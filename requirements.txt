@@ -1,0 +1,40 @@
+# Core runtime — everything the API and the workers need.
+
+# --- web + data ---
+fastapi>=0.110
+uvicorn[standard]>=0.27
+sqlmodel>=0.0.16
+pydantic>=2.6
+pydantic-settings>=2.3          # NoDecode, used for comma-separated env vars
+alembic>=1.13
+python-multipart>=0.0.9         # multipart cookie-file upload
+python-dotenv>=1.0
+
+# --- outbound HTTP ---
+requests>=2.31
+httpx>=0.27
+requests-auth-aws-sigv4>=0.7    # signs TikTok's chunked video upload
+
+# --- media ---
+yt-dlp
+imageio-ffmpeg>=0.4             # bundled ffmpeg when the system has none
+# PO-token provider plugin for yt-dlp. YouTube returns 403 mid-download without
+# one; needs the token server running:
+#   docker run -d --name bgutil-provider --restart unless-stopped -p 4416:4416 \
+#     brainicism/bgutil-ytdlp-pot-provider
+bgutil-ytdlp-pot-provider
+
+# --- speech to text ---
+faster-whisper>=1.1
+# Only for AUTOCLIPS_ASR_BACKEND=nvidia (hosted Riva/NVCF — GPU in the cloud):
+# nvidia-riva-client>=2.15
+
+# --- optional: local browser login (desktop only) --------------------------
+# Left out of the server image, which has no display. On a server, accounts are
+# added by importing an exported cookie file instead.
+# undetected-chromedriver @ git+https://github.com/dustinfarris/undetected-chromedriver.git@b6b58a1eecdadf37e1b159cf2b8138047a0ecc3f
+
+# --- tests ---
+pytest>=8
+pytest-asyncio>=0.23
+freezegun>=1.4
