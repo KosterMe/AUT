@@ -1,0 +1,926 @@
+"""Turning a `Composition` into ffmpeg invocations.
+
+Two strategies share one vocabulary of filter chains:
+
+**One pass** builds a single graph — every segment seeked, composed and
+concatenated, inserts laid over the result, subtitles burned, audio
+normalised — and encodes once. It is both the fastest and the cleanest path,
+and it is the default.
+
+**Two stages** renders each segment to its own intermediate file, joins them
+with the concat demuxer without re-encoding, and spends one delivery encode on
+the joined result. It costs 7-30% more time and about one VMAF point, and buys
+one thing: a segment that does not have to be rendered again. Restyling a clip
+(new subtitles, new inserts, new music) then costs only the final pass.
+
+Three findings from measuring both on a real montage (40 s, four segments
+spread across a 14-minute 1080p60 AV1 source, two inserts, 16 cores):
+
+* **Seek per segment, never across them.** One input spanning the first to the
+  last segment and trimming inside the graph — the shape this code replaced —
+  took 30.2 s against 18.4 s, because the decoder walks every frame it is
+  going to throw away.
+* **Intermediates must not be MP4.** Same encoder settings, same final pass,
+  only the container changed: Matroska scored VMAF 95.5 where MP4 scored 92.3.
+  MP4 carries timestamp edits through `concat -c copy` that leave the delivery
+  encode working off a shifted frame grid. `-avoid_negative_ts make_zero` makes
+  it worse, not better.
+* **Rendering segments in parallel buys nothing.** Four at once on 16 cores
+  took 22.1 s against 24.0 s sequential: x264 already saturates the machine.
+  So the second stage is worth choosing for its cache, never for concurrency.
+"""
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable
+
+from app.adapters.media import encoders
+from app.adapters.media import filters
+from app.adapters.media.ffmpeg import (
+    ffmpeg_exe,
+    ffprobe_has_audio,
+    media_root,
+    probe_media,
+    probe_render_output,
+)
+from app.core.config import get_settings
+from app.domain import composition as comp
+from app.domain import subtitles
+
+log = logging.getLogger(__name__)
+
+STRATEGY_ONE_PASS = "one_pass"
+STRATEGY_TWO_STAGE = "two_stage"
+
+# Intermediates are Matroska on purpose — see the module docstring. This is a
+# constant rather than a setting because getting it wrong costs three VMAF
+# points silently, which is not a trade anybody should be offered.
+FRAGMENT_SUFFIX = ".mkv"
+
+# Audio every segment is conformed to, so `concat -c copy` has something
+# consistent to join and the delivery encode never resamples mid-clip.
+AUDIO_RATE = 48000
+AUDIO_LAYOUT = "stereo"
+
+LAYOUT_AUTO = comp.LAYOUT_AUTO
+# How much wider than the canvas a source may be and still be cropped to fill
+# it rather than floated over a blurred copy of itself. At 0.15 a 9:16 phone
+# video fills the frame, a 4:5 photo does not — cropping that one would throw
+# away a third of its width, which is exactly what the blurred backdrop exists
+# to avoid.
+FILL_ASPECT_TOLERANCE = 0.15
+
+
+@dataclass(frozen=True)
+class ClipRenderResult:
+    output_path: str
+    output_duration: float
+    segment_count: int
+    subtitles_path: str | None
+    subtitle_count: int
+    silence_removed_seconds: float
+    strategy: str
+    fragments_reused: int
+    qa: dict[str, Any]
+
+
+# --------------------------------------------------------------- entry points
+
+
+def render(
+    composition: comp.Composition,
+    output_path: str,
+    *,
+    strategy: str | None = None,
+    source_duration_sec: float | None = None,
+) -> ClipRenderResult:
+    """Render a composition to `output_path`.
+
+    `source_duration_sec` is only used to report how much was cut out; it does
+    not affect the render.
+    """
+    if not ffmpeg_exe():
+        raise RuntimeError("ffmpeg is not installed or not on PATH")
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+    subtitle_path, subtitle_count = _write_subtitles(composition, output_path)
+    # Only the segments are probed: an insert's audio is dropped, and music and
+    # effects are known to have some — probing them would be two subprocesses
+    # per clip spent confirming what putting them there already asserted.
+    audio_by_source = {
+        segment.source_path: ffprobe_has_audio(segment.source_path)
+        for segment in composition.segments
+    }
+    has_audio = (
+        any(audio_by_source.get(s.source_path, False) for s in composition.segments)
+        or composition.has_own_audio
+    )
+
+    chosen = strategy or choose_strategy(composition)
+    if chosen == STRATEGY_TWO_STAGE:
+        reused = _render_two_stage(
+            composition, output_path,
+            subtitle_path=subtitle_path, audio_by_source=audio_by_source, has_audio=has_audio,
+        )
+    else:
+        _render_one_pass(
+            composition, output_path,
+            subtitle_path=subtitle_path, audio_by_source=audio_by_source, has_audio=has_audio,
+        )
+        reused = 0
+
+    duration = composition.duration_sec
+    removed = max(0.0, (source_duration_sec or duration) - duration)
+    qa = probe_render_output(
+        output_path,
+        expected_width=composition.canvas.width,
+        expected_height=composition.canvas.height,
+        expected_duration=duration,
+        expected_has_audio=has_audio,
+    )
+    log.info(
+        "rendered %s via %s: %d segment(s), %d insert(s), %d fragment(s) reused",
+        os.path.basename(output_path), chosen, len(composition.segments),
+        len(composition.inserts), reused,
+    )
+    return ClipRenderResult(
+        output_path=output_path,
+        output_duration=round(duration, 3),
+        segment_count=len(composition.segments),
+        subtitles_path=subtitle_path,
+        subtitle_count=subtitle_count,
+        silence_removed_seconds=round(removed, 3),
+        strategy=chosen,
+        fragments_reused=reused,
+        qa=qa,
+    )
+
+
+def choose_strategy(composition: comp.Composition) -> str:
+    """Which strategy to render this composition with.
+
+    One pass wins on both time and quality, so it is the default and the
+    exceptions have to earn themselves: a graph large enough to be hard to
+    debug, or a cache warm enough to pay for the extra encode. Operators
+    iterating on look — where every clip is rendered repeatedly — can force
+    two stages with `AUTOCLIPS_RENDER_STRATEGY`.
+    """
+    settings = get_settings().render
+    configured = (settings.strategy or "auto").strip().lower()
+    if configured in (STRATEGY_ONE_PASS, STRATEGY_TWO_STAGE):
+        return configured
+
+    if len(composition.segments) > settings.one_pass_max_segments:
+        return STRATEGY_TWO_STAGE
+    if len(composition.inserts) > settings.one_pass_max_inserts:
+        return STRATEGY_TWO_STAGE
+    if len(composition.layouts) > 1:
+        return STRATEGY_TWO_STAGE
+    if _cached_share(composition) >= 0.5:
+        return STRATEGY_TWO_STAGE
+    return STRATEGY_ONE_PASS
+
+
+def choose_layout(
+    source_path: str, canvas: comp.Canvas, *, requested: str = LAYOUT_AUTO
+) -> str:
+    """How this source should fill the canvas.
+
+    Only `auto` is decided here; a profile that asked for a specific layout
+    gets it. The decision is about shape and nothing else: a source that is
+    already about as tall and narrow as the canvas is cropped to fill it,
+    because giving a vertical video a blurred backdrop made of itself is a
+    frame of wasted screen. Anything wider keeps the backdrop.
+    """
+    if requested and requested != LAYOUT_AUTO:
+        return requested
+
+    probe = probe_media(source_path)
+    width, height = probe.get("width"), probe.get("height")
+    if not width or not height:
+        return comp.LAYOUT_BLUR
+
+    source_aspect = float(width) / float(height)
+    canvas_aspect = canvas.width / canvas.height
+    if source_aspect <= canvas_aspect * (1.0 + FILL_ASPECT_TOLERANCE):
+        return comp.LAYOUT_FILL
+    return comp.LAYOUT_BLUR
+
+
+def plan_vertical_clip(
+    input_path: str,
+    *,
+    start_sec: float,
+    end_sec: float,
+    width: int = 1080,
+    height: int = 1920,
+    crf: int = 23,
+    burn_subtitles: bool = True,
+    auto_montage: bool = True,
+    layout: str = LAYOUT_AUTO,
+    companion_path: str | None = None,
+    transcript_segments: list[Any] | None = None,
+    fallback_subtitle_text: str | None = None,
+    subtitle_font_size: int = 64,
+    subtitle_position_percent: int = 74,
+    title_text: str | None = None,
+) -> comp.Composition:
+    """Describe one slice of one file, without rendering anything.
+
+    Separate from `render_vertical_clip` because what goes *over* a clip is
+    decided from what is already in it: b-roll is placed against the subtitle
+    cues, and those only exist once silence removal has settled where the
+    segments are. So the caller plans, adds inserts, and only then renders.
+    """
+    from app.adapters.media.ffmpeg import montage_keep_segments
+
+    canvas = comp.Canvas(width=width, height=height, fps=get_settings().render.fps)
+    keep_segments = None
+    if auto_montage:
+        keep_segments = montage_keep_segments(input_path, start_sec=start_sec, end_sec=end_sec)
+
+    resolved_layout = choose_layout(input_path, canvas, requested=layout)
+    if resolved_layout == comp.LAYOUT_SPLIT and not companion_path:
+        # Asked for a split screen with nothing to put in the bottom half. The
+        # clip is still worth making, so it falls back rather than failing.
+        log.warning("no companion source for a split screen; falling back to a blurred backdrop")
+        resolved_layout = comp.LAYOUT_BLUR
+
+    draft = comp.single_source(
+        input_path, start_sec=start_sec, end_sec=end_sec, keep_segments=keep_segments,
+        canvas=canvas, crf=crf, layout=resolved_layout,
+        companion_path=companion_path if resolved_layout == comp.LAYOUT_SPLIT else None,
+    )
+    cues: list[subtitles.SubtitleCue] = []
+    if burn_subtitles:
+        cues = subtitles.make_subtitle_cues(
+            transcript_segments or [],
+            timeline_segments=draft.timeline(),
+            fallback_text=fallback_subtitle_text,
+        )
+    return comp.Composition(
+        segments=draft.segments,
+        canvas=canvas,
+        subtitles=comp.SubtitleSpec(
+            cues=tuple(cues),
+            font_size=subtitle_font_size,
+            position_percent=subtitle_position_percent,
+            title_text=title_text,
+        ),
+        crf=crf,
+    )
+
+
+def render_vertical_clip(
+    input_path: str,
+    output_path: str,
+    *,
+    start_sec: float,
+    end_sec: float,
+    strategy: str | None = None,
+    **plan_options: Any,
+) -> ClipRenderResult:
+    """Plan and render one slice of one file, with no inserts over it."""
+    composition = plan_vertical_clip(
+        input_path, start_sec=start_sec, end_sec=end_sec, **plan_options
+    )
+    return render(
+        composition,
+        output_path,
+        strategy=strategy,
+        source_duration_sec=max(0.0, end_sec - start_sec),
+    )
+
+
+# ------------------------------------------------------------------ strategies
+
+
+def one_pass_args(
+    composition: comp.Composition,
+    output_path: str,
+    *,
+    subtitle_path: str | None,
+    audio_by_source: dict[str, bool],
+    has_audio: bool,
+    encoder: str,
+) -> list[str]:
+    """The whole composition as one ffmpeg invocation.
+
+    Separate from running it so the graph can be asserted on in tests: a
+    filter graph is the compiler's real output, and comparing strings is far
+    cheaper than comparing frames.
+    """
+    inputs: list[str] = []
+    parts: list[str] = []
+    video_labels: list[str] = []
+    audio_labels: list[str] = []
+
+    for index, segment in enumerate(composition.segments):
+        video_input = _add_input(inputs, segment.source_path,
+                                 start=segment.source_start_sec, duration=segment.duration_sec)
+        companion_input = None
+        if segment.layout == comp.LAYOUT_SPLIT and segment.companion_path:
+            companion_input = _add_input(inputs, segment.companion_path,
+                                         start=segment.companion_start_sec,
+                                         duration=segment.duration_sec, loop=True)
+        chain, video_label = _segment_video_chain(
+            index, composition.canvas, segment,
+            video_in=f"[{video_input}:v]",
+            companion_in=None if companion_input is None else f"[{companion_input}:v]",
+        )
+        parts.extend(chain)
+        video_labels.append(video_label)
+
+        if has_audio:
+            audio_in = f"[{video_input}:a]" if audio_by_source.get(segment.source_path) else None
+            audio_chain, audio_label = _segment_audio_chain(index, segment, audio_in=audio_in)
+            parts.extend(audio_chain)
+            audio_labels.append(audio_label)
+
+    video_label, audio_label = _concat(parts, video_labels, audio_labels if has_audio else [])
+
+    insert_chains, video_label = _insert_chains(composition, inputs, video_in=video_label)
+    parts.extend(insert_chains)
+    parts.append(_look_chain(video_in=video_label, subtitle_path=subtitle_path))
+    if has_audio:
+        parts.extend(_audio_chains(composition, inputs, audio_in=audio_label))
+
+    return [
+        ffmpeg_exe(), "-y", *inputs, "-filter_complex", ";".join(parts),
+        *_delivery_tail(output_path, crf=composition.crf, encoder=encoder,
+                        has_audio=has_audio, shortest=True),
+    ]
+
+
+def final_pass_args(
+    composition: comp.Composition,
+    joined_path: str,
+    output_path: str,
+    *,
+    subtitle_path: str | None,
+    has_audio: bool,
+    encoder: str,
+) -> list[str]:
+    """The second stage: inserts, look and audio over the joined segments."""
+    inputs = ["-i", joined_path]
+    parts: list[str] = []
+    insert_chains, video_label = _insert_chains(composition, inputs, video_in="0:v")
+    parts.extend(insert_chains)
+    parts.append(_look_chain(video_in=video_label, subtitle_path=subtitle_path))
+    if has_audio:
+        parts.extend(_audio_chains(composition, inputs, audio_in="0:a"))
+
+    return [
+        ffmpeg_exe(), "-y", *inputs, "-filter_complex", ";".join(parts),
+        *_delivery_tail(output_path, crf=composition.crf, encoder=encoder,
+                        has_audio=has_audio, shortest=False),
+    ]
+
+
+def _delivery_tail(
+    output_path: str, *, crf: int, encoder: str, has_audio: bool, shortest: bool
+) -> list[str]:
+    args = ["-map", "[v]"]
+    args.extend(["-map", "[a]"] if has_audio else ["-an"])
+    args.extend(encoders.encoder_args(encoder, crf=crf))
+    if has_audio:
+        args.extend(["-c:a", "aac", "-b:a", "160k"])
+    args.extend(["-movflags", "+faststart"])
+    if shortest:
+        args.append("-shortest")
+    args.append(output_path)
+    return args
+
+
+def _render_one_pass(
+    composition: comp.Composition,
+    output_path: str,
+    *,
+    subtitle_path: str | None,
+    audio_by_source: dict[str, bool],
+    has_audio: bool,
+) -> None:
+    _run_with_encoder_fallback(
+        lambda encoder: one_pass_args(
+            composition, output_path, subtitle_path=subtitle_path,
+            audio_by_source=audio_by_source, has_audio=has_audio, encoder=encoder,
+        ),
+        label="one-pass render",
+    )
+
+
+def _render_two_stage(
+    composition: comp.Composition,
+    output_path: str,
+    *,
+    subtitle_path: str | None,
+    audio_by_source: dict[str, bool],
+    has_audio: bool,
+) -> int:
+    """Render each segment, join them, then spend one encode on the result.
+
+    Returns how many segments came out of the cache.
+    """
+    settings = get_settings().render
+    fragments: list[str] = []
+    reused = 0
+    for index, segment in enumerate(composition.segments):
+        path = fragment_path(composition.canvas, segment)
+        if settings.fragment_cache and os.path.exists(path) and os.path.getsize(path) > 2048:
+            reused += 1
+            os.utime(path, None)  # keep the cache sweep honest about what is in use
+        else:
+            _render_fragment(
+                composition, segment, index, path,
+                has_audio=has_audio and bool(audio_by_source.get(segment.source_path)),
+                keep_audio=has_audio,
+            )
+        fragments.append(path)
+
+    joined = _concat_fragments(fragments, output_path)
+    try:
+        _run_with_encoder_fallback(
+            lambda encoder: final_pass_args(
+                composition, joined, output_path,
+                subtitle_path=subtitle_path, has_audio=has_audio, encoder=encoder,
+            ),
+            label="final pass",
+        )
+    finally:
+        _remove_quietly(joined)
+        if not settings.fragment_cache:
+            # With the cache off these were scratch files, not a cache. Leaving
+            # them would fill the disk with fragments nothing will ever read.
+            for path in fragments:
+                _remove_quietly(path)
+    return reused
+
+
+def fragment_args(
+    composition: comp.Composition,
+    segment: comp.Segment,
+    index: int,
+    output_path: str,
+    *,
+    has_audio: bool,
+    keep_audio: bool,
+    encoder: str | None = None,
+) -> list[str]:
+    """One segment, composed into the canvas and nothing else.
+
+    Deliberately free of subtitles, inserts and grading: those belong to the
+    final pass, so changing any of them leaves every cached fragment valid.
+    """
+    settings = get_settings().render
+    inputs: list[str] = []
+    video_input = _add_input(inputs, segment.source_path,
+                             start=segment.source_start_sec, duration=segment.duration_sec)
+    companion_input = None
+    if segment.layout == comp.LAYOUT_SPLIT and segment.companion_path:
+        companion_input = _add_input(inputs, segment.companion_path,
+                                     start=segment.companion_start_sec,
+                                     duration=segment.duration_sec, loop=True)
+
+    parts, video_label = _segment_video_chain(
+        index, composition.canvas, segment,
+        video_in=f"[{video_input}:v]",
+        companion_in=None if companion_input is None else f"[{companion_input}:v]",
+    )
+    parts.append(f"[{video_label}]format=yuv420p,setsar=1[v]")
+    if keep_audio:
+        audio_chain, audio_label = _segment_audio_chain(
+            index, segment, audio_in=f"[{video_input}:a]" if has_audio else None
+        )
+        parts.extend(audio_chain)
+        parts.append(f"[{audio_label}]anull[a]")
+
+    args = [ffmpeg_exe(), "-y", *inputs, "-filter_complex", ";".join(parts), "-map", "[v]"]
+    args.extend(["-map", "[a]"] if keep_audio else ["-an"])
+    args.extend(
+        encoders.encoder_args(encoder or settings.fragment_encoder, crf=settings.fragment_crf)
+    )
+    if keep_audio:
+        args.extend(["-c:a", "aac", "-b:a", "192k", "-ar", str(AUDIO_RATE)])
+    args.append(output_path)
+    return args
+
+
+def _render_fragment(
+    composition: comp.Composition,
+    segment: comp.Segment,
+    index: int,
+    output_path: str,
+    *,
+    has_audio: bool,
+    keep_audio: bool,
+) -> None:
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    # Written under a scratch name and moved into place, so a worker killed
+    # mid-encode cannot leave a truncated fragment that later reads as a hit.
+    temporary = output_path + ".partial" + FRAGMENT_SUFFIX
+    args = fragment_args(
+        composition, segment, index, temporary, has_audio=has_audio, keep_audio=keep_audio
+    )
+    _run_ffmpeg(args)
+    os.replace(temporary, output_path)
+
+
+# ------------------------------------------------------------- filter vocabulary
+
+
+def _segment_video_chain(
+    index: int,
+    canvas: comp.Canvas,
+    segment: comp.Segment,
+    *,
+    video_in: str,
+    companion_in: str | None,
+) -> tuple[list[str], str]:
+    """Compose one segment into the canvas. Returns (chain parts, out label)."""
+    prefix = f"s{index}"
+    out = f"v{index}"
+    settings = get_settings().render
+    normalise = f"fps={canvas.fps},setpts=PTS-STARTPTS"
+
+    if segment.layout == comp.LAYOUT_FILL:
+        return (
+            [filters.fill(canvas.width, canvas.height, src=f"{video_in}{normalise},", out=out)],
+            out,
+        )
+
+    if segment.layout == comp.LAYOUT_SPLIT:
+        if not companion_in:
+            raise ValueError("a split-screen segment needs a companion input")
+        half = canvas.half_height
+        return (
+            [
+                filters.fill(canvas.width, half,
+                             src=f"{video_in}{normalise},", out=f"{prefix}top"),
+                filters.fill(canvas.width, half,
+                             src=f"{companion_in}{normalise},", out=f"{prefix}bottom"),
+                f"[{prefix}top][{prefix}bottom]vstack=inputs=2[{out}]",
+            ],
+            out,
+        )
+
+    return (
+        [
+            f"{video_in}{normalise},split=2[{prefix}bgsrc][{prefix}fgsrc]",
+            filters.background(canvas.width, canvas.height, src=f"[{prefix}bgsrc]",
+                               out=f"{prefix}bg", divisor=settings.blur_scale_divisor),
+            filters.foreground(canvas.width, canvas.height, src=f"[{prefix}fgsrc]",
+                               out=f"{prefix}fg", zoom=settings.foreground_zoom),
+            f"[{prefix}bg][{prefix}fg]overlay=(W-w)/2:(H-h)/2[{out}]",
+        ],
+        out,
+    )
+
+
+def _segment_audio_chain(
+    index: int, segment: comp.Segment, *, audio_in: str | None
+) -> tuple[list[str], str]:
+    """One segment's audio, conformed so segments can be concatenated.
+
+    A source without an audio stream contributes silence rather than being
+    skipped: dropping it would desynchronise everything after it.
+    """
+    out = f"a{index}"
+    conform = _conform()
+    if audio_in:
+        return ([f"{audio_in}asetpts=PTS-STARTPTS,{conform}[{out}]"], out)
+    return (
+        [
+            f"anullsrc=r={AUDIO_RATE}:cl={AUDIO_LAYOUT},"
+            f"atrim=duration={filters.flt(segment.duration_sec)},asetpts=PTS-STARTPTS[{out}]"
+        ],
+        out,
+    )
+
+
+def _concat(
+    parts: list[str], video_labels: list[str], audio_labels: list[str]
+) -> tuple[str, str]:
+    """Join the composed segments. A single segment needs no concat at all."""
+    if len(video_labels) == 1:
+        return video_labels[0], (audio_labels[0] if audio_labels else "")
+
+    has_audio = bool(audio_labels)
+    pairs = []
+    for index, video in enumerate(video_labels):
+        pairs.append(f"[{video}]")
+        if has_audio:
+            pairs.append(f"[{audio_labels[index]}]")
+    parts.append(
+        "".join(pairs)
+        + f"concat=n={len(video_labels)}:v=1:a={1 if has_audio else 0}"
+        + ("[vcat][acat]" if has_audio else "[vcat]")
+    )
+    return "vcat", ("acat" if has_audio else "")
+
+
+def _insert_chains(
+    composition: comp.Composition, inputs: list[str], *, video_in: str
+) -> tuple[list[str], str]:
+    """Lay every insert over the assembled video, in timeline order.
+
+    Each insert is padded at the front with `tpad` so overlay always has a
+    frame available at the moment it becomes visible; `enable` does the actual
+    switching. Insert audio is dropped — the clip's own soundtrack keeps
+    running underneath, which is what keeps subtitles aligned.
+    """
+    parts: list[str] = []
+    current = video_in
+    canvas = composition.canvas
+    for order, insert in enumerate(sorted(composition.inserts, key=lambda i: i.at_sec)):
+        index = _add_input(inputs, insert.source_path, start=insert.source_start_sec,
+                           duration=insert.duration_sec, still=insert.still)
+        tag = f"ins{order}"
+        if insert.kind == comp.INSERT_FULL:
+            fit = (
+                f"scale={canvas.width}:{canvas.height}:force_original_aspect_ratio=increase,"
+                f"crop={canvas.width}:{canvas.height}"
+            )
+            position = "0:0"
+        else:
+            box_width = max(2, int(canvas.width * 0.46) // 2 * 2)
+            fit = f"scale={box_width}:-2"
+            position = f"{canvas.width - box_width - 48}:{int(canvas.height * 0.094)}"
+        parts.append(
+            f"[{index}:v]fps={canvas.fps},{fit},setpts=PTS-STARTPTS,"
+            f"tpad=start_duration={filters.flt(insert.at_sec)}:start_mode=add:color=black[{tag}]"
+        )
+        out = f"vins{order}"
+        parts.append(
+            f"[{current}][{tag}]overlay={position}:eof_action=pass:"
+            f"enable='between(t,{filters.flt(insert.at_sec)},{filters.flt(insert.end_sec)})'[{out}]"
+        )
+        current = out
+    return parts, current
+
+
+def _look_chain(*, video_in: str, subtitle_path: str | None) -> str:
+    """Grade, sharpen and burn the overlay — everything that is style.
+
+    Kept out of the segment chain on purpose: a cached fragment stays valid
+    when the look changes. Measured to cost nothing either way.
+    """
+    chain = f"[{video_in}]eq=contrast=1.04:saturation=1.08"
+    if get_settings().render.sharpen:
+        chain += ",unsharp=5:5:0.55:3:3:0.25"
+    chain += ",format=yuv420p,setsar=1"
+    if subtitle_path:
+        chain += (
+            f",subtitles=filename='{filters.path(subtitle_path)}'{filters.fontsdir_arg()}"
+        )
+    return chain + "[v]"
+
+
+def _audio_chains(
+    composition: comp.Composition, inputs: list[str], *, audio_in: str
+) -> list[str]:
+    """The music bed, the effects, and the delivery normalisation.
+
+    Everything here happens after the segments are joined, which is what keeps
+    a cached fragment valid when the music changes — and what keeps the mix
+    from being normalised once per segment and again at the end.
+
+    The bed is compressed against the voice rather than set to a fixed low
+    level: a level quiet enough under speech is inaudible in a pause, and one
+    audible in a pause fights the speech.
+    """
+    duration = composition.duration_sec
+    parts: list[str] = []
+    voice = audio_in
+    extra: list[str] = []
+
+    if composition.music is not None:
+        music = composition.music
+        # The voice is needed twice: once in the mix, once as the trigger that
+        # tells the compressor when to pull the music down.
+        parts.append(f"[{voice}]asplit=2[voicemix][voicekey]")
+        voice = "voicemix"
+        index = _add_input(
+            inputs, music.source_path,
+            start=music.start_sec, duration=duration, loop=True,
+        )
+        fade_out_start = max(0.0, duration - music.fade_out_sec)
+        parts.append(
+            f"[{index}:a]{_conform()},volume={music.gain_db:.2f}dB,"
+            f"afade=t=in:st=0:d={filters.flt(music.fade_in_sec)},"
+            f"afade=t=out:st={filters.flt(fade_out_start)}:d={filters.flt(music.fade_out_sec)}"
+            "[bed]"
+        )
+        parts.append(
+            f"[bed][voicekey]sidechaincompress="
+            f"threshold={music.duck_threshold:.4f}:ratio={music.duck_ratio:.2f}:"
+            f"attack={music.duck_attack_ms:.2f}:release={music.duck_release_ms:.2f}:"
+            "makeup=1[ducked]"
+        )
+        extra.append("ducked")
+
+    for order, effect in enumerate(sorted(composition.effects, key=lambda e: e.at_sec)):
+        index = _add_input(inputs, effect.source_path, start=0.0, duration=effect.duration_sec)
+        label = f"sfx{order}"
+        delay_ms = int(round(effect.at_sec * 1000))
+        # adelay wants one value per channel; the mix is stereo throughout.
+        # The tail fade is what stops a truncated effect ending in a click.
+        parts.append(
+            f"[{index}:a]{_conform()},volume={effect.gain_db:.2f}dB,"
+            f"afade=t=out:st={filters.flt(max(0.0, effect.duration_sec - 0.05))}:d=0.05,"
+            f"adelay={delay_ms}|{delay_ms}[{label}]"
+        )
+        extra.append(label)
+
+    if extra:
+        # normalize=0 because amix otherwise divides every input by their
+        # number, which would drop the voice by 6 dB for the crime of having
+        # music under it. loudnorm below sorts the overall level out.
+        parts.append(
+            f"[{voice}]" + "".join(f"[{label}]" for label in extra)
+            + f"amix=inputs={1 + len(extra)}:normalize=0:duration=first:"
+            "dropout_transition=0[amixed]"
+        )
+        voice = "amixed"
+
+    fade_start = max(0.0, duration - 0.12)
+    parts.append(
+        f"[{voice}]loudnorm=I=-14:TP=-1.5:LRA=11,"
+        f"afade=t=in:st=0:d=0.08,afade=t=out:st={filters.flt(fade_start)}:d=0.12[a]"
+    )
+    return parts
+
+
+def _conform() -> str:
+    return f"aformat=sample_rates={AUDIO_RATE}:channel_layouts={AUDIO_LAYOUT}"
+
+
+# ------------------------------------------------------------------ fragments
+
+
+def fragment_cache_dir() -> str:
+    directory = os.path.join(media_root(), "fragments")
+    os.makedirs(directory, exist_ok=True)
+    return directory
+
+
+def fragment_path(canvas: comp.Canvas, segment: comp.Segment) -> str:
+    """Where a rendered segment lives, named by everything that shaped it.
+
+    The key covers the source's identity as well as its path: replacing a file
+    in place would otherwise serve the old picture forever.
+    """
+    settings = get_settings().render
+    material = "|".join(
+        str(part)
+        for part in (
+            comp.VERSION,
+            canvas.width, canvas.height, canvas.fps,
+            segment.layout,
+            _source_identity(segment.source_path),
+            f"{segment.source_start_sec:.3f}", f"{segment.source_end_sec:.3f}",
+            _source_identity(segment.companion_path) if segment.companion_path else "",
+            f"{segment.companion_start_sec:.3f}",
+            settings.foreground_zoom, settings.blur_scale_divisor,
+            settings.fragment_encoder, settings.fragment_crf,
+        )
+    )
+    digest = hashlib.sha1(material.encode("utf-8")).hexdigest()[:20]
+    return os.path.join(fragment_cache_dir(), f"seg-{digest}{FRAGMENT_SUFFIX}")
+
+
+def _source_identity(path: str | None) -> str:
+    if not path:
+        return ""
+    try:
+        stat = os.stat(path)
+        return f"{path}|{stat.st_size}|{int(stat.st_mtime)}"
+    except OSError:
+        return path
+
+
+def _cached_share(composition: comp.Composition) -> float:
+    """Fraction of the output already sitting in the fragment cache."""
+    if not get_settings().render.fragment_cache:
+        return 0.0
+    total = composition.duration_sec
+    if total <= 0:
+        return 0.0
+    cached = sum(
+        segment.duration_sec
+        for segment in composition.segments
+        if os.path.exists(fragment_path(composition.canvas, segment))
+    )
+    return cached / total
+
+
+def _concat_fragments(fragments: list[str], output_path: str) -> str:
+    listing = os.path.join(media_root(), "tmp", f"{Path(output_path).stem}.concat.txt")
+    os.makedirs(os.path.dirname(listing), exist_ok=True)
+    with open(listing, "w", encoding="utf-8") as handle:
+        for path in fragments:
+            handle.write(f"file '{Path(path).as_posix()}'\n")
+
+    joined = os.path.join(media_root(), "tmp", f"{Path(output_path).stem}.joined{FRAGMENT_SUFFIX}")
+    _run_ffmpeg([
+        ffmpeg_exe(), "-y", "-f", "concat", "-safe", "0", "-i", listing, "-c", "copy", joined
+    ])
+    _remove_quietly(listing)
+    return joined
+
+
+# ------------------------------------------------------------------- plumbing
+
+
+def _add_input(
+    inputs: list[str],
+    path: str,
+    *,
+    start: float,
+    duration: float,
+    still: bool = False,
+    loop: bool = False,
+) -> int:
+    """Append a seeked input and return its index.
+
+    Seeking at the input rather than trimming in the graph is the whole reason
+    a montage spread across a long source is affordable: the decoder only
+    touches the frames that end up on screen.
+
+    A still has nothing to seek into and no duration of its own, so it is
+    looped for as long as it needs to be on screen instead. `loop` does the
+    same for a video: a thirty-second background under a ninety-second clip
+    plays three times rather than running out and leaving a black half-frame.
+    Looping a file that is already long enough costs nothing — `-t` still ends
+    the input at the same place.
+    """
+    index = sum(1 for item in inputs if item == "-i")
+    length = filters.flt(max(0.01, duration))
+    if still:
+        inputs.extend(["-loop", "1", "-t", length, "-i", path])
+        return index
+    if loop:
+        inputs.append("-stream_loop")
+        inputs.append("-1")
+    inputs.extend(["-ss", filters.flt(max(0.0, start)), "-t", length, "-i", path])
+    return index
+
+
+def _write_subtitles(
+    composition: comp.Composition, output_path: str
+) -> tuple[str | None, int]:
+    spec = composition.subtitles
+    if spec is None or spec.is_empty:
+        return None, 0
+    path = os.path.abspath(
+        os.path.join(media_root(), "tmp", f"{Path(output_path).stem}.ass")
+    )
+    subtitles.write_ass_file(
+        list(spec.cues),
+        path,
+        width=composition.canvas.width,
+        height=composition.canvas.height,
+        font_size=spec.font_size,
+        position_percent=spec.position_percent,
+        title_text=spec.title_text,
+        title_end_sec=composition.duration_sec,
+    )
+    return path, len(spec.cues)
+
+
+def _run_with_encoder_fallback(build: Callable[[str], list[str]], *, label: str) -> None:
+    encoder = encoders.resolve(get_settings().render.video_encoder)
+    try:
+        _run_ffmpeg(build(encoder))
+    except subprocess.CalledProcessError:
+        if encoder == encoders.SOFTWARE_ENCODER:
+            raise
+        # A hardware encoder can pass a probe and still refuse a particular
+        # frame size or filter output. Losing the clip over that would be worse
+        # than losing the speed.
+        log.warning("%s failed during %s; retrying with %s",
+                    encoder, label, encoders.SOFTWARE_ENCODER)
+        _run_ffmpeg(build(encoders.SOFTWARE_ENCODER))
+
+
+def _run_ffmpeg(args: list[str]) -> None:
+    """Run ffmpeg, raising CalledProcessError with its stderr attached."""
+    subprocess.run(
+        args,
+        check=True,
+        capture_output=True,
+        timeout=get_settings().render.render_timeout_seconds,
+    )
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:  # pragma: no cover - filesystem edge case
+        pass
+
+
