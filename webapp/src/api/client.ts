@@ -1,0 +1,128 @@
+import axios from "axios";
+import type {
+  Account,
+  Clip,
+  ClipJob,
+  ClipJobDetail,
+  CreateJobPayload,
+  Health,
+  MediaAsset,
+  Publication,
+  Task,
+  UploadOptions,
+} from "./types";
+
+export const api = axios.create({
+  baseURL: "/api",
+  headers: { "Content-Type": "application/json" },
+});
+
+/** The API returns {detail} for expected failures; surface that, not "Request failed". */
+export function errorMessage(error: unknown): string {
+  if (axios.isAxiosError(error)) {
+    const detail = error.response?.data?.detail;
+    if (typeof detail === "string") return detail;
+    if (Array.isArray(detail) && detail.length) {
+      return detail.map((item: any) => item.msg ?? String(item)).join("; ");
+    }
+    return error.message;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+export const System = {
+  health: () => api.get<Health>("/health").then((r) => r.data),
+  tasks: (params?: { status?: string; kind?: string }) =>
+    api.get<Task[]>("/tasks", { params }).then((r) => r.data),
+  cancelTask: (id: number) => api.post(`/tasks/${id}/cancel`).then((r) => r.data),
+  clipVideoUrl: (clipId: number) => `/api/clips/${clipId}/video`,
+  clipCoverUrl: (clipId: number) => `/api/clips/${clipId}/cover`,
+};
+
+export const Accounts = {
+  list: () => api.get<Account[]>("/accounts").then((r) => r.data),
+  remove: (id: number) => api.delete(`/accounts/${id}`),
+  rename: (id: number, display_name: string) =>
+    api.patch<Account>(`/accounts/${id}`, { display_name }).then((r) => r.data),
+  importFromDisk: () => api.post<Account[]>("/accounts/import-from-disk").then((r) => r.data),
+  resync: () => api.post<Account[]>("/accounts/resync").then((r) => r.data),
+};
+
+export const Assets = {
+  list: () => api.get<MediaAsset[]>("/assets").then((r) => r.data),
+  upload: (file: File, tags: string) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("tags", tags);
+    return api
+      .post<MediaAsset>("/assets", form, {
+        headers: { "Content-Type": "multipart/form-data" },
+      })
+      .then((r) => r.data);
+  },
+  setTags: (id: number, tags: string) =>
+    api.patch<MediaAsset>(`/assets/${id}`, { tags }).then((r) => r.data),
+  remove: (id: number) => api.delete(`/assets/${id}`),
+  fileUrl: (id: number) => `/api/assets/${id}/file`,
+};
+
+export const Login = {
+  importCookies: (username: string, cookies: string) =>
+    api.post("/login/import", { username, cookies }).then((r) => r.data),
+  importCookieFile: (username: string, file: File) => {
+    const form = new FormData();
+    form.append("username", username);
+    form.append("file", file);
+    return api
+      .post("/login/import-file", form, { headers: { "Content-Type": "multipart/form-data" } })
+      .then((r) => r.data);
+  },
+  startBrowser: (username: string) =>
+    api.post("/login/browser", { username }).then((r) => r.data),
+  get: (id: string) => api.get(`/login/${id}`).then((r) => r.data),
+};
+
+export const Jobs = {
+  list: () => api.get<ClipJob[]>("/jobs").then((r) => r.data),
+  get: (id: number) => api.get<ClipJobDetail>(`/jobs/${id}`).then((r) => r.data),
+  create: (payload: CreateJobPayload) =>
+    api.post<ClipJob>("/jobs", payload).then((r) => r.data),
+  start: (id: number) => api.post<ClipJob>(`/jobs/${id}/start`).then((r) => r.data),
+  cancel: (id: number) => api.post<ClipJob>(`/jobs/${id}/cancel`).then((r) => r.data),
+  remove: (id: number) => api.delete(`/jobs/${id}`),
+  setTitle: (id: number, custom_title: string) =>
+    api.patch<ClipJob>(`/jobs/${id}/title`, { custom_title }).then((r) => r.data),
+  setCaptionTags: (id: number, caption_tags: string) =>
+    api.patch<ClipJob>(`/jobs/${id}/caption-tags`, { caption_tags }).then((r) => r.data),
+  clips: (id: number, unpublishedOnly = false) =>
+    api
+      .get<Clip[]>(`/jobs/${id}/clips`, { params: { unpublished_only: unpublishedOnly } })
+      .then((r) => r.data),
+};
+
+export const Publications = {
+  list: (status?: string) =>
+    api.get<Publication[]>("/publications", { params: { status } }).then((r) => r.data),
+  scheduleClip: (
+    clipId: number,
+    body: { username: string; scheduled_at: string; caption?: string; options?: UploadOptions },
+  ) => api.post<Publication>(`/publications/clip/${clipId}`, body).then((r) => r.data),
+  scheduleJob: (
+    jobId: number,
+    body: {
+      username: string;
+      first_at: string;
+      interval_minutes: number;
+      options?: UploadOptions;
+    },
+  ) => api.post<Publication[]>(`/publications/job/${jobId}`, body).then((r) => r.data),
+  update: (id: number, body: { scheduled_at?: string; caption?: string }) =>
+    api.patch<Publication>(`/publications/${id}`, body).then((r) => r.data),
+  cancel: (id: number) => api.post<Publication>(`/publications/${id}/cancel`).then((r) => r.data),
+  cancelScheduled: (jobId?: number) =>
+    api
+      .post<Publication[]>("/publications/cancel-scheduled", null, { params: { job_id: jobId } })
+      .then((r) => r.data),
+  retry: (id: number) => api.post<Publication>(`/publications/${id}/retry`).then((r) => r.data),
+  remove: (id: number) => api.delete(`/publications/${id}`),
+};
