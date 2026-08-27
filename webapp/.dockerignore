@@ -1,0 +1,11 @@
+# The build context is ./webapp, so the repository root's .dockerignore does
+# not apply here — without this file the host's 142 MB node_modules is shipped
+# into the build and `COPY . .` drops it on top of the one npm just installed
+# in the image. On a Windows host that means Windows binaries (esbuild,
+# rollup) inside a Linux image, and a build that fails for reasons that look
+# nothing like the cause.
+node_modules
+dist
+tsconfig.tsbuildinfo
+Dockerfile
+.dockerignore

@@ -1,0 +1,145 @@
+# Local-first deployment of the whole flow:
+#   source video -> clips -> scheduled publications -> TikTok
+#
+#   api             REST API + OpenAPI docs at /docs      (127.0.0.1:8000)
+#   worker-media    downloads, transcribes, renders clips  (CPU bound)
+#   worker-publish  uploads publications at their time     (network bound)
+#   bgutil          PO-token provider yt-dlp needs for YouTube (internal)
+#   webapp          React UI behind nginx                  (127.0.0.1:3000)
+#
+# Scaling out is `docker compose up -d --scale worker-media=3`. Nothing needs
+# to change for that to be safe: workers claim tasks with a compare-and-swap,
+# so two of them never take the same one.
+#
+# Ports bind to 127.0.0.1 — the API has no authentication unless APP_AUTH_TOKEN
+# is set, so it must not be reachable from outside the host without one.
+
+x-app-base: &app-base
+  image: tiktok-poster:latest
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  # The only way .env reaches a container: it is in .dockerignore, so it is
+  # neither baked into the image nor visible to load_dotenv() at /app. Compose
+  # gives `environment:` precedence over `env_file:`, so the settings below
+  # stay authoritative no matter what .env says about them.
+  env_file:
+    - path: .env
+      required: false
+
+x-app-env: &app-env
+  APP_DATA_DIR: /data
+  APP_COOKIES_DIR: /data/cookies
+  APP_VIDEOS_DIR: /data/videos
+  AUTOCLIPS_DIR: /data/media
+  APP_DATABASE_URL: sqlite:////data/app.db
+  # .env's ./youtube-cookies.txt would resolve against /app in here. The mount
+  # below puts the file at this path, and this is what makes yt-dlp read it.
+  YTDLP_COOKIES_FILE: /data/youtube-cookies.txt
+  # The plugin's own default, 127.0.0.1:4416, is the asking container in here.
+  YTDLP_POT_BASE_URL: http://bgutil:4416
+  APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
+  APP_AUTH_TOKEN: ${APP_AUTH_TOKEN:-}
+  # Whisper weights live on a named volume, not in the container's writable
+  # layer where the default (~/.cache/huggingface) puts them. large-v3 is ~3GB
+  # and this network fetches it at single-digit KB/s, so losing it to a routine
+  # `docker compose up -d` — which recreates containers — costs days.
+  HF_HOME: /models/huggingface
+
+x-app-volumes: &app-volumes
+  - ./data:/data
+  # Named, not a bind mount under ./data: the Windows bind mount is 9p, and
+  # reading a 3GB model through it on every worker start is slow enough to
+  # notice. Survives container recreation; `docker volume rm` is the only way
+  # to lose it.
+  - models:/models
+  # Read-only: yt-dlp needs YouTube cookies, and nothing should rewrite them.
+  # yt-dlp saves its jar back on close, so it is handed a writable copy under
+  # /data/cookies instead — see options._writable_cookie_jar. Pointing it here
+  # directly made every download die in YoutubeDL.__exit__ with EROFS, after
+  # the download itself had already worked or already failed for some other,
+  # now invisible, reason.
+  - ./youtube-cookies.txt:/data/youtube-cookies.txt:ro
+
+services:
+  api:
+    <<: *app-base
+    environment:
+      <<: *app-env
+    volumes: *app-volumes
+    ports:
+      - "127.0.0.1:8000:8000"
+    # Migrations run here and only here, so several workers starting at once
+    # cannot race each other applying the same revision.
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.api.main:app --host 0.0.0.0 --port 8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  worker-media:
+    <<: *app-base
+    environment:
+      <<: *app-env
+      # Renders are independent, so running a few at once helps — but only so
+      # far, because x264 is already multi-threaded. Measured on 16 logical
+      # cores, 6 clips took 46s at 1, 35s at 3, and 38s at 5. Hence 3.
+      QUEUE_CONCURRENCY: "${WORKER_MEDIA_CONCURRENCY:-3}"
+    volumes: *app-volumes
+    depends_on:
+      api:
+        condition: service_started
+      bgutil:
+        condition: service_started
+    command: ["python", "-m", "app.workers", "--kinds", "download,render"]
+    restart: unless-stopped
+
+  worker-publish:
+    <<: *app-base
+    environment:
+      <<: *app-env
+      QUEUE_CONCURRENCY: "1"
+    volumes: *app-volumes
+    depends_on:
+      api:
+        condition: service_started
+      bgutil:
+        condition: service_started
+    # Publishing is mostly waiting on TikTok, so it gets its own worker: a
+    # queue of slow renders must never delay a post that has a scheduled time.
+    command: ["python", "-m", "app.workers", "--kinds", "publish,cleanup"]
+    restart: unless-stopped
+
+  # YouTube serves 403 mid-download to clients without a PO token. Fetching one
+  # means running YouTube's botguard challenge in a browser runtime, which is
+  # why this is a server and not a library call: bgutil-ytdlp-pot-provider (in
+  # requirements.txt) is only the yt-dlp-side client for it.
+  #
+  # Plugin and server are expected to be on the same minor version; the plugin
+  # warns loudly when they drift. Both track latest here — pin both together if
+  # you ever pin one.
+  bgutil:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    # Nothing outside the compose network has any business talking to it.
+    expose:
+      - "4416"
+    restart: unless-stopped
+
+  webapp:
+    image: tiktok-poster-webapp:latest
+    build:
+      context: ./webapp
+      dockerfile: Dockerfile
+    depends_on:
+      - api
+    ports:
+      - "127.0.0.1:3000:80"
+    restart: unless-stopped
+
+volumes:
+  models:
