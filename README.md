@@ -294,6 +294,58 @@ The ones that most often need attention:
 | `AUTOCLIPS_INSERTS_*` | How much of a clip automatic b-roll may cover, and where it may not go. |
 | `APP_RETENTION_*` | How long downloads and published clips stay on disk. |
 
+## Language
+
+Nothing in the pipeline is tied to a language, and the defaults already lean
+Russian: Russian caption tracks are preferred first, `AUTOCLIPS_TIKTOK_HASHTAGS`
+is a Russian tag set, and the bundled Oswald-Bold covers Cyrillic in full. That
+last one is why it is bundled at all -- neither Windows nor the Linux containers
+ship a condensed display font that does.
+
+| Setting | Default | What it decides |
+| --- | --- | --- |
+| `AUTOCLIPS_USE_YOUTUBE_CAPTIONS` | `1` | Whether the source's own captions are used at all, before any ASR runs. |
+| `AUTOCLIPS_YOUTUBE_CAPTION_LANGS` | `ru,en,*` | Which caption track wins when the video has several. |
+| `AUTOCLIPS_WHISPER_LANGUAGE` | *(empty)* | Empty auto-detects per video; `ru` pins it. |
+| `AUTOCLIPS_WHISPER_INITIAL_PROMPT` | *(empty)* | Context sentence that fixes the spelling of names and jargon. |
+| `AUTOCLIPS_NVIDIA_ASR_LANGUAGE` | `multi` | Only under `AUTOCLIPS_ASR_BACKEND=nvidia`; `ru-RU` pins it. |
+
+Forcing Russian:
+
+```bash
+AUTOCLIPS_WHISPER_LANGUAGE=ru
+AUTOCLIPS_WHISPER_INITIAL_PROMPT="Речь на русском языке."
+```
+
+Auto-detection reads the opening seconds, so it mislabels a Russian video that
+starts on music or an English cold open. That is the case worth pinning `ru`
+for; on genuinely mixed sources, leaving it empty does better than pinning it.
+
+**The caption languages are an ordering, not a filter.** Every track the video
+has is sorted by kind, then language, then format, and the best one is taken --
+so a listed language does not have to exist, and an unlisted one still wins when
+it is the only track on offer. Kind sorts first of all, which means a
+hand-written English track beats an auto-generated Russian one even with `ru` at
+the front of the list. When the transcript has to be Russian regardless of what
+YouTube offers, the lever is `AUTOCLIPS_USE_YOUTUBE_CAPTIONS=0`: it skips the
+tracks entirely and sends the audio to ASR, at the cost of the minutes that
+captions would have been free.
+
+`AUTOCLIPS_WHISPER_INITIAL_PROMPT` is context, not an instruction -- Whisper
+continues the style it is primed with rather than obeying it, so what works is a
+sentence written the way the output should be written, with the names spelled
+correctly and the punctuation present.
+
+Subtitles need nothing further: `ё` renders, and
+`AUTOCLIPS_SUBTITLE_UPPERCASE=1` uppercases Cyrillic correctly.
+
+**The web UI itself has no language setting.** Its labels are hardcoded English
+and there is no i18n layer. Everything above changes what the pipeline produces
+-- transcripts, subtitles, captions, hashtags -- not what the interface is
+written in.
+
+---
+
 ---
 
 ## Development
