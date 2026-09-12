@@ -36,6 +36,12 @@ def insert_at(at: float) -> comp.Insert:
 
 
 class TestMusic:
+    @pytest.mark.parametrize("tag", ["music", "музыка", "муз", "трек"])
+    def test_a_track_is_a_bed_whatever_the_library_calls_it(self, tag):
+        """A role tag says what a file is for, and the library is tagged in
+        whichever language its owner thinks in."""
+        assert audio.choose_music(clip(), assets=[asset(1, tag)]) is not None
+
     def test_a_track_tagged_music_becomes_the_bed(self):
         bed = audio.choose_music(clip(), assets=[asset(1, "music")])
 

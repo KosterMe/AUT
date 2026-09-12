@@ -102,6 +102,12 @@ def handle_publish(ctx: TaskContext) -> dict:
             on_progress=ctx.progress,
         )
     except SessionExpiredError as exc:
+        # Both places this can come from are before any video data moves: a
+        # cookie file with no session, and TikTok answering the very first
+        # request with a logged-out body. So the mark set above is wrong here,
+        # and leaving it on would make this publication look like one that
+        # might already be live — which is what keeps it out of a bulk retry.
+        ctx.clear_irreversible()
         with ctx.db() as session:
             accounts.invalidate_session(session, plan.account_id)
             publications.mark_failed(
@@ -147,7 +153,7 @@ def _resolve_video(plan: _Plan) -> str:
     if plan.source_kind == SourceKind.YOUTUBE:
         from app.adapters.youtube import downloader
 
-        path, _ = downloader.download_source(plan.source_ref, job_id=0)
+        path, _ = downloader.download_for_publication(plan.source_ref)
         return path
 
     if not plan.source_ref or not os.path.exists(plan.source_ref):

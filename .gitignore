@@ -163,6 +163,10 @@ app/adapters/tiktok/signature/command.txt
 
 # Secrets & session dumps — never commit
 .env
+.env.*
+!.env.example
 cookies.txt
+*cookies*.txt
+*cookies*.json
 youtube-cookies*
 TK_cookies_*.json

@@ -14,7 +14,7 @@ from typing import Sequence
 
 from app.core.clock import utc_now
 from app.core.config import get_settings
-from app.core.errors import PermanentError, TaskCancelled
+from app.core.errors import LeaseLost, PermanentError, TaskCancelled
 from app.db.enums import TaskKind, TaskStatus
 from app.db.models import Task
 from app.db.session import session_scope
@@ -37,6 +37,11 @@ class _Lease:
         self._interval = interval
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # Raised into the handler through the task context. The refresher used
+        # to just stop when the lease was gone, leaving the handler running a
+        # task another worker had already picked up: two renders writing the
+        # same output file, or in the worst case two uploads of one video.
+        self.lost = threading.Event()
 
     def __enter__(self) -> "_Lease":
         self._thread = threading.Thread(
@@ -55,7 +60,14 @@ class _Lease:
             try:
                 with session_scope() as session:
                     if not queue.heartbeat(session, self._task_id):
-                        # Somebody else finalized the task; stop touching it.
+                        # The task is no longer RUNNING under us: reclaimed
+                        # after an expired lease, cancelled, or finalized.
+                        # Tell the handler so it stops, and stop touching it.
+                        self.lost.set()
+                        log.warning(
+                            "lease for task %s is gone; asking the handler to stop",
+                            self._task_id,
+                        )
                         return
             except Exception:  # pragma: no cover - best effort
                 log.exception("lease refresh failed for task %s", self._task_id)
@@ -119,13 +131,25 @@ def _execute(task: _TaskSnapshot) -> None:
             )
         return
 
-    ctx = TaskContext(task_id=task.id, kind=task.kind, payload=task.payload, attempt=task.attempts)
     settings = get_settings()
+    lease = _Lease(task.id, settings.queue.heartbeat_seconds)
+    ctx = TaskContext(
+        task_id=task.id,
+        kind=task.kind,
+        payload=task.payload,
+        attempt=task.attempts,
+        lease_lost=lease.lost,
+    )
     started = utc_now()
 
     try:
-        with _Lease(task.id, settings.queue.heartbeat_seconds):
+        with lease:
             result = spec.run(ctx) or {}
+    except LeaseLost as exc:
+        # Deliberately writes nothing: the task belongs to another worker now,
+        # and its state is that worker's to report.
+        log.warning("task %s (%s) abandoned: %s", task.id, task.kind, exc)
+        return
     except TaskCancelled as exc:
         with session_scope() as session:
             queue.finish_cancelled(session, task.id, str(exc))

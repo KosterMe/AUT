@@ -6,9 +6,11 @@ that would have caught a job stuck in "slicing" with all its clips rendered.
 """
 from __future__ import annotations
 
+import os
 from datetime import timedelta
 
 import pytest
+from sqlmodel import select
 
 from app.core.clock import aware_utc_now
 from app.core.errors import SessionExpiredError
@@ -17,7 +19,7 @@ from app.db.models import Account, Clip, ClipJob, Publication, Task
 from app.db.session import session_scope
 from app.domain.transcript import TranscriptSegment, TranscriptWord
 from app.services import clip_jobs, publications
-from app.tasks import runner
+from app.tasks import queue, runner
 from app.tasks.registry import load_handlers
 
 load_handlers()
@@ -32,7 +34,19 @@ def source_file(tmp_path):
 
 @pytest.fixture()
 def account(db):
-    row = Account(username="tester", cookie_path="/tmp/c.cookie", has_valid_session=True)
+    """An account with a cookie file, so it passes the readiness checks.
+
+    The file is the point: `has_valid_session` is only a cache of it, and an
+    account whose cookies are gone must not read as signed in.
+    """
+    from app.adapters.tiktok import cookies as cookie_store
+
+    cookie_store.save("tester", [{"name": "sessionid", "value": "abc", "domain": ".tiktok.com"}])
+    row = Account(
+        username="tester",
+        cookie_path=str(cookie_store.cookie_path("tester")),
+        has_valid_session=True,
+    )
     db.add(row)
     db.commit()
     db.refresh(row)
@@ -510,6 +524,39 @@ class TestRenderHandler:
 # ---- publish ---------------------------------------------------------------
 
 
+class TestRenderRefusesAMissingSource:
+    def test_a_swept_source_fails_at_once_instead_of_retrying(self, db, tmp_path):
+        """Named but not on disk: three attempts used to be spent on it.
+
+        Retention deletes a job's source a few days after it finishes, so a
+        re-render queued after that arrives with a path to nothing. The
+        failure came out of ffmpeg, deep in the compiler, and the queue tried
+        it twice more over fifteen minutes.
+        """
+        job = clip_jobs.create(
+            db, source_ref="https://youtu.be/swept", start_immediately=False
+        )
+        job.original_path = str(tmp_path / "swept-away.mp4")
+        db.add(job)
+        db.commit()
+        clip = Clip(
+            job_id=job.id, index=1, start_sec=0.0, end_sec=60.0, duration_sec=60.0,
+            title="clip 1", text="", status=ClipStatus.PLANNED,
+        )
+        db.add(clip)
+        db.commit()
+
+        queue.enqueue(db, TaskKind.RENDER, {"clip_id": clip.id, "job_id": job.id})
+        db.commit()
+        runner.run_once([TaskKind.RENDER])
+
+        db.expire_all()
+        task = db.exec(select(Task).where(Task.kind == TaskKind.RENDER)).one()
+        assert task.status == TaskStatus.FAILED
+        assert task.attempts == 1, "a missing file will not appear on a retry"
+        assert "source file is gone" in (task.error or "")
+
+
 class TestPublishHandler:
     def _scheduled(self, db, account, tmp_path) -> int:
         video = tmp_path / "clip.mp4"
@@ -573,6 +620,10 @@ class TestPublishHandler:
         assert db.get(Task, row.task_id).status == TaskStatus.FAILED
         assert db.get(Task, row.task_id).attempts == 1
         assert db.get(Account, account.id).has_valid_session is False
+        # Nothing was uploaded: both places this error comes from are earlier
+        # than the first byte of video, so the publication must not be left
+        # looking like one that might already be live.
+        assert db.get(Task, row.task_id).irreversible is False
 
     def test_the_task_is_marked_irreversible_before_uploading(
         self, db, account, tmp_path, monkeypatch
@@ -709,6 +760,178 @@ class TestCleanupHandler:
         db.expire_all()
         assert db.get(ClipJob, job.id).original_path is None
 
+    def test_a_source_two_jobs_share_survives_until_both_expire(
+        self, db, tmp_path, configure
+    ):
+        """Re-running a video reuses its download, so one file can have two owners.
+
+        Deleting it for the older job would leave the newer one pointing at a
+        path that is gone, and its next render fails looking for it.
+        """
+        from app.tasks import queue
+
+        configure(APP_RETENTION_ORIGINALS_DAYS=1)
+        source = tmp_path / "shared-source.mp4"
+        source.write_bytes(b"\x00" * 4096)
+        old = ClipJob(
+            source_platform="youtube", source_ref="https://youtu.be/shared",
+            status=JobStatus.READY, original_path=str(source),
+            updated_at=aware_utc_now().replace(tzinfo=None) - timedelta(days=5),
+        )
+        recent = ClipJob(
+            source_platform="youtube", source_ref="https://youtu.be/shared",
+            status=JobStatus.READY, original_path=str(source),
+        )
+        db.add(old)
+        db.add(recent)
+        db.commit()
+
+        queue.enqueue(db, TaskKind.CLEANUP, {})
+        db.commit()
+        runner.run_once([TaskKind.CLEANUP])
+
+        assert source.exists()
+        db.expire_all()
+        assert db.get(ClipJob, old.id).original_path == str(source)
+
+    def test_leftovers_from_an_unfinished_download_are_swept(self, db, tmp_path, configure):
+        """A failed download leaves files no rule above ever looks at.
+
+        `.part`, its per-fragment pieces, `.ytdl` and the format intermediates
+        written before a merge that never happened were never any job's
+        `original_path`, so nothing deleted them: 63 MB from two jobs that had
+        failed three days earlier.
+        """
+        from app.tasks import queue
+
+        originals = tmp_path / "media" / "originals"
+        originals.mkdir(parents=True)
+        configure(AUTOCLIPS_DIR=str(tmp_path / "media"))
+
+        stale = aware_utc_now().timestamp() - 48 * 3600
+        leftovers = ["job-4.f616.mp4.part", "job-4.f616.mp4.part-Frag15.part",
+                     "job-4.f616.mp4.ytdl", "job-7.f399.mp4"]
+        for name in leftovers:
+            path = originals / name
+            path.write_bytes(b"\x00" * 1024)
+            os.utime(path, (stale, stale))
+        keep = originals / "job-4.mp4"
+        keep.write_bytes(b"\x00" * 1024)
+        os.utime(keep, (stale, stale))
+        in_flight = originals / "job-9.mp4.part"
+        in_flight.write_bytes(b"\x00" * 1024)
+
+        queue.enqueue(db, TaskKind.CLEANUP, {})
+        db.commit()
+        runner.run_once([TaskKind.CLEANUP])
+
+        assert not any((originals / name).exists() for name in leftovers)
+        assert keep.exists(), "a finished download is not a leftover"
+        assert in_flight.exists(), "a download still being written must survive"
+
+    def test_a_job_stops_naming_a_source_that_is_already_gone(self, db, tmp_path, configure):
+        """The sweep skipped a vanished file and left the row pointing at it.
+
+        `_remove` reported bytes freed, so a path that had already gone said
+        zero — indistinguishable from a failed delete — and the sweep left
+        `original_path` set. Every later sweep read it the same way, and the
+        job's next render died looking for a file nothing could read.
+        """
+        from app.tasks.handlers import cleanup
+
+        job = clip_jobs.create(
+            db, source_ref="https://youtu.be/gone", start_immediately=False
+        )
+        job.status = JobStatus.READY
+        job.original_path = str(tmp_path / "never-existed.mp4")
+        job.updated_at = aware_utc_now().replace(tzinfo=None) - timedelta(days=90)
+        db.add(job)
+        db.commit()
+
+        removed, freed = cleanup._remove_sources(db, [job])
+        db.commit()
+
+        assert (removed, freed) == (0, 0), "nothing was on disk to free"
+        db.expire_all()
+        assert db.get(ClipJob, job.id).original_path is None
+
+    def test_an_undeletable_source_keeps_its_row(self, db, tmp_path, monkeypatch):
+        """A file that is still there must keep being named."""
+        from app.tasks.handlers import cleanup
+
+        source = tmp_path / "locked.mp4"
+        source.write_bytes(bytes(64))
+        job = clip_jobs.create(
+            db, source_ref="https://youtu.be/locked", start_immediately=False
+        )
+        job.original_path = str(source)
+        db.add(job)
+        db.commit()
+
+        def refuse(_path):
+            raise OSError("in use")
+
+        monkeypatch.setattr(cleanup.os, "remove", refuse)
+        removed, freed = cleanup._remove_sources(db, [job])
+        db.commit()
+
+        assert (removed, freed) == (0, 0)
+        db.expire_all()
+        assert db.get(ClipJob, job.id).original_path == str(source)
+
+    def test_stale_yt_dlp_cookie_jars_are_swept(self, db, tmp_path, configure):
+        """One jar per worker thread per start, and nothing removed them.
+
+        `options._writable_cookie_jar` copies the read-only YouTube export so
+        yt-dlp can save its own jar back; the thread id in the name is new
+        every start. Seventeen had piled up in the directory that also holds
+        the TikTok sessions.
+        """
+        from app.tasks import queue
+
+        cookies = tmp_path / "cookies"
+        cookies.mkdir(exist_ok=True)
+        configure(APP_COOKIES_DIR=str(cookies))
+
+        stale = aware_utc_now().timestamp() - 48 * 3600
+        old_jar = cookies / "ytdlp-jar.1.123456789.txt"
+        old_jar.write_text("# stale", encoding="utf-8")
+        os.utime(old_jar, (stale, stale))
+        fresh_jar = cookies / "ytdlp-jar.1.987654321.txt"
+        fresh_jar.write_text("# in use", encoding="utf-8")
+        session_file = cookies / "tiktok_session-tester.cookie"
+        session_file.write_bytes(b"a tiktok session")
+        os.utime(session_file, (stale, stale))
+
+        queue.enqueue(db, TaskKind.CLEANUP, {})
+        db.commit()
+        runner.run_once([TaskKind.CLEANUP])
+
+        assert not old_jar.exists()
+        assert fresh_jar.exists(), "a jar a running download may still write to"
+        assert session_file.exists(), "a TikTok session is not a yt-dlp jar"
+
+    def test_a_sweep_queues_the_next_one(self, db):
+        """The chain is what makes retention periodic at all.
+
+        Nothing runs cleanup on a timer; each sweep books its successor, and
+        the API seeds the first. Without this the handler ran once, if ever.
+        """
+        from app.db.models import Task
+        from app.tasks import queue
+
+        queue.enqueue(db, TaskKind.CLEANUP, {}, dedupe_key="cleanup:periodic")
+        db.commit()
+        runner.run_once([TaskKind.CLEANUP])
+
+        db.expire_all()
+        pending = [
+            t for t in db.query(Task).all()
+            if t.kind == TaskKind.CLEANUP and t.status == TaskStatus.QUEUED
+        ]
+        assert len(pending) == 1
+        assert pending[0].run_at > aware_utc_now().replace(tzinfo=None)
+
     def test_recent_jobs_are_left_alone(self, db, tmp_path):
         from app.tasks import queue
 
@@ -728,3 +951,66 @@ class TestCleanupHandler:
         runner.run_once([TaskKind.CLEANUP])
 
         assert source.exists()
+
+
+class TestRenderedStyle(TestRenderHandler):
+    """What the style is for: it reaches the render, and it is written down.
+
+    Inherits the fakes above — only the encode is stubbed, so the composition
+    these assert on is the one the handler really hands to ffmpeg.
+    """
+
+    def test_a_job_style_reaches_the_composition(self, db, source_file):
+        self._planned_clip(
+            db, source_file,
+            render_options={"style": {"subtitles": {"font_size": 120}, "framing": {"zoom": 1.4}}},
+        )
+
+        assert runner.run_once([TaskKind.RENDER]) is True
+
+        style = self.rendered_compositions[-1].style
+        assert style.subtitles.font_size == 120
+        assert style.framing.zoom == 1.4
+
+    def test_the_profile_still_decides_what_the_style_is_silent_about(self, db, source_file):
+        self._planned_clip(db, source_file, render_options={"style": {"grade": {"contrast": 1.1}}})
+
+        assert runner.run_once([TaskKind.RENDER]) is True
+
+        style = self.rendered_compositions[-1].style
+        assert style.grade.contrast == 1.1
+        # `talking` is the default profile, and it removes silence.
+        assert style.pacing.remove_silence is True
+
+    def test_a_task_queued_before_styles_existed_still_renders(self, db, source_file):
+        """The queue can be full during an upgrade. Those tasks carry the old
+        flat switches and nothing else."""
+        self._planned_clip(
+            db, source_file,
+            render_options={"auto_montage": False, "inserts": False, "subtitle_font_size": 64},
+        )
+
+        assert runner.run_once([TaskKind.RENDER]) is True
+
+        style = self.rendered_compositions[-1].style
+        assert style.pacing.remove_silence is False
+        assert style.inserts.enabled is False
+        assert style.subtitles.font_size == 64
+
+    def test_a_finished_clip_records_what_it_was_made_of(self, db, source_file):
+        """Stored so the clip can be inspected, and re-rendered without
+        re-deciding anything."""
+        import json
+
+        _, clip_id = self._planned_clip(db, source_file)
+
+        assert runner.run_once([TaskKind.RENDER]) is True
+
+        db.expire_all()
+        stored = json.loads(db.get(Clip, clip_id).composition_json)
+        assert stored["segments"]
+        assert stored["style"]["delivery"]["width"] == 1080
+        # And it loads back into the very thing that produced it.
+        from app.domain import composition as comp
+
+        assert comp.from_dict(stored) == self.rendered_compositions[-1]

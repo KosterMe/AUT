@@ -16,7 +16,6 @@ offline_recognize call.
 """
 from __future__ import annotations
 
-import os
 import threading
 from typing import Any
 
@@ -86,7 +85,7 @@ def _build_config(language: str) -> Any:
     return riva.client.RecognitionConfig(
         language_code=language,
         max_alternatives=1,
-        enable_automatic_punctuation=_env_bool("AUTOCLIPS_NVIDIA_ASR_PUNCTUATION", default=True),
+        enable_automatic_punctuation=get_settings().asr.nvidia.punctuation,
         enable_word_time_offsets=True,
         audio_channel_count=1,
         sample_rate_hertz=_sample_rate(),

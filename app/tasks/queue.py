@@ -181,6 +181,21 @@ def mark_irreversible(session: Session, task_id: int) -> None:
     session.commit()
 
 
+def clear_irreversible(session: Session, task_id: int) -> None:
+    """Take back the mark when the step turned out not to have happened.
+
+    The publish handler sets it on the line before the upload call, because
+    that is the last moment it is certainly safe to. Some of what happens
+    inside that call is still setup: a session TikTok has already logged out
+    is refused by the very first request, before a byte of video moves. Saying
+    so is what lets a bulk retry tell "never posted" from "might be live".
+    """
+    session.exec(
+        update(Task).where(col(Task.id) == task_id).values(irreversible=False, updated_at=utc_now())
+    )
+    session.commit()
+
+
 def is_cancel_requested(session: Session, task_id: int) -> bool:
     session.expire_all()
     task = session.get(Task, task_id)
@@ -301,42 +316,16 @@ def reclaim_expired(session: Session) -> list[Task]:
     ).all()
 
     for task in orphans:
-        if task.cancel_requested:
-            task.status = TaskStatus.CANCELLED
-            task.stage = "cancelled"
-            task.progress = 1.0
-            task.error = task.error or "cancelled by user"
-            release_dedupe_key(session, task)
-        elif task.irreversible:
-            task.status = TaskStatus.FAILED
-            task.stage = "failed"
-            task.progress = 1.0
-            task.error = (
-                "worker stopped after an irreversible step; the action may have "
-                "completed — verify before retrying"
-            )
-        elif task.attempts >= task.max_attempts:
-            task.status = TaskStatus.FAILED
-            task.stage = "failed"
-            task.progress = 1.0
-            # Keep what the last attempt actually said. A worker that dies
-            # after diagnosing the problem — or one whose finalizing write is
-            # lost — otherwise leaves "lease expired", which explains nothing
-            # and hides the sentence that would have told the user what to fix.
-            task.error = (
-                f"{task.error}\n(the worker then stopped responding on attempt "
-                f"{task.attempts})"
-                if task.error
-                else f"lease expired after {task.attempts} attempt(s)"
-            )
-        else:
-            task.status = TaskStatus.QUEUED
-            task.stage = "retry_queued"
-            task.error = "worker stopped responding; requeued"
-        _clear_lease(task)
-        task.updated_at = now
-        session.add(task)
-        changed.append(task)
+        if _transition(
+            session,
+            task,
+            guards=(
+                col(Task.status) == TaskStatus.RUNNING,
+                col(Task.lease_expires_at) < utc_now(),
+            ),
+            values=_orphan_outcome(task),
+        ):
+            changed.append(task)
 
     # A queued task the user cancelled while no worker was looking at it.
     pending_cancels = session.exec(
@@ -345,24 +334,112 @@ def reclaim_expired(session: Session) -> list[Task]:
         .where(col(Task.cancel_requested) == True)  # noqa: E712
     ).all()
     for task in pending_cancels:
-        task.status = TaskStatus.CANCELLED
-        task.stage = "cancelled"
-        task.progress = 1.0
-        task.error = task.error or "cancelled by user"
-        release_dedupe_key(session, task)
-        _clear_lease(task)
-        task.updated_at = now
-        session.add(task)
-        changed.append(task)
+        if _transition(
+            session,
+            task,
+            guards=(col(Task.status) == TaskStatus.QUEUED,),
+            values={
+                "status": TaskStatus.CANCELLED,
+                "stage": "cancelled",
+                "progress": 1.0,
+                "error": task.error or "cancelled by user",
+                # The intent behind the task is gone, so an equivalent one must
+                # be schedulable again — same reason as `release_dedupe_key`.
+                "dedupe_key": None,
+                **_LEASE_CLEARED,
+            },
+        ):
+            changed.append(task)
 
     if changed:
-        session.commit()
         log.info("reclaimed %d task(s)", len(changed))
     return changed
 
 
+def _orphan_outcome(task: Task) -> dict[str, Any]:
+    """What a lapsed lease means for one task."""
+    if task.cancel_requested:
+        return {
+            "status": TaskStatus.CANCELLED,
+            "stage": "cancelled",
+            "progress": 1.0,
+            # Not `task.error or ...`: cancelling a *running* task records no
+            # reason, so whatever is in that column belongs to an earlier
+            # attempt. Keeping it made a cancelled task report "worker stopped
+            # responding; requeued", which is a different thing entirely.
+            "error": "cancelled by user",
+            "dedupe_key": None,
+            **_LEASE_CLEARED,
+        }
+    if task.irreversible:
+        return {
+            "status": TaskStatus.FAILED,
+            "stage": "failed",
+            "progress": 1.0,
+            "error": (
+                "worker stopped after an irreversible step; the action may have "
+                "completed — verify before retrying"
+            ),
+            **_LEASE_CLEARED,
+        }
+    if task.attempts >= task.max_attempts:
+        return {
+            "status": TaskStatus.FAILED,
+            "stage": "failed",
+            "progress": 1.0,
+            # Keep what the last attempt actually said. A worker that dies
+            # after diagnosing the problem — or one whose finalizing write is
+            # lost — otherwise leaves "lease expired", which explains nothing
+            # and hides the sentence that would have told the user what to fix.
+            "error": (
+                f"{task.error}\n(the worker then stopped responding on attempt "
+                f"{task.attempts})"
+                if task.error
+                else f"lease expired after {task.attempts} attempt(s)"
+            ),
+            **_LEASE_CLEARED,
+        }
+    return {
+        "status": TaskStatus.QUEUED,
+        "stage": "retry_queued",
+        "error": "worker stopped responding; requeued",
+        **_LEASE_CLEARED,
+    }
+
+
+def _transition(session: Session, task: Task, *, guards: Sequence[Any], values: dict) -> bool:
+    """Write a state change only if the row still matches what was read.
+
+    Every worker thread sweeps for expired leases, so several of them read the
+    same orphan in the same instant. Writing that back the obvious way — read
+    the row, mutate the object, commit — carries no guard, so a worker holding
+    a copy from a moment ago can requeue a task another worker has *already
+    claimed* since, and then claim it itself. The task does not lose an
+    update; it runs twice, in parallel. Seen here as two Whisper passes over
+    one file at 15:41:22 and 15:41:23, and it would just as easily have been
+    two TikTok uploads of one clip. `claim` always used a compare-and-swap;
+    this is the same rule applied to the sweep.
+    """
+    statement = update(Task).where(col(Task.id) == task.id)
+    for guard in guards:
+        statement = statement.where(guard)
+    result = session.exec(statement.values(**values, updated_at=utc_now()))
+    session.commit()
+    if result.rowcount != 1:
+        return False
+    # Sessions here are created with expire_on_commit=False, so the in-memory
+    # copy still holds the pre-update values the caller would otherwise report.
+    session.refresh(task)
+    return True
+
+
 def payload_of(task: Task) -> dict[str, Any]:
     return loads_dict(task.payload_json)
+
+
+# The same thing as `_clear_lease`, for the guarded UPDATEs that cannot go
+# through an ORM object without giving up the guard.
+_LEASE_CLEARED = {"heartbeat_at": None, "lease_expires_at": None}
 
 
 def _clear_lease(task: Task) -> None:

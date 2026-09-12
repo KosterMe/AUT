@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 
 from app.domain import composition as comp
+from app.domain.subtitles import SubtitleCue
 
 
 def test_single_source_without_keep_segments_is_one_continuous_cut():
@@ -104,3 +105,121 @@ def test_unknown_layouts_and_insert_kinds_are_rejected():
         comp.Segment("a.mp4", 0.0, 5.0, layout="ken-burns")
     with pytest.raises(ValueError, match="unknown insert kind"):
         comp.Insert("explosion", "b.mp4", at_sec=0.0, duration_sec=1.0)
+
+
+# --- storing a composition --------------------------------------------------
+
+
+def test_a_composition_round_trips_through_json():
+    """What makes a finished clip inspectable, and re-renderable without
+    re-deciding anything: everything that shaped it survives the trip."""
+    original = comp.Composition(
+        segments=(
+            comp.Segment("/media/a.mp4", 10.0, 20.0),
+            comp.Segment("/media/a.mp4", 40.0, 45.0, layout=comp.LAYOUT_FILL),
+        ),
+        inserts=(comp.Insert(comp.INSERT_FULL, "/media/broll.mp4", at_sec=4.0, duration_sec=2.0),),
+        subtitles=comp.SubtitleSpec(
+            cues=(SubtitleCue(start_sec=1.0, end_sec=1.4, text="привет"),),
+            title_text="часть 1",
+        ),
+        music=comp.MusicBed("/media/bed.mp3", gain_db=-18.0),
+        effects=(comp.SoundEffect("/media/whoosh.wav", at_sec=9.9),),
+        style=comp.StyleSpec.from_settings().merged({"framing": {"zoom": 1.35}}),
+    )
+
+    restored = comp.from_dict(comp.to_dict(original))
+
+    assert restored == original
+    assert restored.style.framing.zoom == 1.35
+
+
+def test_a_stored_composition_from_an_older_version_still_loads():
+    """Fields that did not exist when it was written take their defaults —
+    the alternative is a clip nobody can re-render after an upgrade."""
+    restored = comp.from_dict(
+        {"segments": [{"source_path": "/media/a.mp4",
+                       "source_start_sec": 0.0, "source_end_sec": 12.0}]}
+    )
+
+    assert restored.duration_sec == 12.0
+    assert restored.style.delivery.width == 1080
+
+
+# --- excerpts, which is what a preview is -----------------------------------
+
+
+def build(**overrides) -> comp.Composition:
+    kwargs = dict(
+        segments=(
+            comp.Segment("/media/a.mp4", 100.0, 110.0),
+            comp.Segment("/media/a.mp4", 200.0, 210.0),
+        ),
+    )
+    kwargs.update(overrides)
+    return comp.Composition(**kwargs)
+
+
+def test_an_excerpt_takes_the_source_time_the_window_lands_on():
+    """Output second 12 is source second 202 when the first segment ended at
+    10 — getting this wrong previews a different part of the video."""
+    window = comp.excerpt(build(), at_sec=12.0, duration_sec=4.0)
+
+    assert len(window.segments) == 1
+    assert window.segments[0].source_start_sec == 202.0
+    assert window.segments[0].source_end_sec == 206.0
+    assert window.duration_sec == 4.0
+
+
+def test_an_excerpt_spanning_a_cut_keeps_both_sides_of_it():
+    window = comp.excerpt(build(), at_sec=8.0, duration_sec=4.0)
+
+    assert [(s.source_start_sec, s.source_end_sec) for s in window.segments] == [
+        (108.0, 110.0), (200.0, 202.0)
+    ]
+
+
+def test_an_excerpt_moves_everything_laid_over_the_clip_with_it():
+    composition = build(
+        inserts=(comp.Insert(comp.INSERT_FULL, "/media/b.mp4", at_sec=11.0, duration_sec=2.0),),
+        subtitles=comp.SubtitleSpec(
+            cues=(
+                SubtitleCue(start_sec=2.0, end_sec=2.4, text="early"),
+                SubtitleCue(start_sec=11.5, end_sec=11.9, text="inside"),
+            ),
+        ),
+        effects=(comp.SoundEffect("/media/w.wav", at_sec=11.2),),
+    )
+
+    window = comp.excerpt(composition, at_sec=10.0, duration_sec=4.0)
+
+    assert window.inserts[0].at_sec == 1.0
+    assert [cue.text for cue in window.subtitles.cues] == ["inside"]
+    assert window.subtitles.cues[0].start_sec == 1.5
+    assert window.effects[0].at_sec == pytest.approx(1.2)
+
+
+def test_an_excerpt_advances_the_music_rather_than_restarting_it():
+    """A preview of the last ten seconds should hear the part of the track
+    that plays there."""
+    window = comp.excerpt(build(music=comp.MusicBed("/media/bed.mp3")), at_sec=12.0,
+                          duration_sec=4.0)
+
+    assert window.music.start_sec == 12.0
+
+
+def test_a_window_past_the_end_is_refused():
+    with pytest.raises(ValueError):
+        comp.excerpt(build(), at_sec=90.0, duration_sec=4.0)
+
+
+def test_scaling_shrinks_the_canvas_and_the_type_with_it():
+    """Everything else in this model is a share of the frame, so the font
+    size is the one thing that would not survive being scaled."""
+    small = comp.scaled(build(), 0.5)
+
+    assert (small.canvas.width, small.canvas.height) == (540, 960)
+    assert small.style.subtitles.font_size == 41
+    assert small.style.delivery.width == 540
+    # The framing is untouched: it is expressed relative to the canvas.
+    assert small.style.framing.zoom == build().style.framing.zoom

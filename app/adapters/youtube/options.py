@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import socket
 import threading
 from pathlib import Path
 from typing import Iterable
@@ -187,12 +188,49 @@ def assert_downloadable_formats(info: dict, source_ref: str) -> None:
         f"YouTube returned no downloadable video/audio formats for '{title}'. "
         f"Available formats: {format_ids} — sb0/sb1/sb2/sb3 are storyboard "
         "thumbnails, not video.\n"
-        "Two different causes look identical here, so check them in this order:\n"
-        f"1. JavaScript runtime — {_js_runtime_diagnostics()} Without one, "
+        "Three different causes look identical here, so check them in this order:\n"
+        f"1. Name resolution — {_resolution_diagnostics()}\n"
+        f"2. JavaScript runtime — {_js_runtime_diagnostics()} Without one, "
         "YouTube's n-challenge cannot be solved and only storyboards come back, "
         "even with perfectly good cookies.\n"
-        f"2. Cookies — {_cookie_diagnostics()}"
+        f"3. Cookies — {_cookie_diagnostics()}"
     )
+
+
+def _resolution_diagnostics() -> str:
+    """Whether the hosts a format list depends on resolve at all.
+
+    Ranked first because it is the cause that hides best. A watch page can come
+    back complete — title, duration, thumbnails — while the player API calls
+    and the challenge-solver fetch that actually produce the format list never
+    leave the machine, and what is left is a list of storyboards. That reads
+    exactly like an expired cookie file, and the cookie report below will then
+    supply a plausible-sounding reason for a file that is perfectly good.
+    """
+    hosts = ["www.youtube.com"]
+    if "github" in _clean(get_settings().youtube.remote_components):
+        # Where the n-challenge solver itself is fetched from.
+        hosts.append("github.com")
+    unresolved = [host for host in hosts if not _resolves(host)]
+    if not unresolved:
+        return "every host yt-dlp needs resolves, so this is probably not the cause."
+    return (
+        f"{_names(unresolved)} did NOT resolve. This is the most likely cause. "
+        "Some networks answer nothing for exactly these names on port 53 while "
+        "leaving every other lookup alone, so a general is-the-internet-up check "
+        "will not show it: compare these against a hostname you know is not "
+        "blocked. The fix is to resolve names somewhere the interception cannot "
+        "read the query — docker-compose.yml runs a `resolver` service that "
+        "forwards over TLS for exactly this reason."
+    )
+
+
+def _resolves(host: str) -> bool:
+    try:
+        socket.getaddrinfo(host, 443)
+    except OSError:
+        return False
+    return True
 
 
 def _js_runtime_diagnostics() -> str:
@@ -321,16 +359,20 @@ def _cookie_diagnostics() -> str:
         f"missing={_names(missing)}. Cookie values were not logged."
     )
 
-    # Nearly every YouTube auth cookie is httpOnly, so an export containing
-    # none of them is the single most common reason for LOGIN_REQUIRED — and
-    # it looks like a full, healthy file until you check for this.
+    # A lead, not a verdict. Nearly every YouTube auth cookie is httpOnly, so
+    # an export carrying none of them is a common reason for LOGIN_REQUIRED —
+    # but the #HttpOnly_ prefix is optional, and this sentence has already
+    # been believed once about a cookie file that turned out to be fine.
+    # Report what was observed and leave the conclusion to whoever reads it.
     if httponly_count == 0 and missing:
         report += (
-            " The file contains no httpOnly cookies at all, and the missing "
-            "names above are all httpOnly — the export tool skipped them. Use "
-            "an exporter that includes httpOnly cookies (for example the "
-            '"Get cookies.txt LOCALLY" extension), exporting from a youtube.com '
-            "tab that is signed in."
+            " No line carries the #HttpOnly_ prefix and the missing names are "
+            "all httpOnly cookies, which would fit an exporter that skipped "
+            "them — but an export that omits only the prefix looks identical "
+            "here and works fine, so rule out the causes above first. If this "
+            "is the cause, re-export with a tool that keeps httpOnly cookies "
+            '(for example "Get cookies.txt LOCALLY") from a youtube.com tab '
+            "that is signed in."
         )
     return report
 

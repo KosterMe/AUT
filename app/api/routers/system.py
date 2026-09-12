@@ -6,6 +6,8 @@ worker running, and what is it doing?"
 """
 from __future__ import annotations
 
+import importlib.util
+
 import os
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -14,6 +16,7 @@ from sqlmodel import Session, col, func, select
 
 from app import __version__
 from app.api.deps import db_session
+from app.core.clock import isoformat_z
 from app.core.config import get_settings
 from app.db.enums import TaskStatus
 from app.db.models import Clip, Task
@@ -42,7 +45,27 @@ def health(session: Session = Depends(db_session)):
         "tasks": {str(k): v for k, v in counts.items()},
         # Steadily rising means no worker is serving these kinds.
         "tasks_due_now": overdue,
+        # Whether the local-browser login can work on this host at all, so the
+        # UI can stop offering a button that only ever returns 503 here.
+        "browser_login": browser_login_available(),
     }
+
+
+def browser_login_available() -> bool:
+    """Whether `POST /api/login/browser` has any chance of working here.
+
+    It drives a real Chrome through undetected-chromedriver and waits for a
+    person to sign in past TikTok's captcha, so it needs both the dependency
+    and a desktop in front of the machine running the API. In the container
+    image neither holds — the dependency is deliberately left out of
+    requirements.txt, and a browser opened inside a container is one nobody
+    can reach — which is why importing an exported cookie file is the primary
+    path and this is a desktop convenience.
+
+    The module check stands in for the whole question: it is present exactly
+    in the desktop install this flow was built for.
+    """
+    return importlib.util.find_spec("undetected_chromedriver") is not None
 
 
 @router.get("/tasks")
@@ -66,7 +89,10 @@ def list_tasks(
             "progress": task.progress,
             "attempts": task.attempts,
             "max_attempts": task.max_attempts,
-            "run_at": task.run_at,
+            # Serialized like every other timestamp the API returns. The
+            # column is naive UTC, so handing it over unmarked makes a
+            # browser read it as local time — three hours out here.
+            "run_at": isoformat_z(task.run_at),
             "error": task.error,
             "payload": queue.payload_of(task),
         }

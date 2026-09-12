@@ -49,7 +49,9 @@ def handle_download(ctx: TaskContext) -> dict:
     with ctx.db() as session:
         job = clip_jobs.get(session, job_id)
         source_ref, platform = job.source_ref, job.source_platform
-        existing_path = job.original_path
+        existing_path = job.original_path or clip_jobs.source_downloaded_elsewhere(
+            session, job_id, source_ref
+        )
         # The job says "queued" until something says otherwise, and fetching a
         # source is the longest step in the pipeline. Claim it on the job now,
         # not after the download returns.
@@ -221,8 +223,17 @@ def _resolve_source(
     existing_path: str | None,
     on_progress=None,
 ) -> tuple[str, dict]:
-    """Return a local path to the source, downloading it only if needed."""
-    if existing_path and os.path.exists(existing_path):
+    """Return a local path to the source, downloading it only if needed.
+
+    A path recorded by an earlier attempt is not automatically usable — see
+    `downloader.is_usable_source`. Job 10 reused an unmerged download, took
+    its transcript from YouTube's captions rather than from the file, and
+    rendered twenty silent clips without raising anything. Fetching the source
+    again is the cheaper mistake.
+    """
+    if existing_path and os.path.exists(existing_path) and downloader.is_usable_source(
+        existing_path
+    ):
         log.info("reusing already-downloaded source %s", existing_path)
         metadata = {
             "title": None,

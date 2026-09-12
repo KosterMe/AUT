@@ -1,8 +1,22 @@
 import { useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { ArrowLeft, CalendarCheck, CalendarPlus, Trash2, XCircle } from "lucide-react";
-import { Jobs, Publications, System, errorMessage } from "../api/client";
-import { keys, useAccounts, useInvalidatingMutation, useJob } from "../api/hooks";
+import {
+  ArrowLeft,
+  CalendarCheck,
+  CalendarPlus,
+  Palette,
+  RefreshCw,
+  Trash2,
+  XCircle,
+} from "lucide-react";
+import { Clips, Jobs, Publications, System, errorMessage } from "../api/client";
+import {
+  keys,
+  useAccounts,
+  useInvalidatingMutation,
+  useJob,
+  useStyles,
+} from "../api/hooks";
 import StatusBadge from "../components/StatusBadge";
 import { formatDuration } from "./Jobs";
 import type { Clip } from "../api/types";
@@ -150,8 +164,80 @@ function ClipCard({ clip }: { clip: Clip }) {
               Schedule
             </button>
           )}
+          <RerenderClip clip={clip} />
         </>
       )}
+    </div>
+  );
+}
+
+/**
+ * Render this one clip again, optionally into a different look.
+ *
+ * One clip rather than the job, because replanning a job recuts every clip in
+ * it — the wrong tool for "I want this one to look different". The boundaries
+ * stay where they are and only the render repeats, which is cheap: the
+ * transcript is cached and the segments may still be in the fragment cache.
+ */
+function RerenderClip({ clip }: { clip: Clip }) {
+  const { data: presets } = useStyles();
+  const [open, setOpen] = useState(false);
+  const [styleId, setStyleId] = useState<string>("");
+  const [error, setError] = useState("");
+
+  const rerender = useInvalidatingMutation(
+    () => Clips.rerender(clip.id, styleId ? { style_id: Number(styleId) } : {}),
+    [keys.job(clip.job_id), keys.jobs, keys.tasks],
+  );
+
+  if (!open) {
+    return (
+      <button
+        className="text-xs text-slate-500 hover:text-slate-800 w-full text-center"
+        onClick={() => setOpen(true)}
+      >
+        <RefreshCw size={12} className="inline mr-1" />
+        Render again
+      </button>
+    );
+  }
+
+  return (
+    <div className="space-y-2 border-t border-slate-100 pt-3">
+      <label className="label">
+        <Palette size={12} className="inline mr-1" />
+        Look
+      </label>
+      <select
+        className="input"
+        value={styleId}
+        onChange={(event) => setStyleId(event.target.value)}
+      >
+        <option value="">Keep the one it has</option>
+        {presets?.map((preset) => (
+          <option key={preset.id} value={preset.id}>
+            {preset.name}
+          </option>
+        ))}
+      </select>
+      {error && <p className="text-xs text-red-600">{error}</p>}
+      <div className="flex gap-2">
+        <button
+          className="btn btn-primary flex-1 justify-center"
+          disabled={rerender.isPending}
+          onClick={() =>
+            rerender
+              .mutateAsync(undefined)
+              .then(() => setOpen(false))
+              .catch((reason) => setError(errorMessage(reason)))
+          }
+        >
+          {rerender.isPending ? "Queueing…" : "Render"}
+        </button>
+        <button className="btn btn-secondary" onClick={() => setOpen(false)}>
+          Cancel
+        </button>
+      </div>
     </div>
   );
 }

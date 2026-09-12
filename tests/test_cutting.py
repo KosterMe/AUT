@@ -169,3 +169,61 @@ def test_every_cutter_numbers_from_one_and_moves_forward(build):
         later.start_sec >= earlier.start_sec
         for earlier, later in zip(specs, specs[1:])
     )
+
+
+class TestGapNeverStallsTheCutter:
+    """A gap as long as the clip used to loop forever.
+
+    The gap is an overlap: the next clip starts a little before this one
+    ended. When it was as long as the clip itself, the next start landed back
+    on the current one and the cursor stopped moving — the loop appended a
+    slice per pass until the worker was killed, and the task stayed `running`
+    for as long as the container lived.
+
+    The API's own bounds allow it: `min_clip_seconds=5` with `gap_seconds=10`
+    are both inside the schema, so one POST was enough.
+    """
+
+    @pytest.mark.parametrize("gap", [0.0, 1.0, 10.0, 90.0, 1_000_000.0])
+    def test_plain_slices_always_move_forward(self, gap):
+        specs = cutting.build_plain_slices(
+            source_duration=600.0, clip_seconds=90.0, gap_seconds=gap
+        )
+
+        assert specs
+        assert all(
+            later.start_sec > earlier.start_sec
+            for earlier, later in zip(specs, specs[1:])
+        )
+
+    @pytest.mark.parametrize("gap", [0.0, 1.0, 10.0, 120.0, 1_000_000.0])
+    def test_scene_slices_always_move_forward(self, gap):
+        specs = cutting.build_scene_slices(
+            source_duration=1200.0,
+            scene_changes=[100.0, 300.0, 700.0],
+            min_clip_seconds=90.0,
+            max_clip_seconds=120.0,
+            gap_seconds=gap,
+        )
+
+        assert specs
+        assert all(
+            later.start_sec > earlier.start_sec
+            for earlier, later in zip(specs, specs[1:])
+        )
+
+    def test_the_shortest_clip_the_api_allows_with_the_largest_gap(self):
+        """min_clip_seconds=5 and gap_seconds=10 are both inside the schema."""
+        specs = cutting.build_scene_slices(
+            source_duration=300.0,
+            scene_changes=[],
+            min_clip_seconds=5.0,
+            max_clip_seconds=10.0,
+            gap_seconds=10.0,
+        )
+
+        assert 0 < len(specs) < 200
+        assert all(
+            later.start_sec > earlier.start_sec
+            for earlier, later in zip(specs, specs[1:])
+        )

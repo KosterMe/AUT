@@ -15,13 +15,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.domain.composition import LAYOUT_AUTO, LAYOUT_SPLIT, PLANNABLE_LAYOUTS
 from app.domain.cutting import CUTTER_SCENES, CUTTER_SPEECH, CUTTERS
-
-# Tag a library asset must carry to be usable as the bottom half of a split
-# screen. Not a setting: it is part of what "the split profile" means, and an
-# operator who wants different footage there changes the tag on the asset.
-BACKGROUND_TAG = "background"
+from app.domain.style import (
+    BACKGROUND_TAG,
+    LAYOUT_AUTO,
+    LAYOUT_SPLIT,
+    PLANNABLE_LAYOUTS,
+)
 
 
 @dataclass(frozen=True)
@@ -122,6 +122,23 @@ def get(name: str | None) -> Profile:
     return _BY_NAME[resolved]
 
 
+def style_overrides(profile: Profile) -> dict:
+    """The profile's opinions, in the shape a `StyleSpec` merges.
+
+    Only the fields a profile actually has a view on. Everything else — the
+    zoom, the grade, the type — is left to the layers underneath, which is
+    what makes a profile a statement about the *material* rather than a
+    complete look.
+    """
+    return {
+        "framing": {"layout": profile.layout, "companion_tag": profile.companion_tag or None},
+        "pacing": {"remove_silence": profile.remove_silence},
+        "inserts": {"enabled": profile.inserts},
+        "audio": {"music": profile.music, "sfx": profile.sfx},
+        "subtitles": {"enabled": profile.burn_subtitles},
+    }
+
+
 def resolve(profile: Profile, overrides: dict | None = None) -> dict:
     """The profile's decisions, with any explicit overrides applied.
 
@@ -158,4 +175,5 @@ __all__ = [
     "TALKING",
     "get",
     "resolve",
+    "style_overrides",
 ]

@@ -25,8 +25,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from app.core.config import get_settings
-from app.domain.composition import INSERT_FULL, INSERT_KINDS, Composition, Insert
+from app.domain.composition import Composition, Insert
+from app.domain.style import InsertPolicy
 from app.domain.subtitles import SubtitleCue
 
 # Shortest tag that is matched by stem rather than exactly. Below this a tag is
@@ -59,48 +59,6 @@ class AssetOption:
     # insert. Kept on the same value object because the library is one library.
     audio: bool = False
     last_used_rank: int = 0
-
-
-@dataclass(frozen=True)
-class InsertPolicy:
-    """How much b-roll a clip may carry, and where it may go."""
-
-    kind: str = INSERT_FULL
-    max_inserts: int = 4
-    min_seconds: float = 1.5
-    max_seconds: float = 3.5
-    # Space between inserts. Without it a paragraph dense in keywords turns
-    # into a slideshow.
-    min_gap_seconds: float = 6.0
-    hook_guard_seconds: float = 2.5
-    tail_guard_seconds: float = 1.5
-    # Ceiling on how much of the clip may be covered, as a fraction.
-    max_share: float = 0.35
-    # Used only when nothing matched by keyword: place inserts on a fixed beat.
-    cadence_seconds: float = 12.0
-    cadence_when_no_match: bool = True
-
-    @classmethod
-    def from_settings(cls) -> "InsertPolicy":
-        configured = get_settings().inserts
-        return cls(
-            kind=configured.kind,
-            max_inserts=configured.max_per_clip,
-            min_seconds=configured.min_seconds,
-            max_seconds=configured.max_seconds,
-            min_gap_seconds=configured.min_gap_seconds,
-            hook_guard_seconds=configured.hook_guard_seconds,
-            tail_guard_seconds=configured.tail_guard_seconds,
-            max_share=configured.max_share,
-            cadence_seconds=configured.cadence_seconds,
-            cadence_when_no_match=configured.cadence_when_no_match,
-        )
-
-    def __post_init__(self) -> None:
-        if self.kind not in INSERT_KINDS:
-            raise ValueError(f"unknown insert kind {self.kind!r}")
-        if self.min_seconds > self.max_seconds:
-            raise ValueError("min_seconds must not exceed max_seconds")
 
 
 @dataclass(frozen=True)

@@ -44,11 +44,23 @@ def create_job(payload: ClipJobCreate, session: Session = Depends(db_session)):
         max_clip_seconds=payload.max_clip_seconds,
         gap_seconds=payload.gap_seconds,
         max_clips=payload.max_clips,
-        render=payload.render.model_dump(),
+        render=_render_payload(payload.render),
+        style_id=payload.style_id,
     )
     session.commit()
     session.refresh(job)
     return job
+
+
+def _render_payload(options) -> dict:
+    """The render options, with the flat switches folded into a style.
+
+    Two vocabularies reach this endpoint — the handful of loose booleans the
+    API has always taken, and the style itself — and exactly one leaves it.
+    """
+    payload = options.model_dump()
+    payload["style"] = options.to_style_overrides()
+    return payload
 
 
 @router.get("/{job_id}", response_model=ClipJobDetail)
@@ -73,7 +85,8 @@ def start_job(
         gap_seconds=payload.gap_seconds,
         max_clips=payload.max_clips,
         profile=payload.profile,
-        render=payload.render.model_dump(),
+        render=_render_payload(payload.render),
+        style_id=payload.style_id,
     )
     session.commit()
     return clip_jobs.get(session, job_id)

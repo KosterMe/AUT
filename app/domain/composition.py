@@ -26,29 +26,24 @@ Two properties are load-bearing for the renderer:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Iterable
+from dataclasses import dataclass, field, fields as dataclass_fields, replace
+from typing import Any, Iterable, Mapping
 
+from app.domain.style import (
+    INSERT_FULL,
+    INSERT_KINDS,
+    INSERT_PIP,
+    LAYOUT_AUTO,
+    LAYOUT_BLUR,
+    LAYOUT_FILL,
+    LAYOUT_SPLIT,
+    LAYOUTS,
+    PLANNABLE_LAYOUTS,
+    StyleSpec,
+)
 from app.domain.subtitles import SubtitleCue, TimelineSegment
 
-VERSION = 1
-
-# How a segment fills the canvas.
-LAYOUT_BLUR = "blur"    # the source fitted over a blurred, zoomed copy of itself
-LAYOUT_FILL = "fill"    # the source cropped to fill the canvas, no backdrop
-LAYOUT_SPLIT = "split"  # the source on top, a companion source below
-LAYOUTS = (LAYOUT_BLUR, LAYOUT_FILL, LAYOUT_SPLIT)
-
-# What a profile may ask for, as opposed to what a segment may be. "auto" is a
-# question — fill or blur, decided from the source's shape when the clip is
-# planned — so it is legal to request and never legal to render.
-LAYOUT_AUTO = "auto"
-PLANNABLE_LAYOUTS = (LAYOUT_AUTO, *LAYOUTS)
-
-# What an insert does to the picture underneath it.
-INSERT_FULL = "broll_full"  # covers the frame
-INSERT_PIP = "broll_pip"    # a smaller box in a corner
-INSERT_KINDS = (INSERT_FULL, INSERT_PIP)
+VERSION = 2
 
 # Shorter than this a segment is not worth a cut — and, more practically, is
 # shorter than the seek accuracy of most sources.
@@ -202,11 +197,13 @@ class SubtitleSpec:
     Both live here together because they are written into the same .ass file —
     which is why a clip rendered with subtitles disabled still shows its
     headline.
+
+    What the text *looks like* is deliberately absent: the font, its size and
+    where it sits are `style.subtitles`, and having them here as well would be
+    two sources of truth for one line of an .ass file.
     """
 
     cues: tuple[SubtitleCue, ...] = ()
-    font_size: int = 64
-    position_percent: int = 74
     title_text: str | None = None
 
     @property
@@ -224,7 +221,10 @@ class Composition:
     subtitles: SubtitleSpec | None = None
     music: MusicBed | None = None
     effects: tuple[SoundEffect, ...] = ()
-    crf: int = 23
+    # How all of it looks. Resolved once when the clip is planned and carried
+    # here, so a render depends on nothing that could have changed underneath
+    # it: the same composition renders the same video a month later.
+    style: StyleSpec = field(default_factory=StyleSpec.from_settings)
     version: int = VERSION
 
     def __post_init__(self) -> None:
@@ -247,6 +247,11 @@ class Composition:
     @property
     def duration_sec(self) -> float:
         return round(sum(segment.duration_sec for segment in self.segments), 3)
+
+    @property
+    def crf(self) -> int:
+        """Delivery quality. Reads through to the style so there is one of it."""
+        return self.style.delivery.crf
 
     @property
     def layouts(self) -> frozenset[str]:
@@ -310,7 +315,7 @@ def single_source(
     companion_start_sec: float = 0.0,
     inserts: Iterable[Insert] = (),
     subtitles: SubtitleSpec | None = None,
-    crf: int = 23,
+    style: StyleSpec | None = None,
 ) -> Composition:
     """A composition cut from one file — the shape every clip has today.
 
@@ -357,13 +362,219 @@ def single_source(
             )
         ]
 
+    resolved_style = style or StyleSpec.from_settings()
     return Composition(
         segments=tuple(segments),
-        canvas=canvas or Canvas(),
+        canvas=canvas or canvas_for(resolved_style),
         inserts=tuple(inserts),
         subtitles=subtitles,
-        crf=crf,
+        style=resolved_style,
     )
+
+
+def canvas_for(style: StyleSpec) -> Canvas:
+    """The frame a style asks for. The one place the two can disagree."""
+    return Canvas(
+        width=style.delivery.width, height=style.delivery.height, fps=style.delivery.fps
+    )
+
+
+# ------------------------------------------------------------- serialisation
+
+
+def to_dict(composition: Composition) -> dict[str, Any]:
+    """A composition as plain JSON-able data.
+
+    Stored on the clip it produced, which is what makes a render inspectable
+    after the fact and repeatable a month later: everything that shaped the
+    video is here, the style included, so nothing has to be guessed from the
+    configuration the worker happened to be running at the time.
+    """
+    return {
+        "version": composition.version,
+        "canvas": {
+            "width": composition.canvas.width,
+            "height": composition.canvas.height,
+            "fps": composition.canvas.fps,
+        },
+        "segments": [_asdict(segment) for segment in composition.segments],
+        "inserts": [_asdict(insert) for insert in composition.inserts],
+        "subtitles": None if composition.subtitles is None else {
+            "cues": [_asdict(cue) for cue in composition.subtitles.cues],
+            "title_text": composition.subtitles.title_text,
+        },
+        "music": None if composition.music is None else _asdict(composition.music),
+        "effects": [_asdict(effect) for effect in composition.effects],
+        "style": composition.style.to_dict(),
+    }
+
+
+def from_dict(data: Mapping[str, Any]) -> Composition:
+    """Rebuild a composition stored by `to_dict`.
+
+    Tolerant on the way in: a document written by an older version is missing
+    fields that now exist, and the defaults are the right answer for those. A
+    document that is structurally wrong still raises — a composition that
+    cannot be trusted should not quietly render as something else.
+    """
+    canvas_data = data.get("canvas") or {}
+    canvas = Canvas(
+        width=int(canvas_data.get("width", 1080)),
+        height=int(canvas_data.get("height", 1920)),
+        fps=int(canvas_data.get("fps", 30)),
+    )
+    subtitles_data = data.get("subtitles")
+    subtitles = None
+    if isinstance(subtitles_data, Mapping):
+        subtitles = SubtitleSpec(
+            cues=tuple(
+                SubtitleCue(**_only(cue, SubtitleCue))
+                for cue in subtitles_data.get("cues") or []
+            ),
+            title_text=subtitles_data.get("title_text"),
+        )
+    music_data = data.get("music")
+    return Composition(
+        segments=tuple(Segment(**_only(item, Segment)) for item in data.get("segments") or []),
+        canvas=canvas,
+        inserts=tuple(Insert(**_only(item, Insert)) for item in data.get("inserts") or []),
+        subtitles=subtitles,
+        music=MusicBed(**_only(music_data, MusicBed)) if isinstance(music_data, Mapping) else None,
+        effects=tuple(
+            SoundEffect(**_only(item, SoundEffect)) for item in data.get("effects") or []
+        ),
+        style=StyleSpec.from_dict(data.get("style")),
+    )
+
+
+def _asdict(value: Any) -> dict[str, Any]:
+    return {f.name: getattr(value, f.name) for f in dataclass_fields(value)}
+
+
+def _only(data: Mapping[str, Any], kind: type) -> dict[str, Any]:
+    """The keys `kind` actually has, so an extra one cannot raise TypeError."""
+    known = {f.name for f in dataclass_fields(kind)}
+    return {key: value for key, value in data.items() if key in known}
+
+
+# ------------------------------------------------------------------- excerpts
+
+
+def excerpt(composition: Composition, *, at_sec: float, duration_sec: float) -> Composition:
+    """The window of a composition between `at_sec` and `at_sec + duration_sec`.
+
+    This is what makes a preview cheap. Trimming the description rather than
+    the finished file means ffmpeg only ever decodes the seconds being looked
+    at — the difference between a second and half a minute — and everything
+    laid over the clip moves with it, so what the window shows is what the
+    full render would have put there.
+    """
+    window_start = max(0.0, float(at_sec))
+    window_end = min(composition.duration_sec, window_start + max(0.01, float(duration_sec)))
+    if window_end <= window_start:
+        raise ValueError("an excerpt window has to fall inside the composition")
+
+    segments: list[Segment] = []
+    for segment, placed in zip(composition.segments, composition.timeline()):
+        start = max(placed.output_start_sec, window_start)
+        end = min(placed.output_end_sec, window_end)
+        if end - start < MIN_SEGMENT_SECONDS:
+            continue
+        lead = start - placed.output_start_sec
+        segments.append(
+            Segment(
+                source_path=segment.source_path,
+                source_start_sec=round(segment.source_start_sec + lead, 3),
+                source_end_sec=round(segment.source_start_sec + lead + (end - start), 3),
+                layout=segment.layout,
+                companion_path=segment.companion_path,
+                # The companion runs continuously under the clip, so it is
+                # picked up where the window starts rather than restarted.
+                companion_start_sec=round(segment.companion_start_sec + lead, 3),
+            )
+        )
+    if not segments:
+        raise ValueError("the excerpt window falls between segments")
+
+    length = round(sum(segment.duration_sec for segment in segments), 3)
+    inserts: list[Insert] = []
+    for insert in composition.inserts:
+        start = max(insert.at_sec, window_start)
+        end = min(insert.end_sec, window_end)
+        if end - start <= 0.01:
+            continue
+        at = min(start - window_start, length)
+        inserts.append(
+            Insert(
+                kind=insert.kind,
+                source_path=insert.source_path,
+                at_sec=round(at, 3),
+                duration_sec=round(min(end - start, max(0.01, length - at)), 3),
+                source_start_sec=round(insert.source_start_sec + (start - insert.at_sec), 3),
+                still=insert.still,
+            )
+        )
+
+    subtitles = composition.subtitles
+    if subtitles is not None:
+        subtitles = SubtitleSpec(
+            cues=tuple(
+                SubtitleCue(
+                    start_sec=round(max(cue.start_sec, window_start) - window_start, 3),
+                    end_sec=round(min(cue.end_sec, window_end) - window_start, 3),
+                    text=cue.text,
+                )
+                for cue in subtitles.cues
+                if cue.end_sec > window_start and cue.start_sec < window_end
+            ),
+            title_text=subtitles.title_text,
+        )
+
+    music = composition.music
+    if music is not None:
+        # The bed advances with the clip: a preview of the last ten seconds
+        # should hear the part of the track that plays there.
+        music = replace(music, start_sec=round(music.start_sec + window_start, 3))
+
+    return replace(
+        composition,
+        segments=tuple(segments),
+        inserts=tuple(inserts),
+        subtitles=subtitles,
+        music=music,
+        effects=tuple(
+            replace(effect, at_sec=round(effect.at_sec - window_start, 3))
+            for effect in composition.effects
+            if window_start <= effect.at_sec <= window_end
+        ),
+    )
+
+
+def scaled(composition: Composition, factor: float) -> Composition:
+    """The same composition rendered into a smaller frame.
+
+    Only the canvas and the type size move: everything positional in this model
+    is already expressed as a share of the frame, so a half-size preview is the
+    same picture — and the one thing that would not survive being scaled, the
+    font size, is in pixels and is scaled here explicitly.
+    """
+    if not 0.05 <= factor <= 1.0:
+        raise ValueError("a preview scale is a fraction of the delivery size")
+    canvas = Canvas(
+        width=max(2, int(composition.canvas.width * factor) // 2 * 2),
+        height=max(2, int(composition.canvas.height * factor) // 2 * 2),
+        fps=composition.canvas.fps,
+    )
+    style = replace(
+        composition.style,
+        subtitles=composition.style.subtitles.merged(
+            {"font_size": max(8, int(composition.style.subtitles.font_size * factor))}
+        ),
+        delivery=composition.style.delivery.merged(
+            {"width": canvas.width, "height": canvas.height}
+        ),
+    )
+    return replace(composition, canvas=canvas, style=style)
 
 
 __all__ = [
@@ -383,7 +594,13 @@ __all__ = [
     "PLANNABLE_LAYOUTS",
     "Segment",
     "SoundEffect",
+    "StyleSpec",
     "SubtitleSpec",
     "VERSION",
+    "canvas_for",
+    "excerpt",
+    "from_dict",
+    "scaled",
     "single_source",
+    "to_dict",
 ]

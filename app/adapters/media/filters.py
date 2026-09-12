@@ -46,7 +46,9 @@ def fontsdir_arg() -> str:
     return f":fontsdir='{path(directory)}'" if directory else ""
 
 
-def background(width: int, height: int, *, src: str, out: str, divisor: int) -> str:
+def background(
+    width: int, height: int, *, src: str, out: str, divisor: int, radius: float = 24.0
+) -> str:
     """The blurred backdrop behind a letterboxed picture.
 
     Blurring 1080x1920 directly is the single most expensive filter in the
@@ -58,14 +60,14 @@ def background(width: int, height: int, *, src: str, out: str, divisor: int) -> 
     if divisor <= 1:
         return (
             f"{src}scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height},boxblur=24:1[{out}]"
+            f"crop={width}:{height},boxblur={max(1, round(radius))}:1[{out}]"
         )
     small_width = max(2, (width // divisor) // 2 * 2)
     small_height = max(2, (height // divisor) // 2 * 2)
-    radius = max(1, round(24 / divisor))
+    scaled_radius = max(1, round(radius / divisor))
     return (
         f"{src}scale={small_width}:{small_height}:force_original_aspect_ratio=increase,"
-        f"crop={small_width}:{small_height},boxblur={radius}:1,"
+        f"crop={small_width}:{small_height},boxblur={scaled_radius}:1,"
         f"scale={width}:{height}[{out}]"
     )
 

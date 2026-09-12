@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { Plus, Scissors } from "lucide-react";
 import { Jobs, errorMessage } from "../api/client";
-import { keys, useInvalidatingMutation, useJobs } from "../api/hooks";
+import { keys, useInvalidatingMutation, useJobs, useStyles } from "../api/hooks";
 import StatusBadge from "../components/StatusBadge";
 import { JOB_PROFILES } from "../api/types";
 import type { ClipJob, JobProfile } from "../api/types";
@@ -86,6 +86,7 @@ function NewJobForm() {
   const [open, setOpen] = useState(false);
   const [sourceRef, setSourceRef] = useState("");
   const [profile, setProfile] = useState<JobProfile>("talking");
+  const [styleId, setStyleId] = useState("");
   const [customTitle, setCustomTitle] = useState("");
   const [captionTags, setCaptionTags] = useState("");
   const [minSeconds, setMinSeconds] = useState(90);
@@ -93,6 +94,7 @@ function NewJobForm() {
   const [maxClips, setMaxClips] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
+  const { data: styles } = useStyles();
   const create = useInvalidatingMutation(Jobs.create, [keys.jobs]);
 
   if (!open) {
@@ -111,6 +113,7 @@ function NewJobForm() {
       {
         source_ref: sourceRef.trim(),
         profile,
+        style_id: styleId ? Number(styleId) : null,
         custom_title: customTitle.trim() || null,
         caption_tags: captionTags.trim() || null,
         min_clip_seconds: minSeconds,
@@ -163,6 +166,24 @@ function NewJobForm() {
         </div>
         <p className="text-xs text-slate-400 mt-1">
           {JOB_PROFILES.find((option) => option.id === profile)?.hint}
+        </p>
+      </div>
+
+      <div>
+        <label className="label">Look (optional)</label>
+        <select className="input" value={styleId} onChange={(e) => setStyleId(e.target.value)}>
+          <option value="">The profile's own defaults</option>
+          {styles?.map((preset) => (
+            <option key={preset.id} value={preset.id}>
+              {preset.name}
+            </option>
+          ))}
+        </select>
+        <p className="text-xs text-slate-400 mt-1">
+          A saved look overrides the parts of the profile it has an opinion about.{" "}
+          <Link to="/looks" className="text-brand-600 hover:underline">
+            Edit looks
+          </Link>
         </p>
       </div>
 

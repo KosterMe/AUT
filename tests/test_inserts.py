@@ -198,27 +198,30 @@ def test_a_still_is_held_for_the_full_length_and_marked_as_one():
 # --- fallbacks --------------------------------------------------------------
 
 
-def test_clips_that_match_nothing_fall_back_to_a_fixed_beat():
-    """A library still gets used on material it has no vocabulary for."""
+def test_a_clip_that_matches_nothing_gets_nothing():
+    """The default, and the point of tagging at all.
+
+    With the fixed-beat fallback on, a library lands on every clip whatever it
+    is about: a QR code tagged "машина, мусор" went onto twenty consecutive
+    clips of a podcast that mentioned neither. Tags decide, or they decide
+    nothing."""
+    composition = clip(duration=40.0, cues=words((10.0, "погода"), (20.0, "разговор")))
+    library = [asset(1, "машина"), asset(2, "самолёт"), asset(3, "город")]
+
+    assert inserts.choose_inserts(composition, assets=library) == ()
+
+
+def test_the_fixed_beat_fallback_still_exists_for_a_library_of_filler():
     composition = clip(duration=40.0, cues=words((10.0, "погода"), (20.0, "разговор")))
     library = [asset(1, "машина"), asset(2, "самолёт"), asset(3, "город")]
 
     chosen = inserts.choose_inserts(
-        composition, assets=library, policy=inserts.InsertPolicy(cadence_seconds=12.0)
+        composition,
+        assets=library,
+        policy=inserts.InsertPolicy(cadence_seconds=12.0, cadence_when_no_match=True),
     )
 
     assert [insert.at_sec for insert in chosen] == [2.5, 14.5, 26.5]
-
-
-def test_the_fallback_can_be_switched_off():
-    composition = clip(cues=words((10.0, "погода")))
-
-    chosen = inserts.choose_inserts(
-        composition, assets=[asset(1, "машина")],
-        policy=inserts.InsertPolicy(cadence_when_no_match=False),
-    )
-
-    assert chosen == ()
 
 
 def test_a_library_of_nothing_but_audio_produces_nothing():
@@ -243,11 +246,23 @@ def test_an_empty_library_produces_nothing():
     assert inserts.choose_inserts(clip(cues=words((10.0, "машина"))), assets=[]) == ()
 
 
-def test_a_clip_without_subtitles_still_gets_the_cadence():
-    """Subtitles disabled means no cues to match against, not no b-roll."""
+def test_a_clip_without_subtitles_gets_no_broll():
+    """No cues is no words, and words are the only thing that places b-roll.
+
+    Turning subtitles off used to turn the whole library on instead."""
     composition = comp.Composition(segments=(comp.Segment(CLIP, 0.0, 30.0),))
 
-    chosen = inserts.choose_inserts(composition, assets=[asset(1, "машина")])
+    assert inserts.choose_inserts(composition, assets=[asset(1, "машина")]) == ()
+
+
+def test_a_clip_without_subtitles_takes_the_beat_when_it_is_asked_for():
+    composition = comp.Composition(segments=(comp.Segment(CLIP, 0.0, 30.0),))
+
+    chosen = inserts.choose_inserts(
+        composition,
+        assets=[asset(1, "машина")],
+        policy=inserts.InsertPolicy(cadence_when_no_match=True),
+    )
 
     assert len(chosen) == 1
 

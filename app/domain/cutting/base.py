@@ -49,6 +49,23 @@ def title_from_text(text: str, index: int) -> str:
     return text[:TITLE_MAX_CHARS].strip() or f"slice {index}"
 
 
+def next_start(current_start: float, clip_end: float, gap_seconds: float) -> float:
+    """Where the clip after this one begins.
+
+    The gap is an overlap — the next clip starts slightly before this one
+    ended, so a sentence cut in half is present in both. It is not a rewind.
+    A gap as long as the clip itself puts the next start back where the
+    current one began, and a cutter driving its cursor from this value then
+    never finishes: `gap_seconds=90` with 90-second clips looped forever,
+    appending a slice every pass until the worker was killed.
+
+    So the overlap is honoured only as far as it still moves forward, and
+    every clip advances the cursor by at least `MIN_USABLE_SECONDS`.
+    """
+    overlapped = max(0.0, clip_end - max(0.0, float(gap_seconds)))
+    return max(overlapped, current_start + MIN_USABLE_SECONDS)
+
+
 def renumber(specs: list[SliceSpec]) -> list[SliceSpec]:
     """Give slices consecutive 1-based indexes after filtering or reordering."""
     import dataclasses

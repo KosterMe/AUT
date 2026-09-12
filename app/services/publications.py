@@ -29,6 +29,13 @@ from app.tasks import queue
 
 log = logging.getLogger(__name__)
 
+# Long enough to notice a bulk retry and stop it, short enough not to be a wait.
+RETRY_HEAD_START_MINUTES = 5
+# Floor for the gap between two retried posts, whatever the original schedule
+# said — publications that were all due at the same minute must not go out in
+# the same minute either.
+MIN_RETRY_SPACING_MINUTES = 2
+
 
 def get(session: Session, publication_id: int) -> Publication:
     row = session.get(Publication, publication_id)
@@ -68,13 +75,20 @@ def schedule_clip(
     if not clip.video_path:
         raise ConflictError("clip has no rendered file")
 
+    # The request's own mistakes first. Checking the clip's existing booking
+    # before them answered "this clip is already scheduled" to a request that
+    # named an account which does not exist, or a time in the past — true, but
+    # not the thing the caller got wrong.
+    account = account_service.get_ready(session, username)
+    _assert_future(scheduled_at)
+    _assert_publishable(options)
+
     existing = active_for_clip(session, clip_id)
     if existing is not None:
         raise ConflictError(
             f"clip is already scheduled as publication #{existing.id} ({existing.status})"
         )
 
-    account = account_service.get_ready(session, username)
     job = session.get(ClipJob, clip.job_id)
     return _create(
         session,
@@ -211,12 +225,17 @@ def cancel_scheduled(session: Session, *, job_id: int | None = None) -> list[Pub
     return cancelled
 
 
-def retry(session: Session, publication_id: int) -> Publication:
+def retry(
+    session: Session, publication_id: int, *, at: datetime | None = None
+) -> Publication:
     """Put a failed publication back in the queue.
 
     Deliberately manual. A publish can fail *after* TikTok accepted the video,
     so retrying automatically risks a duplicate post; a person should check the
     account first.
+
+    `at` moves it to a specific time instead of straight away, which is what
+    keeps a bulk retry from firing everything at once.
     """
     row = get(session, publication_id)
     if row.status != PublicationStatus.FAILED:
@@ -230,12 +249,78 @@ def retry(session: Session, publication_id: int) -> Publication:
 
     row.status = PublicationStatus.SCHEDULED
     row.result_text = None
-    row.scheduled_at = utc_now()
+    row.scheduled_at = to_utc_naive(at) if at is not None else utc_now()
     row.updated_at = utc_now()
     session.add(row)
     session.flush()
     _enqueue_task(session, row)
     return row
+
+
+def retry_untouched(session: Session, *, job_id: int | None = None) -> list[Publication]:
+    """Re-queue the failures where nothing was ever sent to TikTok.
+
+    `retry` is deliberately one at a time, because an upload can fail *after*
+    TikTok accepted the video and a blind retry would post it twice. That
+    caution does not apply to a publication that never got as far as
+    uploading: an account logged out, a missing file, a video that could not
+    be resolved. The queue already records the difference — the handler marks
+    its task irreversible on the line before the upload starts — so this
+    retries exactly the ones that cannot duplicate anything.
+
+    The case it exists for: one expired session turns every publication queued
+    behind it into a separate failure, at its own scheduled minute, each
+    needing its own click to recover. Twelve of them, in the run that led to
+    this function.
+    """
+    query = select(Publication).where(Publication.status == PublicationStatus.FAILED)
+    if job_id is not None:
+        clip_ids = session.exec(select(col(Clip.id)).where(Clip.job_id == job_id)).all()
+        query = query.where(col(Publication.clip_id).in_(clip_ids))
+
+    candidates = [
+        row
+        for row in session.exec(query.order_by(col(Publication.scheduled_at))).all()
+        if not _upload_may_have_started(session, row)
+    ]
+
+    retried: list[Publication] = []
+    for slot, row in zip(_restart_times(candidates), candidates):
+        retried.append(retry(session, int(row.id), at=slot))
+    if retried:
+        log.info("re-queued %d publication(s) that never reached TikTok", len(retried))
+    return retried
+
+
+def _restart_times(rows: list[Publication]) -> list[datetime]:
+    """New times that keep the gaps the original schedule had.
+
+    Sending all of them at once is the one thing a bulk retry must not do:
+    TikTok rate-limits bursts from an account, and a wall of clips posted in
+    one minute reads as spam to viewers as well. So the first goes out shortly
+    from now and the rest keep the spacing they were given, whatever it was.
+    """
+    if not rows:
+        return []
+    start = aware_utc_now() + timedelta(minutes=RETRY_HEAD_START_MINUTES)
+    times = [start]
+    for previous, row in zip(rows, rows[1:]):
+        gap = row.scheduled_at - previous.scheduled_at
+        times.append(times[-1] + max(gap, timedelta(minutes=MIN_RETRY_SPACING_MINUTES)))
+    return times
+
+
+def _upload_may_have_started(session: Session, publication: Publication) -> bool:
+    """Whether this publication's last attempt got as far as sending bytes.
+
+    Unknown counts as yes. A task that has been swept away takes the evidence
+    with it, and the safe reading of "no evidence" is that the video might be
+    live.
+    """
+    if publication.task_id is None:
+        return True
+    task = session.get(Task, publication.task_id)
+    return task is None or bool(task.irreversible)
 
 
 def delete(session: Session, publication_id: int) -> None:
@@ -320,11 +405,8 @@ def _create(
     options: dict | None,
 ) -> Publication:
     _assert_future(scheduled_at)
+    _assert_publishable(options)
     options = dict(options or {})
-    if int(options.get("visibility_type", 0)) == 1:
-        # A private video cannot be scheduled: TikTok will not accept it, and
-        # discovering that at publish time wastes the slot.
-        raise ValidationError("private videos (visibility_type=1) cannot be scheduled")
 
     row = Publication(
         account_id=account.id,
@@ -361,6 +443,18 @@ def _editable(session: Session, publication_id: int) -> Publication:
     if row.status != PublicationStatus.SCHEDULED:
         raise ConflictError(f"cannot modify a publication in state '{row.status}'")
     return row
+
+
+def _assert_publishable(options: dict | None) -> None:
+    """Reject options TikTok will refuse, before anything is written down.
+
+    A private video cannot be scheduled: TikTok will not accept it, and
+    finding that out at publish time wastes the slot. Checked at the top of
+    `schedule_clip` as well as here, because a request that gets both this and
+    the clip's existing booking wrong should hear about its own mistake first.
+    """
+    if options and int(options.get("visibility_type", 0)) == 1:
+        raise ValidationError("private videos (visibility_type=1) cannot be scheduled")
 
 
 def _assert_future(value: datetime) -> None:

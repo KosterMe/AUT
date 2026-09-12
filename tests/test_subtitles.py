@@ -289,3 +289,35 @@ def test_cover_ass_writer_has_title_and_part_badge(tmp_path):
     assert "Мой Влог" in content
     # Part badge is upper-cased for emphasis.
     assert "ЧАСТЬ 12" in content
+
+
+def test_the_casing_policy_applies_to_a_clip_with_no_word_timings():
+    """A style asking for uppercase used to get it only on clips whose words
+    were timed — so the same preset produced two different looks depending on
+    where the transcript came from."""
+    timeline = [subtitles.TimelineSegment(0.0, 10.0, 0.0, 10.0)]
+    opts = subtitles.CueOptions(uppercase=True)
+
+    cues = subtitles.make_subtitle_cues(
+        [], timeline_segments=timeline, fallback_text="привет мир", options=opts
+    )
+
+    assert cues and cues[0].text == "ПРИВЕТ МИР"
+
+
+def test_the_style_decides_the_casing_on_both_paths():
+    from app.domain.style import SubtitleStyle
+
+    timeline = [subtitles.TimelineSegment(0.0, 10.0, 0.0, 10.0)]
+    style = SubtitleStyle(uppercase=True)
+
+    timed = subtitles.make_subtitle_cues(
+        [{"start_sec": 0.0, "end_sec": 1.0, "text": "привет",
+          "words": [{"text": "привет", "start_sec": 0.0, "end_sec": 0.6}]}],
+        timeline_segments=timeline, style=style,
+    )
+    untimed = subtitles.make_subtitle_cues(
+        [], timeline_segments=timeline, fallback_text="привет", style=style
+    )
+
+    assert timed[0].text == untimed[0].text == "ПРИВЕТ"

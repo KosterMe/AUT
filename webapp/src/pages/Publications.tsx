@@ -23,6 +23,15 @@ export default function PublicationsPage() {
     [keys.publications(), keys.publications("scheduled")],
   );
 
+  // Safe in bulk because the API skips anything whose upload had started; the
+  // rest never sent a byte, which is what an expired session leaves behind —
+  // one failure per scheduled minute, each otherwise needing its own click.
+  const retryAll = useInvalidatingMutation(
+    () => Publications.retryUntouched(),
+    [keys.publications(), keys.publications("failed"), keys.publications("scheduled")],
+  );
+  const failedCount = publications?.filter((p) => p.status === "failed").length ?? 0;
+
   const accountName = (id: number) =>
     accounts?.find((a) => a.id === id)?.username ?? `#${id}`;
 
@@ -35,17 +44,38 @@ export default function PublicationsPage() {
             Every post, waiting or already out.
           </p>
         </div>
-        <button
-          className="btn-secondary"
-          onClick={() => {
-            if (confirm("Cancel every post that has not gone out yet?")) {
-              cancelAll.mutate(undefined);
-            }
-          }}
-        >
-          <XCircle size={16} />
-          Cancel all pending
-        </button>
+        <div className="flex gap-2">
+          {failedCount > 0 && (
+            <button
+              className="btn-secondary"
+              onClick={() => {
+                if (
+                  confirm(
+                    "Re-queue the failures that never reached TikTok? Anything whose " +
+                      "upload had already started is left alone — retry those one by one " +
+                      "after checking the account.",
+                  )
+                ) {
+                  retryAll.mutate(undefined);
+                }
+              }}
+            >
+              <RotateCcw size={16} />
+              Retry what never posted
+            </button>
+          )}
+          <button
+            className="btn-secondary"
+            onClick={() => {
+              if (confirm("Cancel every post that has not gone out yet?")) {
+                cancelAll.mutate(undefined);
+              }
+            }}
+          >
+            <XCircle size={16} />
+            Cancel all pending
+          </button>
+        </div>
       </header>
 
       <div className="flex gap-2">

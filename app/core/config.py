@@ -142,6 +142,21 @@ class QueueSettings(BaseSettings):
     # How many tasks one worker process runs at once.
     concurrency: int = 1
 
+    @field_validator("concurrency")
+    @classmethod
+    def _at_least_one_thread(cls, value: int) -> int:
+        """Zero starts a worker that polls nothing and says nothing about it.
+
+        The container comes up, reports healthy, logs "worker started" — and
+        the queue simply never moves. Scheduled posts stop going out with
+        nothing anywhere to explain why.
+        """
+        if value < 1:
+            raise ValueError("must be at least 1; a worker with no threads runs nothing")
+        if value > 64:
+            raise ValueError("must be 64 or fewer; this is a thread count, not a queue size")
+        return value
+
     @field_validator("poll_seconds", "heartbeat_seconds", "lease_seconds")
     @classmethod
     def _positive(cls, value: float) -> float:
@@ -194,6 +209,24 @@ class YouTubeSettings(BaseSettings):
     pot_base_url: str = ""
     socket_timeout: int = 20
     retries: int = 10
+    # Cap on the source's smallest dimension (yt-dlp's `res`, so it reads the
+    # same for a landscape and a portrait video). Everything downloaded here
+    # exists to be re-encoded into a 1080x1920 canvas, and yt-dlp's own idea
+    # of "best" ignores that: on one 24-minute source it chose AV1 2160p at
+    # 540 MB where the 1080p rendition is 158 MB and nothing above 1080 ever
+    # reaches the screen. The extra pixels are paid for twice — once on a link
+    # that drops large transfers, and again in every render, which decodes 4K
+    # AV1 to produce a frame 1080 wide. 0 disables the cap.
+    max_resolution: int = 1080
+    # Which video codec to prefer at that resolution. A source is downloaded
+    # once and decoded again for every clip cut out of it — fifteen to twenty
+    # times for one video — so the decoder's cost is paid over and over while
+    # the file crosses the wire once. Measured in CPU seconds over 60 s of
+    # source, decode plus the real filter chain and an x264 encode: 140.4 for
+    # the AV1 2160p yt-dlp picks by itself, 90.0 for AV1 1080p, 75.4 for H.264
+    # 1080p. H.264 costs 55 MB more to download and gives back 16% of every
+    # render. Empty leaves the choice to yt-dlp.
+    prefer_codec: str = "h264"
     # yt-dlp inherits HTTP_PROXY/HTTPS_PROXY from the shell otherwise, which
     # trips YouTube bot checks. Empty string means "explicitly no proxy";
     # unset the variable entirely only if you want inheritance back.
@@ -239,9 +272,15 @@ class WhisperSettings(BaseSettings):
 
     # Performance only — these must not affect transcript text or cache keys.
     cpu_threads: int = 0
+    # Also the ceiling on chunk parallelism below: a shared CTranslate2 model
+    # runs `num_workers` inferences at once and queues the rest.
     num_workers: int = 1
 
-    # Chunk-parallel transcription: a big win for slow models on long media.
+    # Chunk-parallel transcription: a big win for slow models on long media,
+    # but only together with `num_workers`. On its own `chunked` splits the
+    # audio and then feeds the chunks through one at a time — the same work
+    # plus one ffmpeg extraction per chunk, so slightly slower than not
+    # chunking at all. Raise both or neither.
     chunked: bool = False
     chunk_seconds: float = 300.0
     chunk_overlap_seconds: float = 1.5
@@ -484,10 +523,12 @@ class InsertSettings(BaseSettings):
     tail_guard_seconds: float = Field(default=1.5, ge=0.0, le=30.0)
     # Ceiling on the share of a clip covered by b-roll.
     max_share: float = Field(default=0.35, ge=0.0, le=0.9)
-    # Used only when a clip's words match no tag in the library: fall back to a
-    # fixed beat, so a library still gets used on material it has no vocabulary
-    # for. Turn off to leave such clips clean.
-    cadence_when_no_match: bool = True
+    # What to do with a clip whose words match no tag in the library. On, it
+    # falls back to a fixed beat — which sounds like "the library still gets
+    # used" and behaves like "tags do not matter": every asset lands on every
+    # clip, whatever it is about. Off is the default for that reason; turn it
+    # on only for a library of neutral filler.
+    cadence_when_no_match: bool = False
     cadence_seconds: float = Field(default=12.0, ge=2.0, le=120.0)
 
     max_upload_mb: int = Field(default=200, ge=1, le=4096)
@@ -510,6 +551,36 @@ class RetentionSettings(BaseSettings):
     # limit is size, not age: a fragment is worth keeping exactly as long as
     # there is room, and the oldest go first.
     fragment_cache_gb: float = 5.0
+    # How often the sweep runs. Nothing else triggers it: the handler exists to
+    # keep the media directory from growing without bound, and for a while
+    # nothing ever enqueued it, so it never ran once.
+    cleanup_interval_hours: float = 6.0
+    # How long yt-dlp's leftovers from an unfinished download are kept. They
+    # are worth something for exactly as long as a retry might resume from
+    # them, and nothing afterwards — hours, not days, but generous enough to
+    # cover a job restarted by hand the next morning.
+    abandoned_download_hours: float = 24.0
+
+    @field_validator(
+        "originals_days",
+        "published_clips_days",
+        "jobs_days",
+        "cleanup_interval_hours",
+        "abandoned_download_hours",
+    )
+    @classmethod
+    def _not_negative(cls, value: float) -> float:
+        """A negative age is not "keep forever" — it deletes everything.
+
+        Each sweep works from `now - timedelta(days=setting)`. Set it to -10
+        and the cutoff lands ten days in the *future*, so every job ever
+        finished is past it and every source download goes on the next sweep.
+        A typed minus sign should not be able to empty the media directory.
+        Use `APP_RETENTION_ENABLED=false` to keep everything.
+        """
+        if value < 0:
+            raise ValueError("must not be negative; set APP_RETENTION_ENABLED=false to keep everything")
+        return value
 
 
 class Settings(BaseSettings):

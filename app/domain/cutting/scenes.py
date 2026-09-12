@@ -22,6 +22,7 @@ from app.domain.cutting.base import (
     DEFAULT_GAP_SECONDS,
     MIN_USABLE_SECONDS,
     SliceSpec,
+    next_start,
     renumber,
 )
 
@@ -81,7 +82,7 @@ def build_scene_slices(
         )
         if end >= duration:
             break
-        cursor = max(0.0, end - max(0.0, float(gap_seconds)))
+        cursor = next_start(cursor, end, gap_seconds)
         index += 1
 
     return renumber(_keep_loudest(specs, loudness, max_clips))

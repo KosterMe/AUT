@@ -12,20 +12,24 @@ from sqlmodel import Session, col, select
 
 from app.core.clock import utc_now
 from app.core.errors import ConflictError, NotFoundError
-from app.db.models import Account
+from app.db.models import Account, Publication
 from app.adapters.tiktok import cookies as cookie_store
 
 log = logging.getLogger(__name__)
 
 
 def list_all(session: Session) -> list[Account]:
-    return list(session.exec(select(Account).order_by(col(Account.username))).all())
+    rows = list(session.exec(select(Account).order_by(col(Account.username))).all())
+    for account in rows:
+        _drop_flag_if_the_file_is_gone(session, account)
+    return rows
 
 
 def get(session: Session, account_id: int) -> Account:
     account = session.get(Account, account_id)
     if account is None:
         raise NotFoundError(f"account {account_id} not found")
+    _drop_flag_if_the_file_is_gone(session, account)
     return account
 
 
@@ -33,6 +37,7 @@ def get_by_username(session: Session, username: str) -> Account:
     account = session.exec(select(Account).where(Account.username == username)).first()
     if account is None:
         raise NotFoundError(f"account '{username}' not found")
+    _drop_flag_if_the_file_is_gone(session, account)
     return account
 
 
@@ -40,8 +45,40 @@ def get_ready(session: Session, username: str) -> Account:
     """An account that can actually publish right now."""
     account = get_by_username(session, username)
     if not account.has_valid_session:
-        raise ConflictError(f"account '{username}' needs to be logged in again")
+        raise ConflictError(
+            f"account '{username}' needs to be logged in again"
+            if cookie_store.exists(username)
+            else f"account '{username}' has no cookie file at "
+            f"{cookie_store.cookie_path(username)} — import a session for it"
+        )
     return account
+
+
+def _drop_flag_if_the_file_is_gone(session: Session, account: Account) -> None:
+    """Clear `has_valid_session` when the cookie file can no longer back it.
+
+    The flag is a cache, and it went stale in the one direction that hurts:
+    a real account showed as signed in for weeks after its cookie file
+    disappeared, and the first thing to notice was a scheduled post failing at
+    the minute it was due — followed by eleven more queued behind it. Reading
+    an account is the moment to find out, because that is when the UI, and
+    `get_ready`, are about to state it as fact.
+
+    Only ever downgrades. A file that still holds a sessionid says nothing
+    about whether TikTok honours it, so raising the flag from here would undo
+    what `invalidate_session` learned the hard way; `resync_session_flags` is
+    the deliberate, user-triggered way to do that.
+    """
+    if not account.has_valid_session or cookie_store.has_valid_session(account.username):
+        return
+    account.has_valid_session = False
+    account.updated_at = utc_now()
+    session.add(account)
+    log.warning(
+        "account '%s' was marked as signed in, but %s holds no session",
+        account.username,
+        cookie_store.cookie_path(account.username),
+    )
 
 
 def register(session: Session, username: str, display_name: str | None = None) -> Account:
@@ -92,11 +129,25 @@ def rename(session: Session, account_id: int, display_name: str | None) -> Accou
 def delete(session: Session, account_id: int) -> None:
     """Remove the account and its cookies.
 
-    The row goes first: if deleting the file then fails, the user can re-import
-    it. The reverse order leaves a row pointing at nothing.
+    Refused while publications still point at it. They are the record of what
+    was posted and to which account, and the foreign key would stop the delete
+    anyway — as a bare IntegrityError surfacing as HTTP 500, which is how this
+    was found.
+
+    The row goes before the file: if deleting the file then fails, the user can
+    re-import it. The reverse order leaves a row pointing at nothing.
     """
     account = get(session, account_id)
     username = account.username
+    published = session.exec(
+        select(col(Publication.id)).where(Publication.account_id == account_id)
+    ).all()
+    if published:
+        raise ConflictError(
+            f"account '{username}' still has {len(published)} publication(s) on record. "
+            "Delete or reassign them first — they are the history of what this "
+            "account posted."
+        )
     session.delete(account)
     session.flush()
     cookie_store.delete(username)

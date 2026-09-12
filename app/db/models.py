@@ -79,6 +79,10 @@ class ClipJob(SQLModel, table=True):
     # cutter and the frame, so it is a property of the job rather than of one
     # render — re-rendering a film with the podcast cutter would recut it.
     profile: str = Field(default="talking", max_length=16, index=True)
+    # The look this job's clips are rendered with. Null means the defaults for
+    # its profile, which is what an unattended job gets and why nothing has to
+    # be chosen for one to run.
+    style_id: Optional[int] = Field(default=None, foreign_key="styles.id", index=True)
 
     # Title auto-detected from the source; custom_title overrides it for
     # on-screen text and captions.
@@ -142,6 +146,12 @@ class Clip(SQLModel, table=True):
     video_path: Optional[str] = Field(default=None, max_length=1024)
     cover_path: Optional[str] = Field(default=None, max_length=1024)
 
+    # The composition this clip was last rendered from, as JSON: its segments,
+    # what was laid over them, and the style that shaped all of it. Written
+    # after a successful render, which is what makes a finished clip
+    # inspectable — and re-renderable without re-deciding anything.
+    composition_json: str = Field(default="{}")
+
     status: str = Field(default=ClipStatus.PLANNED, max_length=16, index=True)
     error: Optional[str] = Field(default=None, max_length=2048)
 
@@ -197,6 +207,35 @@ class Publication(SQLModel, table=True):
 
     account: Optional[Account] = Relationship(back_populates="publications")
     clip: Optional[Clip] = Relationship(back_populates="publications")
+
+
+class StylePreset(SQLModel, table=True):
+    """A named look, stored as the difference from the defaults.
+
+    Sparse on purpose. A preset that means "the usual, but bigger subtitles"
+    holds exactly that one field, so it still means it after the default
+    changes — and a field nobody has an opinion about never has to be written
+    down, which is what lets the UI show a form of forty controls and save two.
+
+    `profile` is a hint, not a constraint: it says which kind of material the
+    preset was written for so the UI can offer the right one first. Any preset
+    can be attached to any job.
+    """
+
+    __tablename__ = "styles"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    owner_id: Optional[int] = Field(default=None, index=True)
+
+    name: str = Field(index=True, unique=True, max_length=64)
+    description: str = Field(default="", max_length=500)
+    profile: Optional[str] = Field(default=None, max_length=16, index=True)
+
+    # The overrides, as JSON. Never the whole style: see the class docstring.
+    data_json: str = Field(default="{}")
+
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
 
 class MediaAsset(SQLModel, table=True):

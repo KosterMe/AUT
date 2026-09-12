@@ -71,6 +71,13 @@ def start_local_browser(session: Session, username: str) -> LoginSession:
     Returns immediately; poll `get` for progress. Only usable where a desktop
     browser exists — on a server, use `import_cookies`.
     """
+    # Imported here, not in the thread that uses it: on a server with no
+    # browser this raises ImportError, and the router turns that into a 503
+    # that says so. Left in the thread, the call answered 201 Created for
+    # something that could never work, and the only way to find out was to
+    # poll a login session that had already failed.
+    from app.adapters.tiktok import login as browser_login  # noqa: F401
+
     record = LoginSession(
         id=uuid.uuid4().hex,
         username=username,

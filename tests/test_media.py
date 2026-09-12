@@ -14,6 +14,7 @@ import pytest
 from yt_dlp.utils import DownloadError
 
 from app.adapters.media.ffmpeg import _parse_silencedetect
+from app.adapters.youtube import downloader
 from app.adapters.youtube.downloader import (
     _cached_metadata,
     _download_candidates,
@@ -39,9 +40,23 @@ def test_download_candidates_prefer_merged_file(tmp_path):
     merged.write_bytes(b"merged")
     intermediate.write_bytes(b"video-only")
 
-    paths = _download_candidates({}, str(tmp_path), 11)
+    paths = _download_candidates({}, str(tmp_path), "job-11")
 
     assert paths[0] == str(merged)
+
+
+def test_the_source_thumbnail_is_not_mistaken_for_the_download(tmp_path):
+    """`job-9.thumb` sits in the same directory and matches the same glob.
+
+    A thumbnail outlives the source retention deletes, so re-running that job
+    found the picture, treated it as the already-downloaded video and handed a
+    77 KB JPEG to the transcriber, which complained about a missing audio
+    track three steps away from the actual problem.
+    """
+    (tmp_path / "job-9.thumb").write_bytes(b"jpeg")
+
+    assert _download_candidates({}, str(tmp_path), "job-9") == []
+    assert _recover_downloaded_file(str(tmp_path), "job-9") is None
 
 
 def test_recover_downloaded_file_ignores_part(tmp_path):
@@ -50,7 +65,7 @@ def test_recover_downloaded_file_ignores_part(tmp_path):
     part = tmp_path / "job-11.mp4.part"
     part.write_bytes(b"truncated")
 
-    recovered = _recover_downloaded_file(str(tmp_path), 11)
+    recovered = _recover_downloaded_file(str(tmp_path), "job-11")
 
     assert recovered is None
     assert part.exists()
@@ -62,9 +77,49 @@ def test_recover_downloaded_file_returns_completed_file(tmp_path):
     completed.write_bytes(b"complete")
     (tmp_path / "job-11.webm.part").write_bytes(b"truncated")
 
-    recovered = _recover_downloaded_file(str(tmp_path), 11)
+    recovered = _recover_downloaded_file(str(tmp_path), "job-11")
 
     assert recovered == str(completed)
+
+
+def test_half_a_download_is_recognised_wherever_it_is_found():
+    """A file yt-dlp wrote before merging looks complete and has no audio.
+
+    Job 10 reused one recorded by an earlier attempt, took its transcript from
+    YouTube's captions instead of the file, and rendered twenty silent clips
+    without raising anything.
+    """
+    assert not downloader.is_usable_source("/media/originals/job-7.f399.mp4")
+    assert not downloader.is_usable_source("/media/originals/job-7.f251-1.webm")
+    # The other way a recorded path turns out not to be the video.
+    assert not downloader.is_usable_source("/media/originals/job-9.thumb")
+    assert downloader.is_usable_source("/media/originals/job-7.mp4")
+    assert downloader.is_usable_source("/media/originals/url-a1b2c3d4e5f6.mp4")
+
+
+def test_a_publication_download_is_keyed_by_its_url(tmp_path, monkeypatch):
+    """Two YouTube publications must not share one cached file.
+
+    Publishing a YouTube URL directly has no job to key the download on, and
+    the constant that stood in for one put every such download at `job-0.mp4`.
+    The cache check at the top of the download returns an existing file
+    without asking where it came from, so the second publication would have
+    uploaded the first video under the second one's caption.
+    """
+    seen: list[str] = []
+
+    def fake_download(source_ref, *, stem, on_progress=None):
+        seen.append(stem)
+        return f"/media/originals/{stem}.mp4", {}
+
+    monkeypatch.setattr(downloader, "_download", fake_download)
+
+    downloader.download_for_publication("https://www.youtube.com/watch?v=aaaaaaaaaaa")
+    downloader.download_for_publication("https://www.youtube.com/watch?v=bbbbbbbbbbb")
+    downloader.download_for_publication("https://www.youtube.com/watch?v=aaaaaaaaaaa")
+
+    assert seen[0] != seen[1], "different videos must not land on the same file"
+    assert seen[0] == seen[2], "the same video must still reuse its download"
 
 
 def test_cached_metadata_reports_no_title(tmp_path):
@@ -193,7 +248,7 @@ def test_an_unmerged_download_is_not_recovered_as_the_source(tmp_path):
     (tmp_path / "job-7.f399.mp4").write_bytes(b"video only")
     (tmp_path / "job-7.f251-1.webm.part").write_bytes(b"audio, still arriving")
 
-    assert _recover_downloaded_file(str(tmp_path), 7) is None
+    assert _recover_downloaded_file(str(tmp_path), "job-7") is None
 
 
 def test_a_merged_download_is_still_recovered(tmp_path):
@@ -202,4 +257,33 @@ def test_a_merged_download_is_still_recovered(tmp_path):
     merged = tmp_path / "job-7.mp4"
     merged.write_bytes(b"video and audio")
 
-    assert _recover_downloaded_file(str(tmp_path), 7) == str(merged)
+    assert _recover_downloaded_file(str(tmp_path), "job-7") == str(merged)
+
+
+class TestSettingsThatFailQuietly:
+    """Two values the model accepted that broke the service without saying so."""
+
+    def test_a_negative_retention_age_is_refused(self, configure):
+        """It does not mean "keep forever" — it deletes everything.
+
+        Each sweep cuts at `now - timedelta(days=setting)`. At -10 the cutoff
+        lands ten days in the future, so every finished job is past it and
+        every source download goes on the next sweep.
+        """
+        from pydantic import ValidationError
+
+        from app.core.config import get_settings
+
+        configure(APP_RETENTION_ORIGINALS_DAYS=-10)
+        with pytest.raises(ValidationError, match="negative"):
+            get_settings()
+
+    def test_a_worker_with_no_threads_is_refused(self, configure):
+        """Zero came up healthy, logged "worker started" and ran nothing."""
+        from pydantic import ValidationError
+
+        from app.core.config import get_settings
+
+        configure(QUEUE_CONCURRENCY=0)
+        with pytest.raises(ValidationError, match="at least 1"):
+            get_settings()

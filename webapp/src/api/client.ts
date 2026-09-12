@@ -7,7 +7,12 @@ import type {
   CreateJobPayload,
   Health,
   MediaAsset,
+  PreviewRequest,
   Publication,
+  StyleDefaults,
+  StyleGroups,
+  StylePayload,
+  StylePreset,
   Task,
   UploadOptions,
 } from "./types";
@@ -124,5 +129,46 @@ export const Publications = {
       .post<Publication[]>("/publications/cancel-scheduled", null, { params: { job_id: jobId } })
       .then((r) => r.data),
   retry: (id: number) => api.post<Publication>(`/publications/${id}/retry`).then((r) => r.data),
+  retryUntouched: (jobId?: number) =>
+    api
+      .post<Publication[]>("/publications/retry-untouched", null, { params: { job_id: jobId } })
+      .then((r) => r.data),
   remove: (id: number) => api.delete(`/publications/${id}`),
+};
+
+export const Styles = {
+  list: () => api.get<StylePreset[]>("/styles").then((r) => r.data),
+  /**
+   * Every value a profile renders with when no preset is attached. The editor
+   * shows these behind empty controls, so a form nobody fills in still
+   * describes exactly what will happen.
+   */
+  defaults: (profile?: string) =>
+    api.get<StyleDefaults>("/styles/defaults", { params: { profile } }).then((r) => r.data),
+  create: (body: StylePayload) => api.post<StylePreset>("/styles", body).then((r) => r.data),
+  update: (id: number, body: StylePayload) =>
+    api.patch<StylePreset>(`/styles/${id}`, body).then((r) => r.data),
+  remove: (id: number) => api.delete(`/styles/${id}`),
+};
+
+export const Clips = {
+  composition: (clipId: number) =>
+    api
+      .get<{ clip_id: number; composition: Record<string, unknown> }>(
+        `/clips/${clipId}/composition`,
+      )
+      .then((r) => r.data),
+  rerender: (clipId: number, body: { style_id?: number | null; style?: StyleGroups } = {}) =>
+    api.post<Clip>(`/clips/${clipId}/render`, body).then((r) => r.data),
+  /**
+   * A few seconds of a clip in a given style, as a blob the browser can play.
+   * The caller owns the object URL and has to revoke it — this is called every
+   * time a control moves, and leaking one per keystroke adds up.
+   */
+  preview: async (clipId: number, body: PreviewRequest = {}) => {
+    const response = await api.post(`/clips/${clipId}/preview`, body, {
+      responseType: "blob",
+    });
+    return URL.createObjectURL(response.data as Blob);
+  },
 };

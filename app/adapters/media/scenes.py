@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from app.adapters.media.ffmpeg import ffmpeg_exe, ffprobe_has_audio
 from app.core.config import get_settings

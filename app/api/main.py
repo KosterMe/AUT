@@ -19,7 +19,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from app import __version__
 from app.api import errors
 from app.api.deps import require_auth
-from app.api.routers import accounts, assets, clip_jobs, login, publications, system
+from app.api.routers import (
+    accounts,
+    assets,
+    clip_jobs,
+    clips,
+    login,
+    publications,
+    styles,
+    system,
+)
 from app.core.config import get_settings, load_dotenv_for_entrypoint
 from app.core.logging import configure_logging
 
@@ -36,8 +45,28 @@ async def lifespan(app: FastAPI):
             "APP_AUTH_TOKEN is not set — the API is unauthenticated. That is fine "
             "bound to localhost, but set it before exposing this port."
         )
+    _seed_cleanup()
     yield
     log.info("API stopped")
+
+
+def _seed_cleanup() -> None:
+    """Put the recurring media sweep on the queue if it is not already there.
+
+    The API runs no background work itself, and this does not change that — it
+    queues one task for a worker. It is here because nothing else was: the
+    cleanup handler was registered, a worker was serving its kind, and no code
+    path had ever created a single cleanup task, so retention never ran and
+    `data/media` grew without a ceiling.
+    """
+    from app.db.session import session_scope
+    from app.tasks.handlers import cleanup
+
+    try:
+        with session_scope() as session:
+            cleanup.ensure_scheduled(session)
+    except Exception:  # pragma: no cover - a broken sweep must not stop the API
+        log.exception("could not schedule the periodic media cleanup")
 
 
 def create_app() -> FastAPI:
@@ -73,6 +102,8 @@ def create_app() -> FastAPI:
     app.include_router(accounts.router)
     app.include_router(assets.router)
     app.include_router(clip_jobs.router)
+    app.include_router(clips.router)
+    app.include_router(styles.router)
     app.include_router(publications.router)
     app.include_router(login.router)
     return app

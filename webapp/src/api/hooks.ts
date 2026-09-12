@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { QueryKey } from "@tanstack/react-query";
-import { Accounts, Assets, Jobs, Publications, System } from "./client";
+import { Accounts, Assets, Jobs, Publications, Styles, System } from "./client";
 import { TERMINAL_JOB_STATUSES, type ClipJob, type ClipJobDetail } from "./types";
 
 // A job in flight changes every few seconds; a finished one never does.
@@ -19,7 +19,23 @@ export const keys = {
   job: (id: number) => ["jobs", id] as const,
   publications: (status?: string) => ["publications", status ?? "all"] as const,
   tasks: ["tasks"] as const,
+  styles: ["styles"] as const,
+  styleDefaults: (profile?: string) => ["styles", "defaults", profile ?? "talking"] as const,
 };
+
+export function useStyles() {
+  return useQuery({ queryKey: keys.styles, queryFn: Styles.list });
+}
+
+export function useStyleDefaults(profile?: string) {
+  return useQuery({
+    queryKey: keys.styleDefaults(profile),
+    queryFn: () => Styles.defaults(profile),
+    // The defaults only move when the server's configuration does, which does
+    // not happen while a tab is open.
+    staleTime: 5 * 60 * 1000,
+  });
+}
 
 export function useHealth() {
   return useQuery({ queryKey: keys.health, queryFn: System.health, refetchInterval: 15000 });
@@ -48,6 +64,9 @@ export function useJob(id: number) {
   return useQuery({
     queryKey: keys.job(id),
     queryFn: () => Jobs.get(id),
+    // 0 is "no job chosen yet", which happens on any page that picks one out
+    // of a list that has not loaded. Asking for it 404s on every mount.
+    enabled: id > 0,
     refetchInterval: (query) => (jobIsLive(query.state.data as ClipJobDetail | undefined) ? LIVE_POLL_MS : false),
   });
 }

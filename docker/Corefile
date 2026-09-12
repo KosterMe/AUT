@@ -1,0 +1,29 @@
+# Resolver for the compose stack. See the `resolver` service in
+# docker-compose.yml for why this exists at all.
+#
+# Only YouTube's own names are broken here, and only over plain DNS: measured
+# from a worker container, `www.youtube.com` comes back NXDOMAIN from 8.8.8.8:53
+# in 0.02 s — a forged answer, too fast to be a real lookup — while
+# googlevideo.com (the edges that carry the media), ytimg.com, github.com and
+# pypi.org all answer normally on the same port. So the workaround is scoped to
+# the names that need it: everything else stays on plain DNS, which is faster
+# and keeps a DoT outage from taking the whole stack's name resolution with it.
+youtube.com youtu.be {
+    # DoT is what the interception does not touch. Google rather than
+    # Cloudflare deliberately: 1.1.1.1:853 accepts the TCP connection here and
+    # then hangs the TLS handshake, for every name, so an upstream list with it
+    # in loses whichever share of queries the forward policy sends its way.
+    # Quad9 (tls://9.9.9.9 tls://149.112.112.112, tls_servername dns.quad9.net)
+    # also works here and is the swap-in if Google ever stops.
+    forward . tls://8.8.8.8 tls://8.8.4.4 {
+        tls_servername dns.google
+    }
+    cache 300
+    errors
+}
+
+. {
+    forward . 8.8.8.8 1.1.1.1 9.9.9.9
+    cache 300
+    errors
+}

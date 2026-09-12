@@ -62,6 +62,62 @@ not "off".
 
 ---
 
+## Looks
+
+A profile says what kind of video this is. A **look** says how it should be
+rendered: the framing, the grade, the type, how the pauses are cut, how much
+b-roll is allowed, how loud the bed sits. Every one of those used to be an
+environment variable, which meant changing one required an edit and a restart,
+and two accounts could not have two looks at all.
+
+A look is a value that travels with the clip. It is resolved once, when the job
+starts, and stored inside the composition the clip is rendered from — so a
+re-render a month later cannot drift, and the fragment cache key covers the
+framing for free.
+
+**Nothing about it is required.** Layers apply weakest first:
+
+```
+code defaults  ->  .env  ->  profile  ->  saved look  ->  this job
+```
+
+Anything a layer does not mention passes straight through. A saved look holding
+one field is a legitimate look; a job with none renders exactly as its profile
+always did. That is what keeps a page of forty controls from turning into forty
+decisions somebody has to make before the pipeline will run.
+
+Presets live on the **Looks** page, or at `/api/styles`. `GET
+/api/styles/defaults?profile=talking` answers with every value a profile
+renders with, which is what the editor shows behind each empty control.
+
+### Seeing it before committing to it
+
+`POST /api/clips/{id}/preview` renders a few seconds of a real clip in a given
+look and hands back the mp4. Measured on a 20-second clip: **1.2 s for a
+4-second preview at 540x960, against 7.3 s for the whole clip** — and the gap
+widens on the 90-second clips the defaults produce. It is composed by exactly
+the code the real render uses, so it is the clip, only shorter and smaller.
+
+The one difference is that a preview never starts a transcription: it takes the
+words already on disk, because a slider cannot wait several minutes for Whisper.
+
+The Looks page has this wired to whatever is on screen, saved or not, which is
+the loop the whole thing exists for — move a control, look at the result, keep
+it or don't.
+
+### Rendering one clip again
+
+`POST /api/clips/{id}/render` re-renders a single clip, optionally into a
+different look, keeping its boundaries. Re-running the *job* would recut every
+clip in it, which is the wrong tool for "make this one look different" — and
+the wrong tool for "I have added b-roll since this rendered", which is the
+other reason to reach for it.
+
+A finished clip stores what it was made of. `GET /api/clips/{id}/composition`
+returns its segments, what was laid over them, and the style that did it.
+
+---
+
 ## Running it
 
 ### Docker (the intended deployment)
@@ -124,7 +180,7 @@ deliberately absent from the server image.
 app/
   core/       configuration, errors, time, logging
   db/         tables, sessions, Alembic migrations
-  domain/     pure logic: cutting/, profiles, compositions, inserts, subtitles
+  domain/     pure logic: cutting/, profiles, style, compositions, inserts, subtitles
   adapters/   the outside world: tiktok/, youtube/, media/, asr/
   tasks/      the queue: claiming, leases, retries, handlers
   services/   use cases — the only place entity state changes
@@ -147,6 +203,13 @@ ffmpeg anywhere near it. `app/adapters/media/compiler.py` turns that into
 ffmpeg runs. The split is what makes it possible to test the montage rules
 without rendering a frame, and to change how something renders without
 touching what it contains.
+
+**The look is part of that description, not of the process.**
+`app/domain/style.py` holds it, and the composition carries it. Nothing under
+`adapters/media/` calls `get_settings()` for anything visual any more, which is
+the difference between "the renderer is configured" and "this clip looks like
+this". A partial override is the normal case: `merged({"subtitles":
+{"font_size": 96}})` changes one field and leaves the other forty alone.
 
 **B-roll is placed by rule, not by hand.** Fragments uploaded to the library
 (the B-roll page, or `POST /api/assets`) carry tags; `app/domain/inserts.py`
@@ -279,6 +342,13 @@ If a job still feels slow, the order to check things in:
 ## Configuration
 
 `.env.example` documents every setting with the reasoning behind the defaults.
+
+Anything visual — framing, grade, type, pacing, b-roll, the soundtrack — is now
+better set as a [look](#looks), which applies per job and takes effect without a
+restart. What is left in `.env` is the *default* a look starts from, plus
+everything that is genuinely a property of the machine: paths, credentials,
+timeouts, which encoder to use.
+
 The ones that most often need attention:
 
 | Setting | Why you would touch it |

@@ -8,18 +8,32 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
+from sqlmodel import select
 
 from app.core.clock import aware_utc_now, utc_now
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.db.enums import ClipStatus, JobStatus, PublicationStatus, TaskStatus
 from app.db.models import Account, Clip, ClipJob, Publication, Task
 from app.domain.cutting import SliceSpec
-from app.services import accounts, clip_jobs, clips, publications
+from app.services import accounts, clip_jobs, clips, publications, styles
+from app.tasks import queue
 
 
 @pytest.fixture()
 def account(db):
-    row = Account(username="tester", cookie_path="/tmp/tester.cookie", has_valid_session=True)
+    """An account with a cookie file, so it passes the readiness checks.
+
+    The file is the point: `has_valid_session` is only a cache of it, and an
+    account whose cookies are gone must not read as signed in.
+    """
+    from app.adapters.tiktok import cookies as cookie_store
+
+    cookie_store.save("tester", [{"name": "sessionid", "value": "abc", "domain": ".tiktok.com"}])
+    row = Account(
+        username="tester",
+        cookie_path=str(cookie_store.cookie_path("tester")),
+        has_valid_session=True,
+    )
     db.add(row)
     db.commit()
     db.refresh(row)
@@ -81,6 +95,31 @@ class TestClipJobCreation:
         # A double-clicked button must not download the same video twice.
         assert first.id == second.id
         assert len(db.query(Task).all()) == 1
+
+    def test_restarting_a_job_keeps_the_settings_it_was_created_with(self, db):
+        """The restart endpoint sends an empty body, and used to mean "defaults".
+
+        A job created for two 120-second clips came back from a retry as
+        twenty clips of the default length, with nothing said about it.
+        """
+        from app.tasks import queue
+
+        job = clip_jobs.create(
+            db, source_ref="https://youtu.be/xyz", start_immediately=True,
+            max_clips=2, max_clip_seconds=120.0, min_clip_seconds=90.0, gap_seconds=1.0,
+        )
+        db.commit()
+        first = clip_jobs._active_task_for_job(db, job.id)
+        queue.finish_failure(db, first.id, "boom", permanent=True)
+        db.commit()
+
+        restarted = clip_jobs.start(db, job.id)
+        db.commit()
+
+        payload = queue.payload_of(restarted)
+        assert payload["max_clips"] == 2
+        assert payload["max_clip_seconds"] == 120.0
+        assert payload["min_clip_seconds"] == 90.0
 
     def test_an_unknown_job_is_not_found(self, db):
         with pytest.raises(NotFoundError):
@@ -175,6 +214,72 @@ class TestJobStatusDerivation:
         assert clip_jobs.get(db, job.id).status == JobStatus.FAILED
 
 
+class TestSourceReuse:
+    def test_a_rerun_of_the_same_url_reuses_the_downloaded_file(self, db, tmp_path):
+        """Half a gigabyte, over a link that drops large transfers.
+
+        The download is keyed by job id, so re-running a video with a
+        different profile fetched the whole thing again: `job-8.mp4` and
+        `job-9.mp4` sat in the media directory byte for byte identical.
+        """
+        source = tmp_path / "already-here.mp4"
+        source.write_bytes(b"video")
+        done = clip_jobs.create(db, source_ref="https://youtu.be/same", start_immediately=False)
+        clip_jobs.record_source(
+            db, done.id, original_path=str(source), duration_seconds=10.0,
+            title=None, thumbnail_path=None, metadata={},
+        )
+        again = clip_jobs.create(db, source_ref="https://youtu.be/same", start_immediately=False)
+        db.commit()
+
+        found = clip_jobs.source_downloaded_elsewhere(db, again.id, "https://youtu.be/same")
+
+        assert found == str(source)
+
+    def test_a_source_that_was_deleted_is_not_offered(self, db, tmp_path):
+        done = clip_jobs.create(db, source_ref="https://youtu.be/gone", start_immediately=False)
+        clip_jobs.record_source(
+            db, done.id, original_path=str(tmp_path / "swept-by-retention.mp4"),
+            duration_seconds=10.0, title=None, thumbnail_path=None, metadata={},
+        )
+        again = clip_jobs.create(db, source_ref="https://youtu.be/gone", start_immediately=False)
+        db.commit()
+
+        assert clip_jobs.source_downloaded_elsewhere(db, again.id, "https://youtu.be/gone") is None
+
+    def test_an_unmerged_download_is_never_offered(self, db, tmp_path):
+        """`job-7.f399.mp4` is video with no audio, and it looks complete.
+
+        A job row written before the downloader learned to refuse these still
+        points at one. Handing it to the next job produced a silent source
+        that failed 2000 seconds later inside the transcriber.
+        """
+        half = tmp_path / "job-7.f399.mp4"
+        half.write_bytes(b"video only")
+        done = clip_jobs.create(db, source_ref="https://youtu.be/half", start_immediately=False)
+        clip_jobs.record_source(
+            db, done.id, original_path=str(half), duration_seconds=10.0,
+            title=None, thumbnail_path=None, metadata={},
+        )
+        again = clip_jobs.create(db, source_ref="https://youtu.be/half", start_immediately=False)
+        db.commit()
+
+        assert clip_jobs.source_downloaded_elsewhere(db, again.id, "https://youtu.be/half") is None
+
+    def test_a_different_video_is_never_offered(self, db, tmp_path):
+        source = tmp_path / "other.mp4"
+        source.write_bytes(b"video")
+        done = clip_jobs.create(db, source_ref="https://youtu.be/one", start_immediately=False)
+        clip_jobs.record_source(
+            db, done.id, original_path=str(source), duration_seconds=10.0,
+            title=None, thumbnail_path=None, metadata={},
+        )
+        other = clip_jobs.create(db, source_ref="https://youtu.be/two", start_immediately=False)
+        db.commit()
+
+        assert clip_jobs.source_downloaded_elsewhere(db, other.id, "https://youtu.be/two") is None
+
+
 class TestJobCancellation:
     def test_cancelling_stops_tasks_and_unfinished_clips(self, db, job):
         clip_jobs.start(db, job.id)
@@ -191,6 +296,24 @@ class TestJobCancellation:
         # Work already finished is kept — cancelling is not deleting.
         assert statuses[2] == ClipStatus.READY
         assert all(t.status == TaskStatus.CANCELLED for t in db.query(Task).all())
+
+    def test_a_cancelled_job_is_not_later_reported_as_failed(self, db, job):
+        """Cancelling a running task still ends it through the failure hook.
+
+        The queue reports every task that stops without succeeding to its
+        handler's `on_failure`, cancelled ones included, and the download
+        handler's hook fails the job. Job 8 was cancelled at 16:21 and read
+        "failed: worker stopped responding" five minutes later.
+        """
+        clip_jobs.cancel(db, job.id)
+        db.commit()
+
+        clip_jobs.fail(db, job.id, "worker stopped responding; requeued")
+        db.commit()
+
+        refreshed = clip_jobs.get(db, job.id)
+        assert refreshed.status == JobStatus.CANCELLED
+        assert refreshed.error == "cancelled by user"
 
     def test_deleting_a_job_with_work_in_flight_is_refused(self, db, job):
         clip_jobs.start(db, job.id)
@@ -283,6 +406,36 @@ class TestScheduling:
         )
         db.commit()
         assert row.caption == "Ровно то, что я написал"
+
+    def test_the_callers_own_mistake_is_reported_before_the_clip_conflict(
+        self, db, account, job
+    ):
+        """"Already scheduled" is true and unhelpful when the request is wrong.
+
+        Naming an account that does not exist, or a time in the past, used to
+        come back as a conflict about the clip, because the clip's booking was
+        checked first.
+        """
+        clip = make_clip(db, job.id, 1)
+        db.commit()
+        publications.schedule_clip(
+            db, clip_id=clip.id, username="tester", scheduled_at=future(30)
+        )
+        db.commit()
+
+        with pytest.raises(NotFoundError, match="nobody"):
+            publications.schedule_clip(
+                db, clip_id=clip.id, username="nobody", scheduled_at=future(30)
+            )
+        with pytest.raises(ValidationError, match="in the future"):
+            publications.schedule_clip(
+                db, clip_id=clip.id, username="tester", scheduled_at=future(-30)
+            )
+        with pytest.raises(ValidationError, match="private"):
+            publications.schedule_clip(
+                db, clip_id=clip.id, username="tester", scheduled_at=future(30),
+                options={"visibility_type": 1},
+            )
 
     def test_a_clip_cannot_be_scheduled_twice(self, db, job, account):
         clip = make_clip(db, job.id, 1)
@@ -424,6 +577,60 @@ class TestPublicationLifecycle:
         with pytest.raises(ConflictError, match="only failed"):
             publications.retry(db, row.id)
 
+    def test_a_bulk_retry_skips_anything_that_reached_tiktok(self, db, account, job):
+        """The one-at-a-time rule exists for uploads that had already started.
+
+        A publication whose task never became irreversible never sent a byte,
+        so re-queueing it cannot duplicate a post. One that did might have.
+        """
+        untouched = make_clip(db, job.id, 1)
+        started = make_clip(db, job.id, 2)
+        db.commit()
+        first = publications.schedule_clip(
+            db, clip_id=untouched.id, username="tester", scheduled_at=future(30)
+        )
+        second = publications.schedule_clip(
+            db, clip_id=started.id, username="tester", scheduled_at=future(60)
+        )
+        db.commit()
+        queue.mark_irreversible(db, second.task_id)
+        publications.mark_failed(db, first.id, "account needs to be logged in again")
+        publications.mark_failed(db, second.id, "connection aborted mid-upload")
+        db.commit()
+
+        retried = publications.retry_untouched(db)
+        db.commit()
+
+        assert [p.id for p in retried] == [first.id]
+        assert publications.get(db, first.id).status == PublicationStatus.SCHEDULED
+        assert publications.get(db, second.id).status == PublicationStatus.FAILED
+
+    def test_a_bulk_retry_keeps_the_gaps_between_posts(self, db, account, job):
+        """Firing them all at once is what TikTok reads as spam."""
+        made = []
+        for index in range(3):
+            clip = make_clip(db, job.id, index + 1)
+            db.commit()
+            made.append(
+                publications.schedule_clip(
+                    db, clip_id=clip.id, username="tester",
+                    scheduled_at=future(30 + index * 30),
+                )
+            )
+        db.commit()
+        for row in made:
+            publications.mark_failed(db, row.id, "account needs to be logged in again")
+        db.commit()
+
+        retried = publications.retry_untouched(db)
+        db.commit()
+
+        times = [p.scheduled_at for p in retried]
+        assert len(times) == 3
+        gaps = [round((b - a).total_seconds() / 60) for a, b in zip(times, times[1:])]
+        assert gaps == [30, 30], "the original spacing must survive the retry"
+        assert times[0] > aware_utc_now().replace(tzinfo=None)
+
     def test_retrying_queues_a_fresh_task(self, db, job, account):
         clip = make_clip(db, job.id, 1)
         row = publications.schedule_clip(
@@ -457,6 +664,42 @@ class TestPublicationLifecycle:
 # ---- accounts --------------------------------------------------------------
 
 
+class TestAccountSessionFlag:
+    def test_an_account_stops_reading_as_signed_in_when_its_cookies_vanish(self, db, account):
+        """The flag is a cache of the file, and it only went stale dangerously.
+
+        A real account showed as signed in for weeks after its cookie file
+        disappeared. Nothing noticed until a scheduled post failed at the
+        minute it was due, with eleven more queued behind it.
+        """
+        from app.adapters.tiktok import cookies as cookie_store
+
+        cookie_store.delete("tester")
+
+        assert accounts.get_by_username(db, "tester").has_valid_session is False
+        with pytest.raises(ConflictError, match="no cookie file"):
+            accounts.get_ready(db, "tester")
+
+    def test_a_present_file_never_raises_the_flag_back(self, db, account):
+        """TikTok rejecting a session is knowledge the file cannot overturn."""
+        accounts.invalidate_session(db, account.id)
+        db.commit()
+
+        assert accounts.get_by_username(db, "tester").has_valid_session is False
+
+    def test_an_account_with_publications_cannot_be_deleted(self, db, account, job):
+        """The foreign key refused anyway — as a bare 500 from the API."""
+        clip = make_clip(db, job.id, 1)
+        db.commit()
+        publications.schedule_clip(
+            db, clip_id=clip.id, username="tester", scheduled_at=future(30)
+        )
+        db.commit()
+
+        with pytest.raises(ConflictError, match="publication"):
+            accounts.delete(db, account.id)
+
+
 class TestAccounts:
     def test_registering_without_cookies_is_refused(self, db):
         with pytest.raises(ConflictError, match="no cookie file"):
@@ -472,3 +715,116 @@ class TestAccounts:
         db.commit()
         with pytest.raises(ConflictError):
             accounts.get_ready(db, account.username)
+
+
+class TestStyleResolution:
+    """Where a job's look is settled, and when.
+
+    Once, at the moment the job starts — not per render. Otherwise the
+    fiftieth clip of a long job comes out different from the first because
+    somebody edited a preset while it was running.
+    """
+
+    def _job(self, db, **kwargs):
+        return clip_jobs.create(
+            db, source_ref="https://youtu.be/abc", start_immediately=False, **kwargs
+        )
+
+    def test_starting_a_job_freezes_its_style_into_the_payload(self, db):
+        job = self._job(db)
+        clip_jobs.start(db, job.id)
+        db.commit()
+
+        payload = queue.payload_of(
+            db.exec(select(Task).where(Task.kind == "download")).one()
+        )
+
+        style = payload["render"]["style"]
+        assert style["delivery"]["width"] == 1080
+        assert style["pacing"]["remove_silence"] is True  # the talking profile
+
+    def test_a_preset_beats_the_profile_in_the_frozen_style(self, db):
+        preset = styles.create(
+            db, name="Nothing removed", data={"pacing": {"remove_silence": False}}
+        )
+        job = self._job(db, style_id=preset.id)
+        clip_jobs.start(db, job.id)
+        db.commit()
+
+        payload = queue.payload_of(
+            db.exec(select(Task).where(Task.kind == "download")).one()
+        )
+
+        assert payload["render"]["style"]["pacing"]["remove_silence"] is False
+
+    def test_editing_a_preset_does_not_reach_a_job_already_running(self, db):
+        preset = styles.create(db, name="House", data={"subtitles": {"font_size": 100}})
+        job = self._job(db, style_id=preset.id)
+        clip_jobs.start(db, job.id)
+        db.commit()
+
+        styles.update(db, preset.id, data={"subtitles": {"font_size": 40}})
+        db.commit()
+
+        payload = queue.payload_of(
+            db.exec(select(Task).where(Task.kind == "download")).one()
+        )
+        assert payload["render"]["style"]["subtitles"]["font_size"] == 100
+
+
+class TestClipRerender:
+    def _rendered_clip(self, db) -> Clip:
+        job = clip_jobs.create(db, source_ref="https://youtu.be/abc", start_immediately=False)
+        job.original_path = "/media/source.mp4"
+        db.add(job)
+        db.flush()
+        created = clips.plan(
+            db, job.id, [SliceSpec(1, 0.0, 60.0, "headline", "words", 3)],
+            render_options={"source_path": "/media/source.mp4", "source_title": "Source"},
+        )
+        clip = created[0]
+        clips.mark_ready(
+            db, clip.id, video_path="/media/clip.mp4", cover_path=None,
+            composition={"segments": [], "style": {}},
+        )
+        db.commit()
+        return clip
+
+    def test_a_rerender_keeps_the_boundaries_and_the_source(self, db):
+        """Replanning the job would recut every clip in it; this repeats one."""
+        clip = self._rendered_clip(db)
+
+        clips.rerender(db, clip.id, style={"subtitles": {"font_size": 96}})
+        db.commit()
+
+        task = db.exec(
+            select(Task).where(Task.kind == "render").order_by(Task.id.desc())
+        ).first()
+        payload = queue.payload_of(task)
+        assert payload["render"]["source_path"] == "/media/source.mp4"
+        assert payload["render"]["style"] == {"subtitles": {"font_size": 96}}
+        assert clip.start_sec == 0.0 and clip.end_sec == 60.0
+
+    def test_a_rerender_is_not_deduplicated_against_the_render_it_repeats(self, db):
+        """The plan-time dedupe key would swallow it and nothing would happen."""
+        clip = self._rendered_clip(db)
+        before = len(db.exec(select(Task).where(Task.kind == "render")).all())
+
+        clips.rerender(db, clip.id)
+        db.commit()
+
+        after = len(db.exec(select(Task).where(Task.kind == "render")).all())
+        assert after == before + 1
+
+    def test_a_clip_already_rendering_is_not_queued_twice(self, db):
+        clip = self._rendered_clip(db)
+        clips.mark_rendering(db, clip.id)
+        db.commit()
+
+        with pytest.raises(ConflictError):
+            clips.rerender(db, clip.id)
+
+    def test_a_finished_clip_hands_back_what_it_was_made_of(self, db):
+        clip = self._rendered_clip(db)
+
+        assert clips.composition_of(db, clip.id) == {"segments": [], "style": {}}

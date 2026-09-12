@@ -11,6 +11,9 @@ What gets deleted, and only when retention is enabled:
 * rendered clips that were published more than `published_clips_days` ago —
   the video lives on TikTok now;
 * everything belonging to jobs older than `jobs_days`;
+* yt-dlp's leftovers from downloads that never finished, once they are older
+  than `abandoned_download_hours` and no retry could still resume from them,
+  and the per-thread cookie jars its workers leave in the cookies directory;
 * the oldest rendered segments, once the fragment cache is over its size cap.
 
 Database rows are kept. They are tiny, and they are the record of what was
@@ -20,16 +23,20 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import time
 from datetime import timedelta
 
 from sqlmodel import col, select
 
 from app.adapters.media import compiler
+from app.adapters.media.ffmpeg import media_root
 from app.core.clock import utc_now
 from app.core.config import get_settings
 from app.db.enums import ClipStatus, JobStatus, PublicationStatus, TaskKind
-from app.db.models import Clip, ClipJob, Publication
+from app.db.models import Clip, ClipJob, Publication, Task
 from app.services import clips as clip_service
+from app.tasks import queue
 from app.tasks.context import TaskContext
 from app.tasks.registry import register_handler
 
@@ -56,13 +63,9 @@ def handle_cleanup(ctx: TaskContext) -> dict:
             .where(col(ClipJob.updated_at) < cutoff)
             .where(col(ClipJob.original_path) != None)  # noqa: E711
         ).all()
-        for job in stale_jobs:
-            freed = _remove(job.original_path)
-            if freed:
-                freed_bytes += freed
-                removed_originals += 1
-                job.original_path = None
-                session.add(job)
+        removed, freed = _remove_sources(session, stale_jobs)
+        removed_originals += removed
+        freed_bytes += freed
 
     ctx.progress("removing_published_clips", 0.6)
     with ctx.db() as session:
@@ -85,12 +88,11 @@ def handle_cleanup(ctx: TaskContext) -> dict:
     ctx.progress("removing_expired_jobs", 0.9)
     with ctx.db() as session:
         cutoff = now - timedelta(days=retention.jobs_days)
-        for job in session.exec(select(ClipJob).where(col(ClipJob.updated_at) < cutoff)).all():
-            freed_bytes += _remove(job.original_path)
-            if job.original_path:
-                removed_originals += 1
-                job.original_path = None
-                session.add(job)
+        expired = session.exec(select(ClipJob).where(col(ClipJob.updated_at) < cutoff)).all()
+        removed, freed = _remove_sources(session, expired)
+        removed_originals += removed
+        freed_bytes += freed
+        for job in expired:
             for clip in session.exec(select(Clip).where(Clip.job_id == job.id)).all():
                 if not clip.video_path:
                     continue
@@ -99,6 +101,15 @@ def handle_cleanup(ctx: TaskContext) -> dict:
                 clip.video_path = None
                 clip.cover_path = None
                 session.add(clip)
+
+    ctx.progress("removing_abandoned_downloads", 0.93)
+    abandoned, abandoned_bytes = sweep_abandoned_downloads(retention.abandoned_download_hours)
+    removed_originals += abandoned
+    freed_bytes += abandoned_bytes
+
+    ctx.progress("removing_stale_cookie_jars", 0.94)
+    jars, jar_bytes = sweep_stale_cookie_jars(retention.abandoned_download_hours)
+    freed_bytes += jar_bytes
 
     ctx.progress("trimming_fragment_cache", 0.95)
     evicted, evicted_bytes = trim_fragment_cache(retention.fragment_cache_gb)
@@ -110,8 +121,49 @@ def handle_cleanup(ctx: TaskContext) -> dict:
         "evicted_fragments": evicted,
         "freed_megabytes": round(freed_bytes / 1024 / 1024, 1),
     }
+    _schedule_next(ctx)
     log.info("cleanup freed %.1f MB", summary["freed_megabytes"])
     return summary
+
+
+# One periodic sweep at a time. `ensure_scheduled` and `_schedule_next` share
+# the key, so a restart cannot start a second chain running alongside the first.
+PERIODIC_KEY = "cleanup:periodic"
+
+
+def ensure_scheduled(session) -> None:
+    """Make sure a periodic sweep is on the queue. Safe to call repeatedly.
+
+    Called when the API starts, which is what gets the chain going the first
+    time and what restarts it if a sweep ever ends without queueing its
+    successor. The dedupe key makes a second call a no-op while one is
+    pending.
+    """
+    queue.enqueue(
+        session,
+        TaskKind.CLEANUP,
+        {},
+        run_at=utc_now() + timedelta(minutes=5),
+        dedupe_key=PERIODIC_KEY,
+    )
+
+
+def _schedule_next(ctx: TaskContext) -> None:
+    interval = max(0.25, get_settings().retention.cleanup_interval_hours)
+    with ctx.db() as session:
+        current = session.get(Task, ctx.task_id)
+        if current is not None:
+            # This task still holds the key while it runs, and `enqueue` hands
+            # back a task that is still active rather than making a new one.
+            queue.release_dedupe_key(session, current)
+            session.flush()
+        queue.enqueue(
+            session,
+            TaskKind.CLEANUP,
+            {},
+            run_at=utc_now() + timedelta(hours=interval),
+            dedupe_key=PERIODIC_KEY,
+        )
 
 
 def trim_fragment_cache(limit_gb: float) -> tuple[int, int]:
@@ -148,11 +200,138 @@ def trim_fragment_cache(limit_gb: float) -> tuple[int, int]:
     for _, size, path in sorted(entries):
         if total - freed <= limit:
             break
-        if _remove(path):
+        cleared, _ = _remove(path)
+        if cleared:
             removed += 1
             freed += size
     log.info("evicted %d cached fragment(s), freeing %.1f MB", removed, freed / 1024 / 1024)
     return removed, freed
+
+
+def _remove_sources(session, jobs: list[ClipJob]) -> tuple[int, int]:
+    """Delete these jobs' source downloads, sparing any that are still shared.
+
+    Two jobs pointing at one file is normal: re-running the same video reuses
+    the download instead of fetching half a gigabyte again — see
+    `clip_jobs.source_downloaded_elsewhere`. So a path only goes when every
+    job holding it is in this sweep; otherwise the survivor is left with an
+    `original_path` to a file that no longer exists, and its next render dies
+    looking for it.
+
+    Returns (files removed, bytes freed).
+    """
+    owners: dict[str, list[ClipJob]] = {}
+    for job in jobs:
+        if job.original_path:
+            owners.setdefault(job.original_path, []).append(job)
+
+    removed = 0
+    freed = 0
+    for path, holders in owners.items():
+        still_wanted = session.exec(
+            select(ClipJob.id)
+            .where(ClipJob.original_path == path)
+            .where(col(ClipJob.id).not_in([job.id for job in holders]))
+        ).first()
+        if still_wanted is not None:
+            continue
+        existed = os.path.exists(path)
+        cleared, size = _remove(path)
+        if not cleared:
+            # Still on disk and undeletable — in use, or a permissions
+            # problem. The rows are right to keep pointing at it.
+            continue
+        if existed:
+            freed += size
+            removed += 1
+        # Cleared covers a file that had already vanished, and that is the
+        # case worth catching: the row went on naming a path nothing could
+        # read, every later sweep skipped it for freeing no bytes, and the
+        # job's next render died looking for it — the exact failure this
+        # function's docstring promises not to leave behind.
+        for job in holders:
+            job.original_path = None
+            session.add(job)
+    return removed, freed
+
+
+def sweep_abandoned_downloads(max_age_hours: float) -> tuple[int, int]:
+    """Delete yt-dlp's leftovers from downloads that never finished.
+
+    A failed or abandoned download leaves `.part`, `.part-FragN.part` and
+    `.ytdl` files, plus format intermediates (`job-7.f399.mp4`) written before
+    the merge that never happened. Nothing ever reads them again — a retry
+    resumes from the `.part` only while the task is still alive — and no rule
+    above touches them, because they were never any job's `original_path`.
+    Found here as 63 MB from two jobs that failed three days earlier.
+
+    The age floor is what keeps this from deleting a download in progress.
+
+    Returns (files removed, bytes freed).
+    """
+    directory = os.path.join(media_root(), "originals")
+    if not os.path.isdir(directory):
+        return 0, 0
+    cutoff = time.time() - max(1.0, max_age_hours) * 3600
+    removed = 0
+    freed = 0
+    with os.scandir(directory) as listing:
+        for entry in listing:
+            if not entry.is_file() or not _ABANDONED.search(entry.name):
+                continue
+            try:
+                if entry.stat().st_mtime > cutoff:
+                    continue
+            except OSError:  # pragma: no cover - vanished mid-sweep
+                continue
+            cleared, size = _remove(entry.path)
+            if cleared:
+                removed += 1
+                freed += size
+    if removed:
+        log.info("removed %d abandoned download file(s), freeing %.1f MB",
+                 removed, freed / 1024 / 1024)
+    return removed, freed
+
+
+def sweep_stale_cookie_jars(max_age_hours: float) -> tuple[int, int]:
+    """Delete the per-thread yt-dlp cookie jars nothing is using any more.
+
+    `options._writable_cookie_jar` copies the read-only YouTube export to
+    `ytdlp-jar.<pid>.<thread>.txt` so yt-dlp can save its jar back without
+    touching the original. The thread id is new on every worker start and
+    nothing ever removed the old ones: seventeen of them had piled up in the
+    directory that also holds the TikTok sessions.
+
+    Age is the only safe test — a jar in use is rewritten at the end of every
+    download, so anything older than a download could possibly take is dead.
+
+    Returns (files removed, bytes freed).
+    """
+    directory = get_settings().paths.cookies_dir
+    if not directory.is_dir():
+        return 0, 0
+    cutoff = time.time() - max(1.0, max_age_hours) * 3600
+    removed = 0
+    freed = 0
+    for path in directory.glob("ytdlp-jar.*.txt"):
+        try:
+            if path.stat().st_mtime > cutoff:
+                continue
+        except OSError:  # pragma: no cover - vanished mid-sweep
+            continue
+        cleared, size = _remove(str(path))
+        if cleared:
+            removed += 1
+            freed += size
+    if removed:
+        log.info("removed %d stale yt-dlp cookie jar(s)", removed)
+    return removed, freed
+
+
+# `.part`, `.part-Frag12.part`, `.ytdl`, and the `job-7.f399.mp4` intermediates
+# yt-dlp writes per format before merging them.
+_ABANDONED = re.compile(r"(\.part(-Frag\d+\.part)?|\.ytdl|\.f\d+\.[A-Za-z0-9]+)$")
 
 
 def _size(path: str | None) -> int:
@@ -164,14 +343,22 @@ def _size(path: str | None) -> int:
     return 0
 
 
-def _remove(path: str | None) -> int:
-    """Delete a file, returning how many bytes it freed."""
+def _remove(path: str | None) -> tuple[bool, int]:
+    """Delete a file. Returns (the path is clear now, bytes freed).
+
+    Two things the previous "return the bytes freed" could not say. A file
+    that is already gone leaves the path just as clear as deleting it does,
+    and callers need that to decide whether a row may stop pointing at it. And
+    an empty file is a file: sizing the result meant a zero-byte `.part`
+    survived every sweep it ever appeared in, because no bytes freed read as
+    nothing was there.
+    """
+    if not path or not os.path.exists(path):
+        return bool(path), 0
     size = _size(path)
-    if not size:
-        return 0
     try:
         os.remove(path)
-        return size
+        return True, size
     except OSError as exc:  # pragma: no cover - filesystem edge case
         log.warning("could not delete %s: %s", path, exc)
-        return 0
+        return False, 0

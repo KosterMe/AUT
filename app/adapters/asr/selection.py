@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from app.adapters.asr import cache as transcript_cache
@@ -16,7 +15,15 @@ def select_subtitle_transcript(
     end_sec: float,
     enabled: bool,
     job_transcript_model: Any = None,
+    allow_transcription: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """The word timings a clip's subtitles are drawn from.
+
+    `allow_transcription=False` is for callers that must answer quickly — the
+    preview endpoint, which runs inside a request. It takes the cache and the
+    job transcript and stops there, rather than sending a clip through Whisper
+    while somebody waits on a slider.
+    """
     mode = render_transcript_mode()
     if not enabled:
         return fallback_segments, {
@@ -50,6 +57,7 @@ def select_subtitle_transcript(
         end_sec=end_sec,
         mode=mode,
         job_transcript_model=job_transcript_model,
+        allow_transcription=allow_transcription,
     )
 
 
@@ -61,8 +69,9 @@ def _cache_or_transcribe(
     end_sec: float,
     mode: str,
     job_transcript_model: Any,
+    allow_transcription: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    if mode != "always_transcribe":
+    if mode != "always_transcribe" or not allow_transcription:
         cached = transcript_cache.load_render_transcript(
             original_path,
             start_sec=start_sec,
@@ -79,6 +88,14 @@ def _cache_or_transcribe(
                     "word_timestamps": True,
                     "cache_key": cache_meta.get("cache_key"),
                 }
+
+    if not allow_transcription:
+        return fallback_segments, {
+            "source": "job_transcript",
+            "mode": mode,
+            "fallback_reason": "transcription_not_allowed",
+            "model": job_transcript_model,
+        }
 
     try:
         fresh = transcription.transcribe_media_segment(

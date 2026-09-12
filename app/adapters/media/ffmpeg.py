@@ -11,6 +11,7 @@ from typing import Any
 
 from app.adapters.media import filters
 from app.core.config import get_settings
+from app.domain.style import PacingStyle
 from app.domain import subtitles
 
 log = logging.getLogger(__name__)
@@ -105,6 +106,17 @@ def clip_output_path(job_id: int, *, index: int, start_sec: float, end_sec: floa
     return os.path.abspath(
         os.path.join(directory, f"clip-{index:03d}-{int(start_sec)}-{int(end_sec)}-{stem}.mp4")
     )
+
+
+def preview_output_path(clip_id: int) -> str:
+    """Where a clip's preview goes. One file per clip, overwritten each time.
+
+    Under `tmp/`, which the retention sweep already clears: a preview is worth
+    keeping exactly as long as the person who asked for it is looking at it.
+    """
+    directory = os.path.join(media_root(), "tmp", "previews")
+    os.makedirs(directory, exist_ok=True)
+    return os.path.abspath(os.path.join(directory, f"clip-{clip_id}.mp4"))
 
 
 def cover_path_for(video_path: str) -> str:
@@ -407,18 +419,24 @@ def montage_keep_segments(
     *,
     start_sec: float,
     end_sec: float,
-    noise_db: str = "-35dB",
-    silence_seconds: float = 0.55,
-    padding_seconds: float = 0.12,
-    min_segment_seconds: float = 1.2,
+    pacing: PacingStyle | None = None,
 ) -> list[tuple[float, float]]:
+    """The stretches of a clip worth keeping, silence taken out.
+
+    Every threshold arrives on the clip's own `pacing` style rather than as a
+    default argument nothing ever overrode. That matters most for the noise
+    floor: -35 dB is an absolute level, so a quietly recorded source has no
+    silence by that measure and the montage used to do nothing at all, with
+    no way to say so.
+    """
+    rules = pacing or PacingStyle()
     duration = max(0.1, end_sec - start_sec)
     silences = _detect_silences(
         video_path,
         start_sec=start_sec,
         duration=duration,
-        noise_db=noise_db,
-        silence_seconds=silence_seconds,
+        noise_db=f"{rules.noise_db:.1f}dB",
+        silence_seconds=rules.min_silence_seconds,
     )
     if not silences:
         return [(0.0, duration)]
@@ -428,26 +446,32 @@ def montage_keep_segments(
     for silence_start, silence_end in silences:
         silence_start = max(0.0, min(duration, silence_start))
         silence_end = max(silence_start, min(duration, silence_end))
-        if silence_end - silence_start < silence_seconds:
+        if silence_end - silence_start < rules.min_silence_seconds:
             continue
 
-        keep_end = min(duration, silence_start + padding_seconds)
-        next_cursor = max(0.0, silence_end - padding_seconds)
-        if keep_end - cursor >= min_segment_seconds:
+        keep_end = min(duration, silence_start + rules.padding_seconds)
+        next_cursor = max(0.0, silence_end - rules.padding_seconds)
+        if keep_end - cursor >= rules.min_segment_seconds:
             keep.append((round(cursor, 3), round(keep_end, 3)))
         cursor = max(cursor, next_cursor)
 
-    if duration - cursor >= min_segment_seconds:
+    if duration - cursor >= rules.min_segment_seconds:
         keep.append((round(cursor, 3), round(duration, 3)))
 
     if not keep:
         return [(0.0, duration)]
 
+    # The guard: if removing silence would take out almost nothing, or would
+    # leave less than half the clip standing, the montage is abandoned and the
+    # clip plays as one continuous piece. Both failure modes produce a worse
+    # clip than not trying.
     kept_duration = sum(end - start for start, end in keep)
     removed = duration - kept_duration
-    if removed < 0.8 or kept_duration < min(10.0, duration * 0.55):
+    if removed < rules.min_removed_seconds or kept_duration < min(
+        10.0, duration * rules.min_kept_share
+    ):
         return [(0.0, duration)]
-    return keep[:24]
+    return keep[: rules.max_segments]
 
 
 def _detect_silences(

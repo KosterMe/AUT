@@ -12,9 +12,12 @@ picked.
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
 import os
+import tempfile
 from datetime import datetime
+from typing import BinaryIO
 
 from sqlmodel import Session, col, select
 
@@ -24,7 +27,7 @@ from app.core.errors import NotFoundError, ValidationError
 from app.core.config import get_settings
 from app.db.enums import AssetKind
 from app.db.models import MediaAsset
-from app.domain import inserts
+from app.domain import inserts, style
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +38,25 @@ VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".mkv", ".webm", ".m4v", ".gif"})
 # Music beds and transition sounds. They carry no picture, so nothing here can
 # ever end up on screen as b-roll.
 AUDIO_SUFFIXES = frozenset({".mp3", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".flac"})
+
+# What the browser is told a fragment is when the library previews it. Not
+# cosmetic: Firefox will not play a .wav announced as audio/mpeg and Chrome
+# will not play a .webm announced as video/mp4, so a single wrong default here
+# turns a working preview into a silent black card.
+CONTENT_TYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".webp": "image/webp", ".bmp": "image/bmp", ".avif": "image/avif",
+    ".gif": "image/gif",
+    ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime",
+    ".mkv": "video/x-matroska", ".webm": "video/webm",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4",
+    ".aac": "audio/aac", ".ogg": "audio/ogg", ".opus": "audio/ogg",
+    ".flac": "audio/flac",
+}
+# Read in chunks this size while hashing an upload. A megabyte is small enough
+# that a dozen concurrent uploads cost nothing worth measuring, and large
+# enough that a 200 MB clip is 200 reads rather than 200 000.
+UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 def library_dir() -> str:
@@ -57,6 +79,23 @@ def kind_for(filename: str) -> str:
     )
 
 
+def content_type_for(filename: str, kind: str | None = None) -> str:
+    """The MIME type to serve this file as, taken from its extension.
+
+    The kind is only a fallback: `.gif` is stored as a video because ffmpeg
+    treats it as one, but a browser has to be told it is an image or the
+    preview shows nothing at all.
+    """
+    suffix = os.path.splitext(filename or "")[1].lower()
+    if suffix in CONTENT_TYPES:
+        return CONTENT_TYPES[suffix]
+    return {
+        AssetKind.IMAGE: "image/jpeg",
+        AssetKind.AUDIO: "audio/mpeg",
+        AssetKind.VIDEO: "video/mp4",
+    }.get(kind, "application/octet-stream")
+
+
 def normalize_tags(raw: str | None) -> str:
     """Tags as stored: lowercase, comma separated, deduplicated, order kept."""
     seen: list[str] = []
@@ -71,30 +110,55 @@ def normalize_tags(raw: str | None) -> str:
 def save_upload(
     session: Session, *, filename: str, data: bytes, tags: str | None = None
 ) -> MediaAsset:
-    """Store an uploaded fragment and register it.
+    """Store an uploaded fragment held in memory."""
+    return save_stream(session, filename=filename, stream=io.BytesIO(data), tags=tags)
 
-    The bytes are hashed before anything is written, so re-uploading a file
-    that is already in the library never touches the disk at all.
+
+def save_stream(
+    session: Session, *, filename: str, stream: BinaryIO, tags: str | None = None
+) -> MediaAsset:
+    """Store an uploaded fragment read in chunks, and register it.
+
+    Never holds the whole file in memory: a 200 MB b-roll clip pulled in with
+    one `read()` is 200 MB of the API process, and a handful of simultaneous
+    uploads is how that container gets killed on a small server. The bytes go
+    straight to a temporary file beside the library while being hashed, and are
+    either renamed into place or thrown away — re-uploading a file that is
+    already in the library still never leaves a second copy behind.
     """
     limit = get_settings().inserts.max_upload_mb * 1024 * 1024
-    if not data:
-        raise ValidationError("the uploaded file is empty")
-    if len(data) > limit:
-        raise ValidationError(
-            f"the file is {len(data) / 1e6:.0f} MB, over the {limit / 1e6:.0f} MB limit"
-        )
+    kind = kind_for(filename)  # before a byte is written
 
-    kind = kind_for(filename)
-    checksum = hashlib.sha256(data).hexdigest()
-    existing = by_checksum(session, checksum)
-    if existing is not None:
-        log.info("asset %s is already in the library; updating its tags", existing.id)
-        return set_tags(session, existing.id, _merge_tags(existing.tags, tags))
+    library = library_dir()
+    digest = hashlib.sha256()
+    size = 0
+    handle_fd, temp_path = tempfile.mkstemp(dir=library, prefix=".upload-")
+    try:
+        with os.fdopen(handle_fd, "wb") as handle:
+            while chunk := stream.read(UPLOAD_CHUNK_BYTES):
+                size += len(chunk)
+                if size > limit:
+                    raise ValidationError(
+                        f"the file is over the {limit / 1e6:.0f} MB limit"
+                    )
+                digest.update(chunk)
+                handle.write(chunk)
+        if not size:
+            raise ValidationError("the uploaded file is empty")
 
-    safe = media.safe_filename(os.path.basename(filename), "asset")
-    path = os.path.abspath(os.path.join(library_dir(), f"{checksum[:16]}-{safe}"))
-    with open(path, "wb") as handle:
-        handle.write(data)
+        checksum = digest.hexdigest()
+        existing = by_checksum(session, checksum)
+        if existing is not None:
+            log.info("asset %s is already in the library; updating its tags", existing.id)
+            return set_tags(session, existing.id, _merge_tags(existing.tags, tags))
+
+        safe = media.safe_filename(os.path.basename(filename), "asset")
+        path = os.path.abspath(os.path.join(library, f"{checksum[:16]}-{safe}"))
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None and os.path.exists(temp_path):
+            os.remove(temp_path)
 
     return register(
         session, path=path, original_name=os.path.basename(filename),
@@ -220,11 +284,11 @@ def companion_for(session: Session, *, tag: str, seed: int = 0) -> str | None:
     one job run in parallel and only record their use at the end, so every clip
     of that job would otherwise pick the same background.
     """
-    wanted = normalize_tags(tag)
+    wanted = set(style.tag_aliases(normalize_tags(tag)))
     options = [
         option
         for option in options_for_planner(session)
-        if not option.still and not option.audio and wanted in option.tags
+        if not option.still and not option.audio and wanted.intersection(option.tags)
     ]
     if not options:
         return None

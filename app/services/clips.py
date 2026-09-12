@@ -6,15 +6,16 @@ files" ordinary queries instead of table scans with JSON parsing.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 
 from sqlmodel import Session, col, select
 
 from app.core.clock import utc_now
-from app.core.errors import NotFoundError
+from app.core.errors import ConflictError, NotFoundError
 from app.db.enums import ClipStatus, TaskKind
-from app.db.models import Clip, ClipJob, Publication
+from app.db.models import Clip, Publication
 from app.db.enums import PublicationStatus
 from app.domain.cutting import SliceSpec
 from app.services import clip_jobs
@@ -97,16 +98,96 @@ def mark_rendering(session: Session, clip_id: int) -> None:
     clip_jobs.refresh_status(session, clip.job_id)
 
 
-def mark_ready(session: Session, clip_id: int, *, video_path: str, cover_path: str | None) -> Clip:
+def mark_ready(
+    session: Session,
+    clip_id: int,
+    *,
+    video_path: str,
+    cover_path: str | None,
+    composition: dict | None = None,
+) -> Clip:
+    """Record a finished clip, and what it was made of.
+
+    The composition is stored with it rather than thrown away: it is the only
+    record of which pieces of the source play in what order, what was laid over
+    them and which style did it — so a finished clip can be inspected, and
+    re-rendered without re-deciding anything.
+    """
     clip = get(session, clip_id)
     clip.status = ClipStatus.READY
     clip.video_path = video_path
     clip.cover_path = cover_path
     clip.error = None
+    if composition is not None:
+        clip.composition_json = json.dumps(composition, ensure_ascii=False)
     clip.updated_at = utc_now()
     session.add(clip)
     clip_jobs.refresh_status(session, clip.job_id)
     return clip
+
+
+def composition_of(session: Session, clip_id: int) -> dict:
+    """What a clip was last rendered from, or an empty dict if it never was."""
+    clip = get(session, clip_id)
+    try:
+        data = json.loads(clip.composition_json or "{}")
+    except json.JSONDecodeError:
+        log.warning("clip %s holds an unreadable composition", clip_id)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def rerender(session: Session, clip_id: int, *, style: dict | None = None) -> Clip:
+    """Queue this one clip again, optionally with a different look.
+
+    One clip, not the job: replanning a job recuts every clip in it, which is
+    the wrong tool for "I want this one to look different". The boundaries stay
+    exactly where they are and only the render is repeated — cheap, because the
+    transcript is already cached and the segments may still be in the fragment
+    cache.
+    """
+    clip = get(session, clip_id)
+    if clip.status == ClipStatus.RENDERING:
+        raise ConflictError(f"clip {clip_id} is already rendering")
+
+    options = dict(render_options_of(session, clip))
+    if style is not None:
+        options["style"] = style
+
+    clip.status = ClipStatus.PLANNED
+    clip.error = None
+    clip.updated_at = utc_now()
+    task = queue.enqueue(
+        session,
+        TaskKind.RENDER,
+        {"clip_id": clip.id, "job_id": clip.job_id, "render": options},
+        # Deliberately not the plan-time key: that one would be deduplicated
+        # against the render this clip already had, and nothing would happen.
+        dedupe_key=f"render:clip:{clip.id}:{int(utc_now().timestamp())}",
+    )
+    clip.task_id = task.id
+    session.add(clip)
+    clip_jobs.refresh_status(session, clip.job_id)
+    session.flush()
+    log.info("queued a re-render of clip %s as task %s", clip_id, task.id)
+    return clip
+
+
+def render_options_of(session: Session, clip: Clip) -> dict:
+    """The render options this clip was planned with.
+
+    Read back off its own render task, which is where the source path, the
+    title and the transcript settings live. Losing them would send a re-render
+    looking for a source it has no path to.
+    """
+    from app.db.models import Task
+
+    task = session.get(Task, clip.task_id) if clip.task_id else None
+    if task is None:
+        return {}
+    payload = queue.payload_of(task)
+    options = payload.get("render") if isinstance(payload, dict) else None
+    return dict(options) if isinstance(options, dict) else {}
 
 
 def mark_failed(session: Session, clip_id: int, error: str) -> None:

@@ -80,6 +80,30 @@ def test_uploads_are_capped(db, configure):
         upload(db, data=b"0" * (2 * 1024 * 1024))
 
 
+def test_a_rejected_upload_leaves_nothing_behind(db, configure):
+    """The bytes land in a temp file while being hashed; a rejected upload has
+    to take it with it, or the library directory fills up with orphans that no
+    row points at."""
+    configure(AUTOCLIPS_INSERTS_MAX_UPLOAD_MB=1)
+
+    with pytest.raises(ValidationError, match="over the"):
+        upload(db, data=b"0" * (2 * 1024 * 1024))
+
+    assert os.listdir(assets.library_dir()) == []
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("broll.mp4", "video/mp4"),
+    ("broll.webm", "video/webm"),      # served as mp4, Chrome plays nothing
+    ("whoosh.wav", "audio/wav"),       # served as mpeg, Firefox plays nothing
+    ("bed.mp3", "audio/mpeg"),
+    ("meme.png", "image/png"),
+    ("loop.gif", "image/gif"),         # stored as a video, previewed as a still
+])
+def test_a_fragment_is_announced_as_what_it_is(name, expected):
+    assert assets.content_type_for(name, assets.kind_for(name)) == expected
+
+
 def test_deleting_an_asset_takes_its_file_with_it(db):
     asset = upload(db)
     path = asset.path
@@ -153,6 +177,26 @@ def test_a_music_file_is_flagged_so_it_can_never_become_b_roll(db):
     assert option.still is False
 
 
+@pytest.mark.parametrize("tagged", ["background", "фон", "задник", "подложка"])
+def test_a_background_is_found_whatever_the_library_calls_it(db, tagged):
+    """The split profile asks for `background`; the person filling the library
+    writes "фон". Before this the asset was simply never found, and the clip
+    fell back to a blurred backdrop with no explanation."""
+    upload(db, name="loop.mp4", data=f"video {tagged}".encode(), tags=tagged)
+    db.commit()
+
+    assert assets.companion_for(db, tag="background") is not None
+
+
+def test_a_custom_companion_tag_means_only_itself(db):
+    """Synonyms belong to the three roles, not to every tag: a job asking for
+    `дорога` must not be given `фон`."""
+    upload(db, name="loop.mp4", data=b"a background", tags="фон")
+    db.commit()
+
+    assert assets.companion_for(db, tag="дорога") is None
+
+
 def test_a_music_file_is_never_offered_as_a_split_screen_background(db):
     upload(db, name="bed.mp3", data=b"mp3 bytes", tags="background")
     db.commit()
@@ -184,6 +228,19 @@ class TestAssetsApi:
         assert client.get(f"/api/assets/{body['id']}/file").status_code == 200
         assert client.delete(f"/api/assets/{body['id']}").status_code == 204
         assert client.get("/api/assets").json() == []
+
+    def test_a_preview_is_served_inline_as_its_own_type(self, client):
+        """A card shows the fragment; it does not offer to download it."""
+        created = client.post(
+            "/api/assets",
+            files={"file": ("whoosh.wav", b"riff bytes", "audio/wav")},
+            data={"tags": "sfx"},
+        ).json()
+
+        response = client.get(f"/api/assets/{created['id']}/file")
+
+        assert response.headers["content-type"] == "audio/wav"
+        assert response.headers["content-disposition"].startswith("inline")
 
     def test_an_unsupported_upload_is_refused_with_a_reason(self, client):
         response = client.post(

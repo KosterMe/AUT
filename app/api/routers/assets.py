@@ -14,7 +14,6 @@ from sqlmodel import Session
 
 from app.api.deps import db_session
 from app.api.schemas.assets import AssetRead, AssetTagsUpdate
-from app.db.enums import AssetKind
 from app.services import assets
 
 router = APIRouter(prefix="/api/assets", tags=["assets"])
@@ -30,7 +29,7 @@ def list_assets(
 
 
 @router.post("", response_model=AssetRead, status_code=status.HTTP_201_CREATED)
-async def upload_asset(
+def upload_asset(
     file: UploadFile = File(...),
     tags: str = Form(default=""),
     session: Session = Depends(db_session),
@@ -40,9 +39,14 @@ async def upload_asset(
     Re-uploading a file that is already there merges the tags into the existing
     asset rather than storing a second copy — two rows of identical footage
     would only compete for the same keyword.
+
+    Deliberately not `async`: the fragment is read from the request in chunks
+    with ordinary blocking reads, which FastAPI runs on a worker thread for a
+    plain `def`. An `async` version of the same loop would hold the event loop
+    for the length of a 200 MB upload and stall every other request in the app.
     """
-    asset = assets.save_upload(
-        session, filename=file.filename or "asset", data=await file.read(), tags=tags
+    asset = assets.save_stream(
+        session, filename=file.filename or "asset", stream=file.file, tags=tags
     )
     session.commit()
     session.refresh(asset)
@@ -71,8 +75,12 @@ def asset_file(asset_id: int, session: Session = Depends(db_session)):
     asset = assets.get(session, asset_id)
     if not asset.path or not os.path.exists(asset.path):
         raise HTTPException(status_code=404, detail="the asset file is missing from disk")
-    media_type = {
-        AssetKind.IMAGE: "image/jpeg",
-        AssetKind.AUDIO: "audio/mpeg",
-    }.get(asset.kind, "video/mp4")
-    return FileResponse(asset.path, media_type=media_type, filename=asset.original_name or None)
+    # `inline`, and the real type of this particular file: the library page
+    # plays these in <video>/<audio>/<img>, and a card that offers a download
+    # instead of a picture is not a preview.
+    return FileResponse(
+        asset.path,
+        media_type=assets.content_type_for(asset.original_name or asset.path, asset.kind),
+        filename=asset.original_name or None,
+        content_disposition_type="inline",
+    )

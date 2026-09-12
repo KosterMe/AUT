@@ -211,6 +211,42 @@ def test_expired_lease_requeues_the_task():
     assert _get(task_id).status == TaskStatus.QUEUED
 
 
+def test_a_stale_sweep_cannot_resurrect_a_task_another_worker_claimed(monkeypatch):
+    """Two sweeps read the same orphan; the loser must not hand it out again.
+
+    Every worker thread sweeps for expired leases, so several of them read the
+    same row in the same instant. A sweeper that writes its decision without
+    re-checking the row requeues a task another worker has already claimed,
+    and then claims it itself — the handler runs twice, in parallel. This
+    happened: one file was transcribed by two Whisper passes a second apart.
+    """
+    task_id = _enqueue(max_attempts=3)
+    with session_scope() as session:
+        queue.claim(session, [TaskKind.RENDER])
+        task = session.get(Task, task_id)
+        task.lease_expires_at = utc_now() - timedelta(seconds=1)
+        session.add(task)
+
+    original = queue._orphan_outcome
+
+    def other_worker_gets_there_first(task):
+        # Called after this sweep has read the orphan and before it writes:
+        # exactly the window the second worker slips through.
+        monkeypatch.setattr(queue, "_orphan_outcome", original)
+        with session_scope() as other:
+            queue.reclaim_expired(other)
+            assert queue.claim(other, [TaskKind.RENDER]) is not None
+        return original(task)
+
+    monkeypatch.setattr(queue, "_orphan_outcome", other_worker_gets_there_first)
+
+    with session_scope() as session:
+        reclaimed = queue.reclaim_expired(session)
+
+    assert reclaimed == []
+    assert _get(task_id).status == TaskStatus.RUNNING
+
+
 def test_reclaiming_a_last_attempt_keeps_what_went_wrong():
     """The diagnosis outlives the worker that produced it.
 
@@ -248,6 +284,31 @@ def test_reclaiming_a_silent_last_attempt_still_says_why():
         queue.reclaim_expired(session)
 
     assert "lease expired after 1 attempt(s)" in _get(task_id).error
+
+
+def test_reclaiming_a_cancelled_task_says_it_was_cancelled():
+    """The task ends as cancelled, not as whatever went wrong last time.
+
+    Cancelling a running task records no reason of its own, so the error
+    column still holds the previous attempt's. Carrying it over made a task
+    the user had just cancelled report "worker stopped responding; requeued".
+    """
+    task_id = _enqueue(max_attempts=3)
+    with session_scope() as session:
+        queue.claim(session, [TaskKind.RENDER])
+        queue.request_cancel(session, task_id)
+        task = session.get(Task, task_id)
+        # What an earlier attempt left in the column. Cancelling a running
+        # task writes no reason of its own, so this is what survives.
+        task.error = "RuntimeError: something from last time"
+        task.lease_expires_at = utc_now() - timedelta(seconds=1)
+        session.add(task)
+
+    with session_scope() as session:
+        reclaimed = queue.reclaim_expired(session)
+
+    assert [t.status for t in reclaimed] == [TaskStatus.CANCELLED]
+    assert _get(task_id).error == "cancelled by user"
 
 
 def test_expired_lease_after_an_irreversible_step_fails_instead_of_retrying():
@@ -349,6 +410,43 @@ def test_missing_handler_fails_the_task_permanently():
     stored = _get(task_id)
     assert stored.status == TaskStatus.FAILED
     assert "no handler registered" in stored.error
+
+
+def test_a_worker_that_loses_its_lease_stops_and_writes_nothing(monkeypatch, configure):
+    """Two workers must never be running one task at the same time.
+
+    The lease refresher noticed the loss and quietly returned, leaving the
+    handler to carry on with a task somebody else had already claimed — two
+    renders writing one output file, or in the worst case two uploads of the
+    same video. It now stops the handler, and the abandoned worker reports
+    nothing: the task's state belongs to whoever holds it now.
+    """
+    import time
+
+    from app.tasks.registry import register_handler
+
+    configure(QUEUE_HEARTBEAT_SECONDS=0.05)
+    steps: list[str] = []
+
+    @register_handler(TaskKind.CLEANUP)
+    def _handler(ctx):
+        steps.append("started")
+        time.sleep(0.4)          # long enough for the refresher to try once
+        ctx.progress("working", 0.5)
+        steps.append("kept going")
+        return {"deleted": 3}
+
+    task_id = _enqueue(kind=TaskKind.CLEANUP)
+    # The task is no longer ours: this is what an expired lease looks like
+    # from the refresher's side once another worker has reclaimed it.
+    monkeypatch.setattr(queue, "heartbeat", lambda session, task_id: False)
+
+    runner.run_once([TaskKind.CLEANUP])
+
+    stored = _get(task_id)
+    assert steps == ["started"], "the handler must not run on past the loss"
+    assert stored.status == TaskStatus.RUNNING, "the abandoned worker must not finalize it"
+    assert "deleted" not in (stored.result_json or ""), "nor record a result for it"
 
 
 def test_task_cancelled_exception_is_not_a_failure():

@@ -18,7 +18,9 @@ from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.jsonutil import dumps
 from app.db.enums import ClipStatus, JobStatus, TaskKind, TaskStatus
 from app.db.models import Clip, ClipJob, Task
+from app.adapters.youtube import downloader
 from app.domain import profiles, sources
+from app.services import styles
 from app.tasks import queue
 
 log = logging.getLogger(__name__)
@@ -39,6 +41,7 @@ def create(
     gap_seconds: float | None = None,
     max_clips: int = 0,
     render: dict | None = None,
+    style_id: int | None = None,
 ) -> ClipJob:
     """Register a source video, optionally starting work on it right away."""
     source_ref = source_ref.strip()
@@ -63,6 +66,7 @@ def create(
         custom_title=_normalize_title(custom_title),
         caption_tags=caption_tags.strip() if caption_tags else None,
         profile=chosen.name,
+        style_id=_style_id(session, style_id),
         status=JobStatus.CREATED,
     )
     session.add(job)
@@ -109,6 +113,7 @@ def start(
     max_clips: int = 0,
     profile: str | None = None,
     render: dict | None = None,
+    style_id: int | None = None,
 ) -> Task:
     """Queue the download → transcribe → plan pass for a job.
 
@@ -127,20 +132,36 @@ def start(
             job.profile = profiles.get(profile).name
         except ValueError as exc:
             raise ValidationError(str(exc)) from exc
+    if style_id is not None:
+        job.style_id = _style_id(session, style_id)
 
     # Resolved once, here, so the download and every render of this job agree
     # about what kind of video it is — including renders queued days later.
     settings = profiles.resolve(profiles.get(job.profile), render or {})
+    # And the same for how it looks. Resolving the style now rather than per
+    # render is what stops the fiftieth clip of a job coming out different from
+    # the first because somebody edited a preset while it was running.
+    look = styles.resolved_for(
+        session,
+        profile_name=job.profile,
+        style_id=job.style_id,
+        overrides=(render or {}).get("style"),
+    ).to_dict()
 
+    # Restarting a failed job comes through here with an empty body, so every
+    # clip setting arrives as None and the job used to come back with the
+    # defaults instead of what it was created with: a job asking for two
+    # 120-second clips was retried as twenty of them.
+    previous = _previous_download_payload(session, job_id)
     payload = {
         "job_id": job_id,
         "profile": settings["profile"],
         "cutter": settings["cutter"],
-        "min_clip_seconds": min_clip_seconds,
-        "max_clip_seconds": max_clip_seconds,
-        "gap_seconds": gap_seconds,
-        "max_clips": max_clips,
-        "render": {**(render or {}), **settings},
+        "min_clip_seconds": _kept(min_clip_seconds, previous, "min_clip_seconds"),
+        "max_clip_seconds": _kept(max_clip_seconds, previous, "max_clip_seconds"),
+        "gap_seconds": _kept(gap_seconds, previous, "gap_seconds"),
+        "max_clips": max_clips or int(previous.get("max_clips") or 0),
+        "render": {**(render or {}), **settings, "style": look},
     }
     task = queue.enqueue(
         session,
@@ -157,6 +178,14 @@ def start(
     session.flush()
     log.info("queued download task %s for job %s", task.id, job_id)
     return task
+
+
+def _style_id(session: Session, style_id: int | None) -> int | None:
+    """A preset id, checked to exist. `None` means "the profile's defaults"."""
+    if not style_id:
+        return None
+    styles.get(session, int(style_id))  # raises NotFoundError if it is gone
+    return int(style_id)
 
 
 def set_custom_title(session: Session, job_id: int, custom_title: str) -> ClipJob:
@@ -223,6 +252,33 @@ def delete(session: Session, job_id: int) -> None:
         raise ConflictError("cancel the job before deleting it")
     session.delete(job)  # clips cascade
     session.flush()
+
+
+def source_downloaded_elsewhere(session: Session, job_id: int, source_ref: str) -> str | None:
+    """A file another job already downloaded for this exact source, if any.
+
+    Re-running the same video — a different profile, different clip lengths,
+    a retry after a bad cut — is normal, and every re-run used to fetch the
+    whole source again because the download is keyed by job id. On the link
+    this runs over that is ten minutes and change for 563 MB, with a real
+    chance of failing outright; `data/media/originals` held `job-8.mp4` and
+    `job-9.mp4` byte for byte identical. Sharing the file means two jobs can
+    point at one path, which `handlers.cleanup` knows about.
+    """
+    if not source_ref:
+        return None
+    rows = session.exec(
+        select(ClipJob)
+        .where(ClipJob.source_ref == source_ref)
+        .where(col(ClipJob.id) != job_id)
+        .where(col(ClipJob.original_path) != None)  # noqa: E711
+        .order_by(col(ClipJob.updated_at).desc())
+    ).all()
+    for row in rows:
+        path = row.original_path
+        if path and os.path.exists(path) and downloader.is_usable_source(path):
+            return path
+    return None
 
 
 def record_source(
@@ -292,8 +348,18 @@ def set_retrying(session: Session, job_id: int, error: str, *, attempt: int) -> 
 
 
 def fail(session: Session, job_id: int, error: str) -> None:
+    """Record that a job could not be completed.
+
+    A job the user cancelled is left alone. Cancelling asks the running task
+    to stop, and the queue reports every task that ends without succeeding
+    through the handler's failure hook — including a cancelled one. Without
+    this guard the job flipped from "cancelled" to "failed" a few minutes
+    later, blaming a worker that had done exactly what it was told: seen on
+    job 8, cancelled at 16:21 and shown as "failed: worker stopped responding"
+    at 16:26.
+    """
     job = session.get(ClipJob, job_id)
-    if job is None:
+    if job is None or job.status == JobStatus.CANCELLED:
         return
     job.status = JobStatus.FAILED
     job.error = error[:2048]
@@ -355,6 +421,26 @@ def _clips(session: Session, job_id: int) -> list[Clip]:
     return list(
         session.exec(select(Clip).where(Clip.job_id == job_id).order_by(col(Clip.index))).all()
     )
+
+
+def _kept(value, previous: dict, key: str):
+    """A caller's value, or what the last run of this job used."""
+    return value if value is not None else previous.get(key)
+
+
+def _previous_download_payload(session: Session, job_id: int) -> dict:
+    """The payload this job was last started with, if it is still on record.
+
+    Dedupe keys are structured and only the most recent download task for a
+    job holds one — `enqueue` releases the old key as it queues the
+    replacement — so this finds exactly the previous run.
+    """
+    task = session.exec(
+        select(Task)
+        .where(Task.dedupe_key == f"download:job:{job_id}")
+        .order_by(col(Task.created_at).desc())
+    ).first()
+    return queue.payload_of(task) if task is not None else {}
 
 
 def _active_task_for_job(session: Session, job_id: int) -> Task | None:

@@ -17,59 +17,9 @@ Pure logic, as with every other planner: values in, values out.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-from app.core.config import get_settings
 from app.domain.composition import Composition, MusicBed, SoundEffect
 from app.domain.inserts import AssetOption
-
-# Library tags that make an asset usable here. Not settings: they are the
-# vocabulary an operator tags with, and renaming them would silently empty
-# every library that used the old names.
-MUSIC_TAG = "music"
-SFX_TAG = "sfx"
-
-
-@dataclass(frozen=True)
-class AudioPolicy:
-    """How loud, how often, and how far out of the way."""
-
-    music_gain_db: float = -20.0
-    music_fade_in_sec: float = 0.6
-    music_fade_out_sec: float = 1.2
-    duck_threshold: float = 0.03
-    duck_ratio: float = 8.0
-    duck_attack_ms: float = 20.0
-    duck_release_ms: float = 300.0
-
-    effect_gain_db: float = -8.0
-    effect_seconds: float = 1.0
-    max_effects: int = 6
-    effect_min_gap_seconds: float = 4.0
-    # Effects land slightly before the cut they belong to: a transition sound
-    # that starts on the frame of the cut reads as late.
-    effect_lead_seconds: float = 0.12
-    effects_on_cuts: bool = True
-    effects_on_inserts: bool = True
-
-    @classmethod
-    def from_settings(cls) -> "AudioPolicy":
-        configured = get_settings().audio
-        return cls(
-            music_gain_db=configured.music_gain_db,
-            music_fade_in_sec=configured.music_fade_in_seconds,
-            music_fade_out_sec=configured.music_fade_out_seconds,
-            duck_threshold=configured.duck_threshold,
-            duck_ratio=configured.duck_ratio,
-            duck_attack_ms=configured.duck_attack_ms,
-            duck_release_ms=configured.duck_release_ms,
-            effect_gain_db=configured.effect_gain_db,
-            effect_seconds=configured.effect_seconds,
-            max_effects=configured.max_effects_per_clip,
-            effect_min_gap_seconds=configured.effect_min_gap_seconds,
-            effects_on_cuts=configured.effects_on_cuts,
-            effects_on_inserts=configured.effects_on_inserts,
-        )
+from app.domain.style import MUSIC_TAG, SFX_TAG, AudioPolicy, tag_aliases
 
 
 def choose_music(
@@ -153,11 +103,15 @@ def _moments(composition: Composition, policy: AudioPolicy) -> list[float]:
 
 
 def _tagged(assets: list[AssetOption], tag: str) -> list[AssetOption]:
-    """Library items carrying a tag, least recently used first."""
+    """Library items carrying a tag, least recently used first.
+
+    Any spelling of the tag: a bed tagged "музыка" is a bed.
+    """
+    wanted = set(tag_aliases(tag))
     return [
         asset
         for asset in sorted(assets, key=lambda a: (a.last_used_rank, a.asset_id))
-        if tag in asset.tags and not asset.still
+        if wanted.intersection(asset.tags) and not asset.still
     ]
 
 

@@ -33,6 +33,20 @@ COPY app/adapters/tiktok/signature/package.json app/adapters/tiktok/signature/pa
      ./app/adapters/tiktok/signature/
 RUN cd app/adapters/tiktok/signature && npm ci --omit=dev
 
+# ...and the browser it drives. `npm ci` installs the Playwright library but
+# never downloads a browser binary, and the signer launches one to compute the
+# signature TikTok wants on the final publish call. Without it every publish
+# uploaded the whole video and then failed on the last step — the upload made,
+# no post to show for it, and nothing safe to retry automatically.
+#
+# The shared path matters: installed as root the browser lands in /root/.cache,
+# which the appuser this image runs as cannot read.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN cd app/adapters/tiktok/signature \
+    && npx playwright install --with-deps chromium \
+    && chmod -R a+rX /ms-playwright \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY app ./app
 COPY assets ./assets
 COPY alembic.ini ./

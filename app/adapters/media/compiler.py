@@ -31,6 +31,7 @@ spread across a 14-minute 1080p60 AV1 source, two inserts, 16 cores):
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 import os
@@ -50,6 +51,7 @@ from app.adapters.media.ffmpeg import (
 )
 from app.core.config import get_settings
 from app.domain import composition as comp
+from app.domain import style as style_module
 from app.domain import subtitles
 
 log = logging.getLogger(__name__)
@@ -68,12 +70,6 @@ AUDIO_RATE = 48000
 AUDIO_LAYOUT = "stereo"
 
 LAYOUT_AUTO = comp.LAYOUT_AUTO
-# How much wider than the canvas a source may be and still be cropped to fill
-# it rather than floated over a blurred copy of itself. At 0.15 a 9:16 phone
-# video fills the frame, a 4:5 photo does not — cropping that one would throw
-# away a third of its width, which is exactly what the blurred backdrop exists
-# to avoid.
-FILL_ASPECT_TOLERANCE = 0.15
 
 
 @dataclass(frozen=True)
@@ -161,6 +157,50 @@ def render(
     )
 
 
+@dataclass(frozen=True)
+class PreviewSpec:
+    """A few seconds of a clip, small and quick, for looking at a style.
+
+    The whole point is the length of the loop. A full render is twenty seconds
+    of ffmpeg and produces a file nobody keeps; four seconds at half size is
+    about one, which is the difference between tuning a look and guessing at
+    one. Quality is deliberately lower — this is for judging framing, type and
+    pacing, never for judging compression.
+    """
+
+    at_sec: float = 0.0
+    duration_sec: float = 4.0
+    scale: float = 0.5
+    crf: int = 30
+
+    def __post_init__(self) -> None:
+        if self.duration_sec <= 0:
+            raise ValueError("a preview needs a positive duration")
+
+
+def render_preview(
+    composition: comp.Composition, output_path: str, *, spec: PreviewSpec | None = None
+) -> ClipRenderResult:
+    """Render one window of a composition at reduced size.
+
+    Always one pass, and never through the fragment cache: a preview is a
+    throwaway at a size nothing else uses, and filling the cache with half-size
+    fragments would only make the real render miss.
+    """
+    window = spec or PreviewSpec()
+    excerpt = comp.scaled(
+        comp.excerpt(composition, at_sec=window.at_sec, duration_sec=window.duration_sec),
+        window.scale,
+    )
+    excerpt = dataclasses.replace(
+        excerpt,
+        style=dataclasses.replace(
+            excerpt.style, delivery=excerpt.style.delivery.merged({"crf": window.crf})
+        ),
+    )
+    return render(excerpt, output_path, strategy=STRATEGY_ONE_PASS)
+
+
 def choose_strategy(composition: comp.Composition) -> str:
     """Which strategy to render this composition with.
 
@@ -171,7 +211,10 @@ def choose_strategy(composition: comp.Composition) -> str:
     two stages with `AUTOCLIPS_RENDER_STRATEGY`.
     """
     settings = get_settings().render
-    configured = (settings.strategy or "auto").strip().lower()
+    # The clip's own style wins: a job being iterated on can ask for the
+    # cacheable path without changing what every other job does.
+    configured = (composition.style.delivery.strategy or settings.strategy or "auto")
+    configured = configured.strip().lower()
     if configured in (STRATEGY_ONE_PASS, STRATEGY_TWO_STAGE):
         return configured
 
@@ -187,7 +230,11 @@ def choose_strategy(composition: comp.Composition) -> str:
 
 
 def choose_layout(
-    source_path: str, canvas: comp.Canvas, *, requested: str = LAYOUT_AUTO
+    source_path: str,
+    canvas: comp.Canvas,
+    *,
+    requested: str = LAYOUT_AUTO,
+    tolerance: float = 0.15,
 ) -> str:
     """How this source should fill the canvas.
 
@@ -207,7 +254,7 @@ def choose_layout(
 
     source_aspect = float(width) / float(height)
     canvas_aspect = canvas.width / canvas.height
-    if source_aspect <= canvas_aspect * (1.0 + FILL_ASPECT_TOLERANCE):
+    if source_aspect <= canvas_aspect * (1.0 + tolerance):
         return comp.LAYOUT_FILL
     return comp.LAYOUT_BLUR
 
@@ -217,17 +264,10 @@ def plan_vertical_clip(
     *,
     start_sec: float,
     end_sec: float,
-    width: int = 1080,
-    height: int = 1920,
-    crf: int = 23,
-    burn_subtitles: bool = True,
-    auto_montage: bool = True,
-    layout: str = LAYOUT_AUTO,
+    style: style_module.StyleSpec | None = None,
     companion_path: str | None = None,
     transcript_segments: list[Any] | None = None,
     fallback_subtitle_text: str | None = None,
-    subtitle_font_size: int = 64,
-    subtitle_position_percent: int = 74,
     title_text: str | None = None,
 ) -> comp.Composition:
     """Describe one slice of one file, without rendering anything.
@@ -236,15 +276,27 @@ def plan_vertical_clip(
     decided from what is already in it: b-roll is placed against the subtitle
     cues, and those only exist once silence removal has settled where the
     segments are. So the caller plans, adds inserts, and only then renders.
+
+    The style arrives resolved. Every decision this function makes — where the
+    cuts go, how the frame is filled, what the type looks like — reads from it
+    and from nothing else, which is what makes the resulting composition a
+    complete description of the clip rather than half of one.
     """
     from app.adapters.media.ffmpeg import montage_keep_segments
 
-    canvas = comp.Canvas(width=width, height=height, fps=get_settings().render.fps)
-    keep_segments = None
-    if auto_montage:
-        keep_segments = montage_keep_segments(input_path, start_sec=start_sec, end_sec=end_sec)
+    look = style or style_module.StyleSpec.from_settings()
+    canvas = comp.canvas_for(look)
 
-    resolved_layout = choose_layout(input_path, canvas, requested=layout)
+    keep_segments = None
+    if look.pacing.remove_silence:
+        keep_segments = montage_keep_segments(
+            input_path, start_sec=start_sec, end_sec=end_sec, pacing=look.pacing
+        )
+
+    resolved_layout = choose_layout(
+        input_path, canvas,
+        requested=look.framing.layout, tolerance=look.framing.fill_tolerance,
+    )
     if resolved_layout == comp.LAYOUT_SPLIT and not companion_path:
         # Asked for a split screen with nothing to put in the bottom half. The
         # clip is still worth making, so it falls back rather than failing.
@@ -253,26 +305,22 @@ def plan_vertical_clip(
 
     draft = comp.single_source(
         input_path, start_sec=start_sec, end_sec=end_sec, keep_segments=keep_segments,
-        canvas=canvas, crf=crf, layout=resolved_layout,
+        canvas=canvas, style=look, layout=resolved_layout,
         companion_path=companion_path if resolved_layout == comp.LAYOUT_SPLIT else None,
     )
     cues: list[subtitles.SubtitleCue] = []
-    if burn_subtitles:
+    if look.subtitles.enabled:
         cues = subtitles.make_subtitle_cues(
             transcript_segments or [],
             timeline_segments=draft.timeline(),
             fallback_text=fallback_subtitle_text,
+            style=look.subtitles,
         )
     return comp.Composition(
         segments=draft.segments,
         canvas=canvas,
-        subtitles=comp.SubtitleSpec(
-            cues=tuple(cues),
-            font_size=subtitle_font_size,
-            position_percent=subtitle_position_percent,
-            title_text=title_text,
-        ),
-        crf=crf,
+        subtitles=comp.SubtitleSpec(cues=tuple(cues), title_text=title_text),
+        style=look,
     )
 
 
@@ -332,6 +380,7 @@ def one_pass_args(
             index, composition.canvas, segment,
             video_in=f"[{video_input}:v]",
             companion_in=None if companion_input is None else f"[{companion_input}:v]",
+            framing=composition.style.framing,
         )
         parts.extend(chain)
         video_labels.append(video_label)
@@ -346,7 +395,11 @@ def one_pass_args(
 
     insert_chains, video_label = _insert_chains(composition, inputs, video_in=video_label)
     parts.extend(insert_chains)
-    parts.append(_look_chain(video_in=video_label, subtitle_path=subtitle_path))
+    parts.append(
+        _look_chain(
+            video_in=video_label, subtitle_path=subtitle_path, grade=composition.style.grade
+        )
+    )
     if has_audio:
         parts.extend(_audio_chains(composition, inputs, audio_in=audio_label))
 
@@ -371,7 +424,11 @@ def final_pass_args(
     parts: list[str] = []
     insert_chains, video_label = _insert_chains(composition, inputs, video_in="0:v")
     parts.extend(insert_chains)
-    parts.append(_look_chain(video_in=video_label, subtitle_path=subtitle_path))
+    parts.append(
+        _look_chain(
+            video_in=video_label, subtitle_path=subtitle_path, grade=composition.style.grade
+        )
+    )
     if has_audio:
         parts.extend(_audio_chains(composition, inputs, audio_in="0:a"))
 
@@ -430,7 +487,7 @@ def _render_two_stage(
     fragments: list[str] = []
     reused = 0
     for index, segment in enumerate(composition.segments):
-        path = fragment_path(composition.canvas, segment)
+        path = fragment_path(composition.canvas, segment, framing=composition.style.framing)
         if settings.fragment_cache and os.path.exists(path) and os.path.getsize(path) > 2048:
             reused += 1
             os.utime(path, None)  # keep the cache sweep honest about what is in use
@@ -490,6 +547,7 @@ def fragment_args(
         index, composition.canvas, segment,
         video_in=f"[{video_input}:v]",
         companion_in=None if companion_input is None else f"[{companion_input}:v]",
+        framing=composition.style.framing,
     )
     parts.append(f"[{video_label}]format=yuv420p,setsar=1[v]")
     if keep_audio:
@@ -540,11 +598,12 @@ def _segment_video_chain(
     *,
     video_in: str,
     companion_in: str | None,
+    framing: style_module.FramingStyle | None = None,
 ) -> tuple[list[str], str]:
     """Compose one segment into the canvas. Returns (chain parts, out label)."""
     prefix = f"s{index}"
     out = f"v{index}"
-    settings = get_settings().render
+    frame = framing or style_module.FramingStyle.from_settings()
     normalise = f"fps={canvas.fps},setpts=PTS-STARTPTS"
 
     if segment.layout == comp.LAYOUT_FILL:
@@ -572,9 +631,10 @@ def _segment_video_chain(
         [
             f"{video_in}{normalise},split=2[{prefix}bgsrc][{prefix}fgsrc]",
             filters.background(canvas.width, canvas.height, src=f"[{prefix}bgsrc]",
-                               out=f"{prefix}bg", divisor=settings.blur_scale_divisor),
+                               out=f"{prefix}bg", divisor=frame.blur_divisor,
+                               radius=frame.blur_radius),
             filters.foreground(canvas.width, canvas.height, src=f"[{prefix}fgsrc]",
-                               out=f"{prefix}fg", zoom=settings.foreground_zoom),
+                               out=f"{prefix}fg", zoom=frame.zoom),
             f"[{prefix}bg][{prefix}fg]overlay=(W-w)/2:(H-h)/2[{out}]",
         ],
         out,
@@ -636,6 +696,7 @@ def _insert_chains(
     parts: list[str] = []
     current = video_in
     canvas = composition.canvas
+    policy = composition.style.inserts
     for order, insert in enumerate(sorted(composition.inserts, key=lambda i: i.at_sec)):
         index = _add_input(inputs, insert.source_path, start=insert.source_start_sec,
                            duration=insert.duration_sec, still=insert.still)
@@ -647,9 +708,12 @@ def _insert_chains(
             )
             position = "0:0"
         else:
-            box_width = max(2, int(canvas.width * 0.46) // 2 * 2)
+            box_width = max(2, int(canvas.width * policy.pip_width_share) // 2 * 2)
             fit = f"scale={box_width}:-2"
-            position = f"{canvas.width - box_width - 48}:{int(canvas.height * 0.094)}"
+            position = (
+                f"{canvas.width - box_width - policy.pip_margin_px}"
+                f":{int(canvas.height * policy.pip_top_share)}"
+            )
         parts.append(
             f"[{index}:v]fps={canvas.fps},{fit},setpts=PTS-STARTPTS,"
             f"tpad=start_duration={filters.flt(insert.at_sec)}:start_mode=add:color=black[{tag}]"
@@ -663,15 +727,20 @@ def _insert_chains(
     return parts, current
 
 
-def _look_chain(*, video_in: str, subtitle_path: str | None) -> str:
+def _look_chain(
+    *, video_in: str, subtitle_path: str | None, grade: style_module.GradeStyle | None = None
+) -> str:
     """Grade, sharpen and burn the overlay — everything that is style.
 
     Kept out of the segment chain on purpose: a cached fragment stays valid
     when the look changes. Measured to cost nothing either way.
     """
-    chain = f"[{video_in}]eq=contrast=1.04:saturation=1.08"
-    if get_settings().render.sharpen:
-        chain += ",unsharp=5:5:0.55:3:3:0.25"
+    look = grade or style_module.GradeStyle.from_settings()
+    chain = (
+        f"[{video_in}]eq=contrast={look.contrast:.2f}:saturation={look.saturation:.2f}"
+    )
+    if look.sharpen:
+        chain += f",unsharp=5:5:{look.sharpen_luma:.2f}:3:3:{look.sharpen_chroma:.2f}"
     chain += ",format=yuv420p,setsar=1"
     if subtitle_path:
         chain += (
@@ -768,13 +837,20 @@ def fragment_cache_dir() -> str:
     return directory
 
 
-def fragment_path(canvas: comp.Canvas, segment: comp.Segment) -> str:
+def fragment_path(
+    canvas: comp.Canvas,
+    segment: comp.Segment,
+    framing: style_module.FramingStyle | None = None,
+) -> str:
     """Where a rendered segment lives, named by everything that shaped it.
 
     The key covers the source's identity as well as its path: replacing a file
-    in place would otherwise serve the old picture forever.
+    in place would otherwise serve the old picture forever. It also covers the
+    framing, which is the only part of the style a fragment can see — the rest
+    is applied after the join, which is exactly why a restyle can reuse them.
     """
     settings = get_settings().render
+    frame = framing or style_module.FramingStyle.from_settings()
     material = "|".join(
         str(part)
         for part in (
@@ -785,7 +861,7 @@ def fragment_path(canvas: comp.Canvas, segment: comp.Segment) -> str:
             f"{segment.source_start_sec:.3f}", f"{segment.source_end_sec:.3f}",
             _source_identity(segment.companion_path) if segment.companion_path else "",
             f"{segment.companion_start_sec:.3f}",
-            settings.foreground_zoom, settings.blur_scale_divisor,
+            frame.zoom, frame.blur_divisor, frame.blur_radius,
             settings.fragment_encoder, settings.fragment_crf,
         )
     )
@@ -813,7 +889,9 @@ def _cached_share(composition: comp.Composition) -> float:
     cached = sum(
         segment.duration_sec
         for segment in composition.segments
-        if os.path.exists(fragment_path(composition.canvas, segment))
+        if os.path.exists(
+            fragment_path(composition.canvas, segment, framing=composition.style.framing)
+        )
     )
     return cached / total
 
@@ -884,8 +962,7 @@ def _write_subtitles(
         path,
         width=composition.canvas.width,
         height=composition.canvas.height,
-        font_size=spec.font_size,
-        position_percent=spec.position_percent,
+        style=composition.style.subtitles,
         title_text=spec.title_text,
         title_end_sec=composition.duration_sec,
     )

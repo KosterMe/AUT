@@ -39,6 +39,18 @@ class SessionExpiredError(PermanentError):
     """
 
 
+class LeaseLost(Exception):
+    """The task being run no longer belongs to this worker.
+
+    The lease expired and the queue handed the task to somebody else, so
+    whatever this process is still doing is duplicate work — and for anything
+    with a side effect, actively harmful. A worker that sees this must stop
+    and touch none of the task's state: it is not its to finish.
+
+    Like `TaskCancelled`, control flow rather than a failure to report.
+    """
+
+
 class TaskCancelled(Exception):
     """Raised inside a handler when the user cancelled the running task.
 

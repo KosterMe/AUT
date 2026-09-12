@@ -130,6 +130,24 @@ def retry_publication(publication_id: int, session: Session = Depends(db_session
     return row
 
 
+@router.post("/retry-untouched", response_model=list[PublicationRead])
+def retry_untouched(
+    job_id: int | None = Query(default=None), session: Session = Depends(db_session)
+):
+    """Re-queue every failure that never reached TikTok.
+
+    Safe in bulk precisely because it skips any publication whose upload had
+    started — those still need the one-at-a-time button, and a look at the
+    account first. This is the way back from an expired session, which fails
+    everything queued behind it one scheduled minute at a time.
+    """
+    rows = publications.retry_untouched(session, job_id=job_id)
+    session.commit()
+    for row in rows:
+        session.refresh(row)
+    return rows
+
+
 @router.delete("/{publication_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_publication(publication_id: int, session: Session = Depends(db_session)):
     publications.delete(session, publication_id)

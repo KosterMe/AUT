@@ -5,6 +5,7 @@
 #   worker-media    downloads, transcribes, renders clips  (CPU bound)
 #   worker-publish  uploads publications at their time     (network bound)
 #   bgutil          PO-token provider yt-dlp needs for YouTube (internal)
+#   resolver        DNS-over-HTTPS forwarder for youtube.com   (internal)
 #   webapp          React UI behind nginx                  (127.0.0.1:3000)
 #
 # Scaling out is `docker compose up -d --scale worker-media=3`. Nothing needs
@@ -26,6 +27,10 @@ x-app-base: &app-base
   env_file:
     - path: .env
       required: false
+  # Docker's embedded resolver keeps answering for container names (api,
+  # bgutil) and forwards everything else here — see the resolver service.
+  dns:
+    - 172.30.0.53
 
 x-app-env: &app-env
   APP_DATA_DIR: /data
@@ -67,6 +72,9 @@ services:
     environment:
       <<: *app-env
     volumes: *app-volumes
+    depends_on:
+      resolver:
+        condition: service_started
     ports:
       - "127.0.0.1:8000:8000"
     # Migrations run here and only here, so several workers starting at once
@@ -96,6 +104,8 @@ services:
         condition: service_started
       bgutil:
         condition: service_started
+      resolver:
+        condition: service_started
     command: ["python", "-m", "app.workers", "--kinds", "download,render"]
     restart: unless-stopped
 
@@ -109,6 +119,8 @@ services:
       api:
         condition: service_started
       bgutil:
+        condition: service_started
+      resolver:
         condition: service_started
     # Publishing is mostly waiting on TikTok, so it gets its own worker: a
     # queue of slow renders must never delay a post that has a scheduled time.
@@ -125,9 +137,43 @@ services:
   # you ever pin one.
   bgutil:
     image: brainicism/bgutil-ytdlp-pot-provider:latest
+    # It runs YouTube's botguard challenge in a browser runtime, so it needs
+    # to reach youtube.com itself — same resolver as the workers.
+    dns:
+      - 172.30.0.53
     # Nothing outside the compose network has any business talking to it.
     expose:
       - "4416"
+    restart: unless-stopped
+
+  # Plain DNS for youtube.com is nulled on this network: the name returns
+  # nothing from 1.1.1.1, 8.8.8.8, 9.9.9.9 and the ISP resolver alike, while
+  # google.com, github.com and the googlevideo edges that carry the actual
+  # media all resolve normally. HTTPS to YouTube is untouched once the address
+  # is known — a request to a pinned IP answers 200 in a third of a second —
+  # so only name resolution has to be routed around it: CoreDNS forwards every
+  # query to Cloudflare over TLS on 853, which the interception does not touch.
+  # (cloudflared's own `proxy-dns` was the obvious choice and is gone — removed
+  # in 2026.2.0.)
+  #
+  # Symptom when this is missing: yt-dlp reports "Failed to resolve
+  # 'www.youtube.com'", or worse, extracts the title and returns storyboards
+  # only, which reads exactly like an expired cookie file and is not one.
+  resolver:
+    image: coredns/coredns:latest
+    command: ["-conf", "/etc/coredns/Corefile"]
+    volumes:
+      - ./docker/Corefile:/etc/coredns/Corefile:ro
+    # The image runs as uid 65532 and binding port 53 needs either root or
+    # this. The sysctl is per network namespace, so it changes nothing outside
+    # the container.
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
+    # Fixed because Docker's `dns:` takes addresses, not service names — which
+    # is also why this file declares its own subnet below.
+    networks:
+      default:
+        ipv4_address: 172.30.0.53
     restart: unless-stopped
 
   webapp:
@@ -140,6 +186,15 @@ services:
     ports:
       - "127.0.0.1:3000:80"
     restart: unless-stopped
+
+networks:
+  # Compose would otherwise pick the subnet itself, and the resolver's address
+  # has to be known before anything starts. 172.30.0.0/24 was free here; any
+  # unused range works, as long as it matches the `dns:` entries above.
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
 
 volumes:
   models:

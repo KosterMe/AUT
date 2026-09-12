@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Trash2, RefreshCcw, Download, Upload as UploadIcon, Chrome } from "lucide-react";
 import { Accounts, Login, errorMessage } from "../api/client";
-import { keys, useAccounts, useInvalidatingMutation } from "../api/hooks";
+import { keys, useAccounts, useHealth, useInvalidatingMutation } from "../api/hooks";
 import StatusBadge from "../components/StatusBadge";
 
 export default function AccountsPage() {
@@ -115,6 +115,12 @@ function AddAccount() {
   const [username, setUsername] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The API says whether it could drive a browser at all. In the container it
+  // cannot — the dependency is left out on purpose, and a Chrome opened inside
+  // a container is one nobody can sign in to — so the button is shown as
+  // unavailable rather than left to answer 503 when pressed.
+  const { data: health } = useHealth();
+  const browserLoginWorks = health?.browser_login ?? false;
 
   const importFile = useInvalidatingMutation(
     ({ username, file }: { username: string; file: File }) =>
@@ -187,17 +193,26 @@ function AddAccount() {
         <button
           type="button"
           className="btn-secondary"
-          disabled={!username.trim() || startBrowser.isPending}
+          disabled={!browserLoginWorks || !username.trim() || startBrowser.isPending}
           onClick={() =>
             startBrowser.mutate(username.trim(), {
               onError: (err) => setError(errorMessage(err)),
             })
           }
-          title="Opens Chrome on the machine running the API. Desktop only."
+          title={
+            browserLoginWorks
+              ? "Opens Chrome on the machine running the API. Desktop only."
+              : "This server runs without a desktop browser, so it cannot open one for you. Upload a cookie file instead."
+          }
         >
           <Chrome size={16} />
           Open browser login
         </button>
+        {!browserLoginWorks && (
+          <span className="text-xs text-slate-500">
+            Browser login needs a desktop; this server has none.
+          </span>
+        )}
       </div>
     </form>
   );

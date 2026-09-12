@@ -4,7 +4,9 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Any
+
 from app.core.config import get_settings
+from app.domain.style import SubtitleStyle
 
 # Word-level ("karaoke") subtitles: each cue shows exactly one word and appears
 # exactly at that word's start time. Nothing is ever glued together — a short
@@ -14,6 +16,8 @@ from app.core.config import get_settings
 # the render retranscribe pass is disabled or fails).
 
 BASE_TAGS = r"\blur0.2"
+# Fallback line length. The style carries the real one; this is what a caller
+# that has no style gets.
 MAX_LINE_CHARS = 24
 
 # Cue entrance: the word lands slightly small, overshoots, then settles. Kept
@@ -36,6 +40,23 @@ DEFAULT_TITLE_FONT = "Oswald"
 
 def title_font_name() -> str:
     return get_settings().subtitles.title_font.strip() or DEFAULT_TITLE_FONT
+
+
+def ass_colour(value: str, opacity: float = 1.0) -> str:
+    """`#RRGGBB` as libass wants it: `&HAABBGGRR`, alpha inverted.
+
+    Inverted because in ASS 00 is opaque and FF is invisible, which is exactly
+    backwards from every colour picker a person will paste a value out of. An
+    unparseable colour falls back to white rather than raising: a typo in a
+    preset should cost the colour, not the clip.
+    """
+    text = (value or "").strip().lstrip("#")
+    if len(text) == 3:
+        text = "".join(char * 2 for char in text)
+    if len(text) != 6 or any(char not in "0123456789abcdefABCDEF" for char in text):
+        text = "FFFFFF"
+    alpha = int(round((1.0 - max(0.0, min(1.0, opacity))) * 255))
+    return f"&H{alpha:02X}{text[4:6]}{text[2:4]}{text[0:2]}".upper()
 
 
 # Fallback (no word timestamps) tuning.
@@ -78,6 +99,7 @@ class CueOptions:
     min_cue_seconds: float = DEFAULT_ASS_MIN_SECONDS
     strip_punctuation: bool = True
     uppercase: bool = False
+    max_line_chars: int = MAX_LINE_CHARS
     time_offset_seconds: float = 0.0  # shift all cues; negative shows them earlier
 
     @classmethod
@@ -87,6 +109,23 @@ class CueOptions:
             strip_punctuation=configured.strip_punct,
             uppercase=configured.uppercase,
             time_offset_seconds=configured.time_offset_seconds,
+        )
+
+    @classmethod
+    def from_style(cls, style: SubtitleStyle) -> "CueOptions":
+        """Cue timing and casing as the clip's own style asks for it.
+
+        The same numbers the environment used to supply, except that these
+        arrived with the clip — so two jobs rendering at the same moment can
+        want different things.
+        """
+        return cls(
+            hold_seconds=style.hold_seconds,
+            end_hold_seconds=style.end_hold_seconds,
+            strip_punctuation=style.strip_punctuation,
+            uppercase=style.uppercase,
+            time_offset_seconds=style.time_offset_seconds,
+            max_line_chars=style.max_line_chars,
         )
 
 
@@ -122,8 +161,9 @@ def make_subtitle_cues(
     timeline_segments: list[TimelineSegment],
     fallback_text: str | None = None,
     options: CueOptions | None = None,
+    style: SubtitleStyle | None = None,
 ) -> list[SubtitleCue]:
-    opts = options or CueOptions.from_settings()
+    opts = options or (CueOptions.from_style(style) if style else CueOptions.from_settings())
     normalized = _coerce_segments(transcript_segments)
 
     words = _mapped_words(normalized, timeline_segments)
@@ -189,24 +229,32 @@ def write_ass_file(
     *,
     width: int,
     height: int,
-    font_size: int = 64,
-    position_percent: int = 74,
+    style: SubtitleStyle | None = None,
     min_cue_seconds: float = DEFAULT_ASS_MIN_SECONDS,
     title_text: str | None = None,
     title_end_sec: float = 0.0,
-    animate: bool | None = None,
 ) -> str:
-    if animate is None:
-        animate = get_settings().subtitles.animate
+    """Write the burned overlay: one file for the karaoke cues and the headline.
+
+    Everything visual comes from `style` — the font included. It used to be
+    Arial, hardcoded, while the headline two lines below rendered in the
+    bundled display face; the mismatch was the most visible thing about a
+    finished clip and could not be changed without editing this function.
+    """
+    look = style or SubtitleStyle.from_settings()
+    animate = look.animate
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    font_size = max(56, int(font_size))
-    margin_v = max(70, int(height * (100 - position_percent) / 100))
-    outline = max(7, int(font_size * 0.12))
-    shadow = max(1, int(font_size * 0.015))
+    font_size = int(look.font_size)
+    margin_v = max(70, int(height * (100 - look.position_percent) / 100))
+    outline = max(1, int(font_size * look.outline_ratio))
+    shadow = max(0, int(font_size * look.shadow_ratio))
+    primary = ass_colour(look.colour)
+    border = ass_colour(look.outline_colour)
+    back = ass_colour(look.outline_colour, look.shadow_opacity)
     styles = [
         (
-            "Style: Default,Arial,"
-            f"{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H7A000000,"
+            f"Style: Default,{look.font or DEFAULT_TITLE_FONT},"
+            f"{font_size},{primary},&H000000FF,{border},{back},"
             f"-1,0,0,0,100,100,0,0,1,{outline},{shadow},2,78,78,{margin_v},1"
         )
     ]
@@ -447,7 +495,7 @@ def _fallback_cues_from_segments(
     """
     cues: list[SubtitleCue] = []
     for segment in _cap_overlaps(segments):
-        text = _wrap_text(_clean_text(segment["text"]))
+        text = _display_card(segment["text"], opts)
         if not text:
             continue
         for out_start, out_end in _project(
@@ -473,7 +521,7 @@ def _fallback_cues_from_text(text: str, output_duration: float, opts: CueOptions
     cursor = 0.0
     for chunk in chunks:
         end = min(output_duration, cursor + min(per_chunk, FALLBACK_MAX_SECONDS))
-        card = _wrap_text(_clean_text(" ".join(chunk)))
+        card = _display_card(" ".join(chunk), opts)
         if card and end - cursor >= opts.min_cue_seconds:
             cues.append(SubtitleCue(start_sec=round(cursor, 3), end_sec=round(end, 3), text=card))
         cursor += per_chunk
@@ -570,6 +618,17 @@ def _coerce_words(items: list[Any]) -> list[dict[str, Any]]:
             continue
         words.append({"start_sec": start, "end_sec": end, "text": text})
     return sorted(words, key=lambda word: word["start_sec"])
+
+
+def _display_card(text: str, opts: CueOptions) -> str:
+    """A phrase as it is drawn: same casing and punctuation rules as a word.
+
+    The fallback paths — a transcript with no word timings, or none at all —
+    used to skip this, so a style asking for uppercase got it on some clips
+    and not others depending on where their words came from.
+    """
+    words = [_display_word(word, opts) for word in _clean_text(text).split()]
+    return _wrap_text(" ".join(word for word in words if word), line_limit=opts.max_line_chars)
 
 
 def _display_word(text: str, opts: CueOptions) -> str:

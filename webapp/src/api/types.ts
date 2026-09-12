@@ -58,6 +58,7 @@ export interface Clip {
 
 export interface ClipJob {
   id: number;
+  style_id: number | null;
   source_platform: string;
   source_ref: string;
   profile: JobProfile;
@@ -111,6 +112,9 @@ export interface Health {
   environment: string;
   tasks: Partial<Record<TaskStatus, number>>;
   tasks_due_now: number;
+  /** False where the local-browser login cannot work — a container, or a host
+   *  without undetected-chromedriver. Importing cookies is the path there. */
+  browser_login: boolean;
 }
 
 export interface MediaAsset {
@@ -154,6 +158,8 @@ export interface CreateJobPayload {
   source_ref: string;
   source_platform?: "auto" | "youtube" | "local";
   profile?: JobProfile;
+  /** A saved look. Omitted means the profile's own defaults. */
+  style_id?: number | null;
   custom_title?: string | null;
   caption_tags?: string | null;
   start_immediately?: boolean;
@@ -188,3 +194,48 @@ export const JOB_PROFILES: { id: JobProfile; name: string; hint: string }[] = [
 // A job is finished with the queue once it reaches one of these; the UI stops
 // polling at that point.
 export const TERMINAL_JOB_STATUSES: JobStatus[] = ["ready", "failed", "cancelled"];
+
+// --- styles -----------------------------------------------------------------
+
+/**
+ * A style is a nested bag of scalars: framing, grade, subtitles, pacing,
+ * inserts, audio, delivery. It is deliberately untyped per field here — the
+ * server owns the schema, and the editor is driven by a descriptor table, so
+ * mirroring forty field names in TypeScript would only add a second place to
+ * forget one.
+ */
+export type StyleGroups = Record<string, Record<string, unknown>>;
+
+export interface StylePreset {
+  id: number;
+  name: string;
+  description: string;
+  profile: JobProfile | null;
+  /** Only what this preset overrides. Everything else follows the defaults. */
+  data: StyleGroups;
+  /** Those overrides with the defaults filled in — what a clip would render as. */
+  resolved: StyleGroups;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StyleDefaults {
+  profile: JobProfile;
+  style: StyleGroups;
+  profiles: JobProfile[];
+}
+
+export interface StylePayload {
+  name?: string;
+  description?: string;
+  profile?: JobProfile | null;
+  data?: StyleGroups;
+}
+
+export interface PreviewRequest {
+  at_sec?: number;
+  duration_sec?: number;
+  scale?: number;
+  style_id?: number | null;
+  style?: StyleGroups;
+}

@@ -7,7 +7,12 @@ every other cutter can fall back to.
 """
 from __future__ import annotations
 
-from app.domain.cutting.base import DEFAULT_GAP_SECONDS, MIN_USABLE_SECONDS, SliceSpec
+from app.domain.cutting.base import (
+    DEFAULT_GAP_SECONDS,
+    MIN_USABLE_SECONDS,
+    SliceSpec,
+    next_start,
+)
 
 
 def build_plain_slices(
@@ -48,7 +53,7 @@ def build_plain_slices(
         )
         if end >= duration:
             break
-        start = max(0.0, end - max(0.0, float(gap_seconds)))
+        start = next_start(start, end, gap_seconds)
         index += 1
         if max_clips and len(specs) >= max_clips:
             break

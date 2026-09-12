@@ -13,6 +13,7 @@ milliseconds it needs.
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -20,7 +21,7 @@ from typing import Any
 
 from sqlmodel import Session
 
-from app.core.errors import TaskCancelled
+from app.core.errors import LeaseLost, TaskCancelled
 from app.db.session import session_scope
 from app.tasks import queue
 
@@ -33,6 +34,8 @@ class TaskContext:
     kind: str
     payload: dict[str, Any]
     attempt: int = 1
+    # Set by the worker's lease thread when the task has been taken away.
+    lease_lost: threading.Event | None = None
     _last_stage: str = field(default="", init=False, repr=False)
 
     @contextmanager
@@ -56,6 +59,11 @@ class TaskContext:
         self.raise_if_cancelled()
 
     def raise_if_cancelled(self) -> None:
+        # The lease first, and without touching the database: if this task has
+        # been reclaimed, another worker is already running it and this one
+        # must stop rather than write anything about a task it no longer owns.
+        if self.lease_lost is not None and self.lease_lost.is_set():
+            raise LeaseLost(f"task {self.task_id} was reclaimed by the queue")
         with session_scope() as session:
             if queue.is_cancel_requested(session, self.task_id):
                 raise TaskCancelled("cancelled by user")
@@ -69,6 +77,11 @@ class TaskContext:
         """
         with session_scope() as session:
             queue.mark_irreversible(session, self.task_id)
+
+    def clear_irreversible(self) -> None:
+        """Undo `mark_irreversible` when the step provably did not happen."""
+        with self.db() as session:
+            queue.clear_irreversible(session, self.task_id)
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.payload.get(key, default)

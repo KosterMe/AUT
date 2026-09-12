@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import html
 import json
-import os
+import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,11 +15,20 @@ from app.domain import sources
 from app.adapters.asr import whisper as transcription
 from app.core.config import get_settings
 
+log = logging.getLogger(__name__)
+
 
 # Part of the caption cache key. Bumped to 2 when json3 parsing started
 # keeping word timings, so transcripts cached without them are re-fetched
 # rather than quietly forcing a re-transcription at render time.
 PARSER_VERSION = 2
+# Waits between retries of the caption endpoint. Short, because the whole
+# point is to be cheaper than the ASR pass this avoids; a rate limit that
+# outlasts them is one that would outlast anything worth waiting for.
+_CAPTION_RETRY_PAUSES = (2.0, 5.0)
+# 429 is what YouTube actually returns; the 5xx are the same situation
+# wearing a different number.
+_CAPTION_RETRYABLE = frozenset({429, 500, 502, 503, 504})
 # Floor for a word's on-screen life when the next offset is not usable.
 MIN_WORD_MS = 120.0
 _PARSEABLE_EXTS = {"json3", "vtt"}
@@ -79,7 +89,11 @@ def fetch_youtube_transcript(
         try:
             text = _download_caption(selected["url"])
             segments = parse_caption_payload(text, selected["ext"])
-            if segments:
+            if not segments:
+                errors.append(
+                    f"{selected['language']} {selected['ext']} track parsed to no cues"
+                )
+            else:
                 return CaptionTranscript(
                     segments=segments,
                     meta={
@@ -92,7 +106,19 @@ def fetch_youtube_transcript(
                     },
                 )
         except Exception as exc:
-            errors.append(str(exc))
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    # Falling through to ASR is a decision worth minutes of GPU or an hour of
+    # CPU, and every reason it was made used to be collected into `errors` and
+    # dropped on the floor. A caption track that exists and did not work is a
+    # different problem from a video that has none, and only this line tells
+    # them apart.
+    if errors:
+        log.warning(
+            "YouTube captions were available for %s but unusable, falling back to ASR: %s",
+            source_ref,
+            "; ".join(errors),
+        )
     return None
 
 
@@ -276,9 +302,38 @@ def parse_vtt(payload: str) -> list[transcription.TranscriptSegment]:
 
 
 def _download_caption(url: str) -> str:
-    timeout = _env_float("AUTOCLIPS_YOUTUBE_CAPTION_TIMEOUT_SECONDS", 20.0)
-    use_env_proxy = _env_bool("AUTOCLIPS_YOUTUBE_CAPTION_USE_ENV_PROXY", default=False)
-    with httpx.Client(timeout=timeout, trust_env=use_env_proxy, follow_redirects=True) as client:
+    """Fetch one caption track over the same egress the download uses.
+
+    `_env_bool` never existed, so this raised NameError on every call — caught
+    by the loop above, recorded in a list nothing reads, and the pipeline then
+    ran a full Whisper pass on a video that had a ready-made transcript. The
+    timeout is a real setting; the proxy question is settled the way
+    `options._apply_proxy` settles it, because a caption URL is a youtube.com
+    URL and a network that needs YTDLP_PROXY to reach one needs it for both.
+    """
+    settings = get_settings()
+    with httpx.Client(
+        timeout=settings.asr.youtube_caption_timeout_seconds,
+        proxy=settings.youtube.proxy.strip() or None,
+        # Never inherit HTTP_PROXY/HTTPS_PROXY from the shell: an unexpected
+        # exit IP is how YouTube's bot checks get tripped.
+        trust_env=False,
+        follow_redirects=True,
+    ) as client:
+        for attempt, pause in enumerate(_CAPTION_RETRY_PAUSES, start=1):
+            response = client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            if response.status_code not in _CAPTION_RETRYABLE:
+                response.raise_for_status()
+                return response.text
+            # Giving up here is not free: the caller's answer to "no captions"
+            # is a full ASR pass, forty minutes of CPU for a transcript that
+            # was one second away. YouTube rate-limits this endpoint in
+            # bursts, so a few seconds of waiting buys back all of it.
+            log.info(
+                "caption endpoint answered %s, retry %d of %d in %.0fs",
+                response.status_code, attempt, len(_CAPTION_RETRY_PAUSES), pause,
+            )
+            time.sleep(pause)
         response = client.get(url, headers={"User-Agent": "Mozilla/5.0"})
         response.raise_for_status()
         return response.text
@@ -352,13 +407,6 @@ def _dedupe_segments(
             continue
         result.append(segment)
     return result
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        return default
 
 
 def _as_float(value: Any) -> float | None:

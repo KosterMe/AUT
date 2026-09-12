@@ -1,11 +1,12 @@
 import { NavLink } from "react-router-dom";
-import { Users, Calendar, Scissors, ListChecks, Film } from "lucide-react";
+import { Users, Calendar, Scissors, ListChecks, Film, Palette } from "lucide-react";
 import clsx from "clsx";
 import { useHealth } from "../api/hooks";
 
 const items = [
   { to: "/jobs", label: "Videos", icon: Scissors },
   { to: "/library", label: "Library", icon: Film },
+  { to: "/looks", label: "Looks", icon: Palette },
   { to: "/publications", label: "Schedule", icon: Calendar },
   { to: "/accounts", label: "Accounts", icon: Users },
   { to: "/queue", label: "Queue", icon: ListChecks },

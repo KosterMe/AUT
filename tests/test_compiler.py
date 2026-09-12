@@ -7,6 +7,7 @@ fragment is allowed to depend on) without a video file and a stopwatch.
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 
 import pytest
@@ -491,3 +492,122 @@ class TestSoundtrack:
 
         assert MUSIC not in fragment and "sidechaincompress" not in fragment
         assert MUSIC in final and "sidechaincompress" in final
+
+
+# --- the style travels with the clip ----------------------------------------
+
+
+def styled(**overrides) -> comp.Composition:
+    from app.domain.style import StyleSpec
+
+    return build(style=StyleSpec.from_settings().merged(overrides))
+
+
+def test_the_graph_follows_the_composition_and_not_the_environment(configure):
+    """The regression this refactor exists to prevent.
+
+    The framing used to be read from `get_settings()` inside the filter
+    builders, so a clip rendered twice with different configuration came out
+    two different videos — and two jobs could not look different at all.
+    """
+    composition = styled(framing={"zoom": 1.5, "blur_divisor": 2})
+    configure(AUTOCLIPS_RENDER_FOREGROUND_ZOOM=1.0, AUTOCLIPS_BLUR_SCALE_DIVISOR=8)
+
+    graph = one_pass(composition)
+
+    assert "scale=1620:1920:force_original_aspect_ratio=decrease" in graph
+    assert "scale=540:960:force_original_aspect_ratio=increase" in graph
+
+
+def test_the_grade_comes_off_the_style():
+    graph = one_pass(styled(grade={"contrast": 1.2, "saturation": 0.9, "sharpen": False}))
+
+    assert "eq=contrast=1.20:saturation=0.90" in graph
+    assert "unsharp" not in graph
+
+
+def test_two_compositions_can_want_different_looks_at_once():
+    """One process, two jobs, two looks — which the environment could never do."""
+    warm = one_pass(styled(grade={"saturation": 1.4}))
+    flat = one_pass(styled(grade={"saturation": 1.0}))
+
+    assert "saturation=1.40" in warm
+    assert "saturation=1.00" in flat
+
+
+def test_a_pip_insert_takes_its_geometry_from_the_policy():
+    composition = styled(inserts={"pip_width_share": 0.6, "pip_margin_px": 20})
+    composition = dataclasses.replace(
+        composition,
+        inserts=(comp.Insert(comp.INSERT_PIP, BROLL, at_sec=1.0, duration_sec=2.0),),
+    )
+
+    graph = one_pass(composition)
+
+    assert "scale=648:-2" in graph
+    assert "overlay=412:" in graph
+
+
+def test_the_fragment_key_follows_the_style_it_was_composed_with():
+    """A fragment is already composed into the canvas, so reframing has to
+    invalidate it — and now the framing is on the clip, not in the process."""
+    from app.domain.style import FramingStyle
+
+    segment = comp.Segment(SOURCE, 0.0, 10.0)
+    default = compiler.fragment_path(comp.Canvas(), segment)
+    zoomed = compiler.fragment_path(
+        comp.Canvas(), segment, framing=FramingStyle(zoom=1.35)
+    )
+
+    assert default != zoomed
+    # The look, which the final pass applies, must not touch it.
+    assert compiler.fragment_path(comp.Canvas(), segment) == default
+
+
+# --- previews ---------------------------------------------------------------
+
+
+class TestPreview:
+    @pytest.fixture(autouse=True)
+    def _fake_ffmpeg(self, monkeypatch, tmp_path):
+        self.runs: list[list[str]] = []
+        monkeypatch.setattr(compiler, "ffmpeg_exe", lambda: "ffmpeg")
+        monkeypatch.setattr(compiler, "ffprobe_has_audio", lambda path: True)
+        monkeypatch.setattr(compiler, "probe_render_output", lambda *a, **k: {})
+        monkeypatch.setattr(compiler, "_run_ffmpeg", lambda args: self.runs.append(args))
+        self.output = str(tmp_path / "preview.mp4")
+
+    def graph(self) -> str:
+        args = self.runs[-1]
+        return args[args.index("-filter_complex") + 1]
+
+    def test_a_preview_renders_only_the_window_asked_for(self):
+        compiler.render_preview(
+            build(), self.output, spec=compiler.PreviewSpec(at_sec=12.0, duration_sec=3.0)
+        )
+
+        args = self.runs[-1]
+        # Seeked straight into the second segment: the first ends at output
+        # second 10, so output second 12 is source second 302.
+        assert ["-ss", "302.000", "-t", "3.000"] == args[2:6]
+        assert len(self.runs) == 1
+
+    def test_a_preview_is_rendered_small_and_cheap(self):
+        compiler.render_preview(
+            build(), self.output, spec=compiler.PreviewSpec(scale=0.5, crf=30)
+        )
+
+        args = self.runs[-1]
+        assert "scale=540:960" in self.graph() or "crop=540:960" in self.graph()
+        assert args[args.index("-crf") + 1] == "30"
+
+    def test_a_preview_never_goes_through_the_fragment_cache(self, configure):
+        """It is a throwaway at a size nothing else uses; caching it would only
+        make the real render miss."""
+        configure(AUTOCLIPS_RENDER_STRATEGY="two_stage")
+
+        compiler.render_preview(build(), self.output)
+
+        # Two stages would be one run per fragment plus a join plus a final
+        # pass. One run means it took the one-pass path regardless.
+        assert len(self.runs) == 1
