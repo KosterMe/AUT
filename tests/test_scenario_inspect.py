@@ -136,10 +136,10 @@ class TestWhatABlockSays:
         assert cta.track_kind == model.TRACK_OVERLAY
 
     def test_the_spine_is_drawn_as_the_layout_it_becomes(self):
-        """Trap 32: the compiler reads the spine element's `fit` and gives
-        every segment the rectangle that layout names, dropping the rectangle
-        the element carried. Showing the element's own numbers would make the
-        editor draw a spine the renderer will not produce."""
+        """A spine nobody has dragged anything in carries the default
+        rectangle, and that does not mean "middle, full size" — it means the
+        layout decides, which is how `auto` still meets the shape of the
+        source."""
         bottom = (AssetOption(9, "/m/bg/loop.mp4", ("background",), 60.0),)
         made = report(with_intro_and_outro(framing={"layout": "split"}), 90.0, assets=bottom)
 
@@ -154,6 +154,59 @@ class TestWhatABlockSays:
         assert made.layout == "blur"
         assert block(made, "source").frame.height == 100.0
         assert [w.code for w in made.warnings if w.code == "no_companion"] == ["no_companion"]
+
+    def test_a_spine_with_a_rectangle_of_its_own_keeps_it(self):
+        """Trap 32, closed. The rectangle used to be collapsed into one of
+        three layouts, so an editor that let somebody drag the spine would
+        have drawn one thing and rendered another."""
+        scenario = with_intro_and_outro()
+        spine = scenario.tracks[0]
+        upper = dataclasses.replace(
+            spine.elements[1],
+            frame=model.Frame(
+                y=model.Animated(30.0),
+                width=model.Animated(100.0),
+                height=model.Animated(60.0),
+            ),
+        )
+        scenario = dataclasses.replace(scenario, tracks=(
+            dataclasses.replace(spine, elements=(
+                spine.elements[0], upper, spine.elements[2],
+            )),
+        ) + scenario.tracks[1:])
+
+        made = report(scenario, 90.0)
+        frame = block(made, "source").frame
+
+        assert (frame.y, frame.height) == (30.0, 60.0)
+        # The layout still decides what fills the rest of the canvas.
+        assert made.layout in {"blur", "fill"}
+
+    def test_the_spine_still_cannot_move(self):
+        """Not for lack of a rectangle: a segment is framed before the join,
+        where every segment's clock starts again, so an expression there would
+        animate each one identically from its own zero."""
+        scenario = with_intro_and_outro()
+        spine = scenario.tracks[0]
+        moving = dataclasses.replace(
+            spine.elements[1],
+            frame=model.Frame(x=model.Animated(50.0, keys=(
+                model.Keyframe(at=model.Anchor(), value=20.0),
+                model.Keyframe(
+                    at=model.Anchor(mode=model.AnchorMode.END), value=80.0,
+                ),
+            ))),
+        )
+        scenario = dataclasses.replace(scenario, tracks=(
+            dataclasses.replace(spine, elements=(
+                spine.elements[0], moving, spine.elements[2],
+            )),
+        ) + scenario.tracks[1:])
+
+        made = report(scenario, 90.0)
+
+        assert any(w.code == "no_spine_animation" for w in made.warnings)
+        assert block(made, "source").frame.moving is False
 
     def test_an_overlay_keeps_its_own_rectangle(self):
         scenario = with_intro_and_outro()

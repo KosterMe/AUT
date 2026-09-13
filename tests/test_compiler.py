@@ -158,6 +158,22 @@ def test_a_split_screen_is_a_half_frame_spine_and_a_layer_under_it():
     assert "overlay=0:960" in graph
 
 
+def test_a_spine_in_a_band_of_its_own_is_padded_to_where_it_sits():
+    """Not one of the three layouts — a rectangle somebody dragged. The
+    renderer has taken arbitrary segment frames since layouts dissolved; what
+    changed with trap 32 is that the compiler stopped collapsing them."""
+    graph = one_pass(build(spine=(
+        comp.Segment(
+            SOURCE, 0.0, 10.0, backdrop=False,
+            frame=comp.Frame(y=40.0, width=100.0, height=60.0, fit="cover"),
+        ),
+    )))
+
+    assert "scale=1080:1152:force_original_aspect_ratio=increase,crop=1080:1152" in graph
+    # 40% of 1920 is 768, less half of the 1152-pixel band: 192 from the top.
+    assert "pad=1080:1920:0:192:black" in graph
+
+
 def test_a_frame_covering_the_canvas_crops_instead_of_blurring():
     graph = one_pass(build(spine=(
         comp.Segment(SOURCE, 0.0, 10.0, frame=comp.FULL_FRAME, backdrop=False),
