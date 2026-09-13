@@ -962,6 +962,31 @@ class TestClipEndpoints:
         assert response.status_code == 200
         assert seen["scenario"].name == "Мой"
 
+    def test_the_preview_endpoint_calls_the_renderer_for_real(self, client, clip, monkeypatch):
+        """Patched one level below the seam, so the call that crosses it is the
+        real one. Every other preview test replaces `montage.preview` itself,
+        and that is how a signature can be wrong for a fortnight: the endpoint
+        would raise `TypeError` in production and pass here."""
+        from montage.render import compiler as render_compiler
+
+        seen = {}
+
+        def fake_render_preview(composition, output_path, *, spec=None):
+            seen.update(spec=spec, segments=len(composition.spine))
+            with open(output_path, "wb") as handle:
+                handle.write(b"\x00" * 32)
+            return None
+
+        monkeypatch.setattr(render_compiler, "render_preview", fake_render_preview)
+
+        response = client.post(
+            f"/api/clips/{clip.id}/preview", json={"at_sec": 0.0, "duration_sec": 2.0},
+        )
+
+        assert response.status_code == 200
+        assert seen["spec"].duration_sec == 2.0
+        assert seen["segments"] >= 1
+
     def test_a_preview_window_past_the_end_is_clamped_not_refused(
         self, client, clip, monkeypatch
     ):

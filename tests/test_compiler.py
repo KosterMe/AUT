@@ -361,6 +361,38 @@ def test_a_moving_layer_is_not_a_layer_that_fills_the_canvas():
     assert still.fills_canvas and not moving.fills_canvas
 
 
+# --- the door ----------------------------------------------------------------
+
+
+def test_the_client_hands_a_preview_straight_to_the_renderer(monkeypatch):
+    """A signature that nothing calls is a signature nothing checks.
+
+    This one was wrong from the day the package was split out — the client
+    took `(output_path, spec, style)` and the renderer takes
+    `(composition, output_path, spec)` — and every test that touched a preview
+    replaced `client.preview` itself, so the mismatch was invisible until
+    something ran it for real. The lesson is in where this test patches: one
+    level *below* the function under test, not at it.
+    """
+    from montage import client
+    from montage.render import compiler as render_compiler
+
+    seen = {}
+
+    def fake(composition, output_path, *, spec=None):
+        seen.update(composition=composition, output_path=output_path, spec=spec)
+        return "result"
+
+    monkeypatch.setattr(render_compiler, "render_preview", fake)
+    composition = build()
+    window = client.PreviewSpec(at_sec=1.0, duration_sec=2.0, scale=0.5)
+
+    assert client.preview(composition, "/out/preview.mp4", spec=window) == "result"
+    assert seen == {
+        "composition": composition, "output_path": "/out/preview.mp4", "spec": window,
+    }
+
+
 # --- fragments and the cache ------------------------------------------------
 
 
