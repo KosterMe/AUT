@@ -130,6 +130,9 @@ def compose(request: ClipRequest) -> ClipPlan:
             request.source_path, start_sec=request.start_sec,
             end_sec=request.end_sec, pacing=request.style.pacing,
         ) or ()),
+        scenario.FactKind.LOUDNESS: lambda: tuple(probe.loudness_curve(
+            request.source_path, start_sec=request.start_sec, end_sec=request.end_sec,
+        )),
         scenario.FactKind.ASSETS: lambda: tuple(request.library.options),
         # The words are not measured here: ASR belongs to the cutter that needs
         # it for its own work, and AUT hands them over as a fact.

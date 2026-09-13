@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from yt_dlp.utils import DownloadError
 
-from montage.render.probe import _parse_silencedetect
+from montage.render.probe import _parse_silencedetect, parse_loudness
 from app.adapters.youtube import downloader
 from app.adapters.youtube.downloader import (
     _cached_metadata,
@@ -32,6 +32,34 @@ def test_parse_silencedetect_handles_open_ended_silence():
     """
 
     assert _parse_silencedetect(stderr, duration=10.0) == [(2.1, 3.4), (8.0, 10.0)]
+
+
+def test_loudness_is_read_as_one_measurement_per_second():
+    """ffmpeg's metadata printer, as it actually writes: a header line naming
+    the moment, then the values measured at it."""
+    output = """frame:0    pts:0       pts_time:0
+lavfi.astats.Overall.RMS_level=-17.277044
+frame:1    pts:48000   pts_time:1
+lavfi.astats.Overall.RMS_level=-19.790364
+"""
+
+    assert parse_loudness(output) == [(0.0, -17.277044), (1.0, -19.790364)]
+
+
+def test_digital_silence_is_a_measurement_and_not_a_gap():
+    """`-inf` is the quietest thing there is, which is information. Dropping
+    it would make a silent stretch look unmeasured, and a rule looking for the
+    loudest moment would be choosing between fewer candidates than it had."""
+    output = """frame:0    pts:0       pts_time:12
+lavfi.astats.Overall.RMS_level=-inf
+"""
+
+    assert parse_loudness(output) == [(12.0, -120.0)]
+
+
+def test_a_value_before_any_frame_is_ignored(tmp_path):
+    """Whatever that line is, it is not a measurement of a moment."""
+    assert parse_loudness("lavfi.astats.Overall.RMS_level=-3.0\n") == []
 
 
 def test_download_candidates_prefer_merged_file(tmp_path):

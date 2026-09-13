@@ -399,6 +399,16 @@ function FrameFields({
   );
 }
 
+const RULE_LABELS: Record<string, string> = {
+  keyword_broll: "b-roll по ключевым словам",
+  on_every_cut: "звук на каждой склейке",
+  cadence: "через равные промежутки",
+  on_loudest: "в самых громких местах",
+};
+
+/** The two that place the rule's own template; the others have planners. */
+const TEMPLATED = ["cadence", "on_loudest"];
+
 function RuleFields({
   element,
   onChange,
@@ -406,25 +416,53 @@ function RuleFields({
   element: ScenarioElement;
   onChange: (patch: Partial<ScenarioElement>) => void;
 }) {
+  const rule = element.rule ?? "keyword_broll";
+  const params = element.params ?? {};
+  const templated = TEMPLATED.includes(rule);
+
+  function setRule(next: string) {
+    // A templated rule with no template places nothing and says so on every
+    // compile. Giving it one here means choosing the rule is the whole of
+    // the gesture, rather than the first half of one.
+    const template =
+      TEMPLATED.includes(next) && !element.template ? defaultTemplate() : element.template;
+    onChange({ rule: next, template });
+  }
+
   return (
     <div className="space-y-2">
       <Field label="Правило">
-        <select
-          className="input"
-          value={element.rule ?? "keyword_broll"}
-          onChange={(event) => onChange({ rule: event.target.value })}
-        >
-          <option value="keyword_broll">b-roll по ключевым словам</option>
-          <option value="on_every_cut">звук на каждой склейке</option>
+        <select className="input" value={rule} onChange={(event) => setRule(event.target.value)}>
+          {Object.keys(RULE_LABELS).map((kind) => (
+            <option key={kind} value={kind}>
+              {RULE_LABELS[kind]}
+            </option>
+          ))}
         </select>
       </Field>
+
+      {rule === "cadence" && (
+        <Field label="Каждые, с">
+          <input
+            type="number"
+            min="1"
+            step="1"
+            className="input"
+            value={Number(params.every_sec ?? 15)}
+            onChange={(event) =>
+              onChange({ params: { ...params, every_sec: Number(event.target.value) } })
+            }
+          />
+        </Field>
+      )}
+
       <div className="grid grid-cols-2 gap-2">
         <Field label="Не больше, шт">
           <input
             type="number"
             min="0"
             className="input"
-            value={element.limit ?? 3}
+            value={element.limit ?? 4}
             onChange={(event) => onChange({ limit: Number(event.target.value) })}
           />
         </Field>
@@ -438,14 +476,112 @@ function RuleFields({
             onChange={(event) => onChange({ min_gap_sec: Number(event.target.value) })}
           />
         </Field>
+        <Field label="Не в первые, с" hint="Хук не трогаем.">
+          <input
+            type="number"
+            min="0"
+            step="0.5"
+            className="input"
+            value={element.guard_head_sec ?? 2.5}
+            onChange={(event) => onChange({ guard_head_sec: Number(event.target.value) })}
+          />
+        </Field>
+        <Field label="Не в последние, с">
+          <input
+            type="number"
+            min="0"
+            step="0.5"
+            className="input"
+            value={element.guard_tail_sec ?? 1.5}
+            onChange={(event) => onChange({ guard_tail_sec: Number(event.target.value) })}
+          />
+        </Field>
       </div>
+
+      {templated ? (
+        <TemplateFields
+          template={element.template ?? defaultTemplate()}
+          onChange={(template) => onChange({ template })}
+        />
+      ) : (
+        <p className="text-[11px] leading-snug text-slate-500">
+          Это правило само знает, что класть: b-roll берёт фрагменты по словам, звук —
+          по склейкам. Настраиваются только рамки выше.
+        </p>
+      )}
+
       <p className="text-[11px] leading-snug text-slate-500">
-        Правило само ничего не занимает на экране: оно порождает элементы там, где
-        совпало с материалом. На таймлайне они пунктиром.
+        Правило ничего не занимает на экране само: оно порождает элементы там, где
+        совпало с материалом. На таймлайне они пунктиром, на своей дорожке.
       </p>
     </div>
   );
 }
+
+function defaultTemplate(): ScenarioElement {
+  return {
+    id: "шаблон",
+    slot: { kind: "library", tag: "broll" },
+    duration: { mode: "fixed", value: 3 },
+  };
+}
+
+/** What a rule puts on screen each time it fires. */
+function TemplateFields({
+  template,
+  onChange,
+}: {
+  template: ScenarioElement;
+  onChange: (template: ScenarioElement) => void;
+}) {
+  const slot = template.slot ?? { kind: "library" as SlotKind, tag: "broll" };
+  const duration = template.duration ?? { mode: "fixed" as const, value: 3 };
+  const sound = !!template.audio?.enabled;
+
+  return (
+    <div className="space-y-2 rounded-md border border-emerald-200 bg-emerald-50/40 p-2">
+      <p className="text-[11px] font-medium text-emerald-800">Что кладёт</p>
+      <Field label="Тег в библиотеке">
+        <input
+          className="input"
+          value={slot.tag ?? ""}
+          onChange={(event) =>
+            onChange({ ...template, slot: { ...slot, kind: "library", tag: event.target.value } })
+          }
+        />
+      </Field>
+      <Field label="Длительность, с">
+        <input
+          type="number"
+          min="0"
+          step="0.5"
+          className="input"
+          value={duration.value ?? 3}
+          onChange={(event) =>
+            onChange({
+              ...template,
+              duration: { ...duration, mode: "fixed", value: Number(event.target.value) },
+            })
+          }
+        />
+      </Field>
+      <label className="flex items-center gap-2 text-sm text-slate-600">
+        <input
+          type="checkbox"
+          checked={sound}
+          onChange={(event) =>
+            onChange({
+              ...template,
+              audio: { ...(template.audio ?? {}), enabled: event.target.checked },
+            })
+          }
+        />
+        Это звук, а не картинка
+      </label>
+    </div>
+  );
+}
+
 
 function ElementPicker({
   data,

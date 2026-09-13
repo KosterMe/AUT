@@ -30,6 +30,7 @@ all for that job.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Iterator, Protocol
@@ -37,6 +38,8 @@ from typing import Any, Callable, Iterator, Protocol
 from montage.rules.inserts import AssetOption
 from montage.scenario import model
 from montage.subtitles import SubtitleCue
+
+log = logging.getLogger(__name__)
 
 
 class FactKind(str, Enum):
@@ -80,6 +83,26 @@ class ClipFacts:
     @property
     def duration_sec(self) -> float:
         return round(max(0.0, self.end_sec - self.start_sec), 3)
+
+    def output_time(self, at_sec: float) -> float | None:
+        """A moment of the clip, as a moment of the output.
+
+        They are the same thing until silence is removed; after that every
+        pause that was cut shifts what follows it earlier. `None` means the
+        moment fell inside a pause and is not in the output at all — which is
+        an answer, not a failure: a rule aiming at it would otherwise place
+        something at a moment nobody will ever see.
+        """
+        if not self.keep:
+            return round(max(0.0, at_sec), 3)
+        cursor = 0.0
+        for start, end in self.keep:
+            if at_sec < start:
+                return None
+            if at_sec <= end:
+                return round(cursor + (at_sec - start), 3)
+            cursor += max(0.0, end - start)
+        return None
 
     @property
     def cuts(self) -> tuple[float, ...]:
@@ -275,6 +298,16 @@ class CachingProvider:
     def get(self, kind: FactKind) -> Any:
         if kind not in self._cache:
             source = self.sources.get(kind)
+            if source is None:
+                # The scenario asked for this fact — that is what `needed`
+                # means — and nobody can produce it. The compile then carries
+                # on with an empty value and whatever wanted it does nothing,
+                # silently and forever. Saying so is the difference between a
+                # missing feature and a mysterious one. See trap 37.
+                log.warning(
+                    "nothing provides the %s fact; anything in the scenario that "
+                    "wanted it will quietly do nothing", kind.value,
+                )
             self._cache[kind] = source() if source is not None else None
         return self._cache[kind]
 

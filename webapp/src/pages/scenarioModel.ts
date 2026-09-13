@@ -140,7 +140,7 @@ export function emptyScenario(name: string): ScenarioData {
   };
 }
 
-type Addable = SlotKind | "rule";
+type Addable = SlotKind | "rule" | "cadence";
 
 /** What the palette on the left offers, and what each one starts as. */
 export const PALETTE: { kind: Addable; label: string; hint: string }[] = [
@@ -150,6 +150,7 @@ export const PALETTE: { kind: Addable; label: string; hint: string }[] = [
   { kind: "color", label: "Заливка", hint: "Ровный цвет — интро, аутро, подложка под текст" },
   { kind: "text", label: "Текст", hint: "Шаблон с подстановками" },
   { kind: "rule", label: "Правило", hint: "Автоматика: b-roll по ключевым словам" },
+  { kind: "cadence", label: "Через промежутки", hint: "Одно и то же каждые N секунд — логотип, плашка" },
 ];
 
 export function newElement(data: ScenarioData, kind: Addable): ScenarioElement {
@@ -159,6 +160,24 @@ export function newElement(data: ScenarioData, kind: Addable): ScenarioElement {
       rule: "keyword_broll",
       label: "B-roll по словам",
       limit: 3,
+    };
+  }
+  if (kind === "cadence") {
+    // The template comes with it: a rule that places nothing places nothing
+    // *and says so on every compile*, which is a poor thing to hand somebody
+    // who just pressed "add".
+    return {
+      id: freeId(data, "beat"),
+      rule: "cadence",
+      label: "Через промежутки",
+      params: { every_sec: 20 },
+      limit: 6,
+      min_gap_sec: 5,
+      template: {
+        id: "шаблон",
+        slot: { kind: "library", tag: "broll" },
+        duration: { mode: "fixed", value: 3 },
+      },
     };
   }
   const base: ScenarioElement = {

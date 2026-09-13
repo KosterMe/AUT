@@ -171,7 +171,7 @@ def plan(scenario: model.Scenario, facts: fact_module.ClipFacts) -> Plan:
     )
     produced: list[Produced] = []
     return Plan(
-        composition=_apply_rules(scenario, draft, facts, notes, produced),
+        composition=_apply_rules(scenario, draft, facts, notes, produced, used),
         warnings=tuple(notes),
         spans=spans,
         timeline_sec=laid.duration_sec,
@@ -797,62 +797,206 @@ def _apply_rules(
     facts: fact_module.ClipFacts,
     notes: list[CompileWarning],
     produced: list[Produced],
+    used: set[str],
 ) -> comp.Composition:
     """Expand the automation against the clip that now exists.
 
-    The two rules that already have implementations keep them: `keyword_broll`
-    is `inserts.choose_inserts` and `on_every_cut` is `audio.choose_effects`,
-    with every limit the README earned intact — not over the hook, no more than
-    one every six seconds, never more than a third of the clip, each fragment
-    once per clip, rotation by last use.
+    Two passes, and the split is not cosmetic. The first holds the rules that
+    read only the clip; the second holds `on_every_cut`, which reads the joins
+    of what the first pass produced — an insert appearing is one of the moments
+    a transition sound belongs on, and it does not exist until now.
 
-    B-roll is expanded before sound, deliberately: an insert appearing is one
-    of the moments a transition sound belongs on, and it does not exist until
-    now.
+    `keyword_broll` is `inserts.choose_inserts` and `on_every_cut` is
+    `audio.choose_effects`, with every limit the README earned intact — not
+    over the hook, no more than one every six seconds, never more than a third
+    of the clip, each fragment once per clip, rotation by last use. The other
+    two place the rule's own template, and enforce the same limits from the
+    rule rather than from a policy object (§5).
     """
     rules = [
         element for element in scenario.elements if isinstance(element, model.RuleElement)
     ]
-    if not rules or not facts.assets:
+    if not rules:
         return composition
 
-    assets = list(facts.assets)
-    changes: dict = {}
+    staged = composition
     for rule in rules:
         if rule.rule == model.RULE_KEYWORD_BROLL:
+            if not facts.assets:
+                continue
             chosen = insert_planner.choose_inserts(
-                composition, assets=assets,
+                staged, assets=list(facts.assets),
                 policy=_insert_policy(scenario, rule), seed=facts.seed,
             )
             if chosen:
-                changes["layers"] = composition.layers + chosen
+                staged = dataclasses.replace(staged, layers=staged.layers + chosen)
                 produced.extend(
                     Produced(rule.id, "layer", layer.at_sec, layer.duration_sec,
                              layer.source_path)
                     for layer in chosen
                 )
+        elif rule.rule == model.RULE_CADENCE:
+            staged = _place(
+                rule, staged, _cadence_times(rule, staged.duration_sec),
+                facts=facts, notes=notes, used=used, produced=produced,
+            )
+        elif rule.rule == model.RULE_ON_LOUDEST:
+            staged = _place(
+                rule, staged, _loudest_times(rule, facts, staged.duration_sec),
+                facts=facts, notes=notes, used=used, produced=produced,
+            )
 
-    staged = dataclasses.replace(composition, **changes) if changes else composition
     for rule in rules:
         if rule.rule == model.RULE_ON_EVERY_CUT:
+            if not facts.assets:
+                continue
             effects = audio_planner.choose_effects(
-                staged, assets=assets, policy=scenario.style.audio, seed=facts.seed,
+                staged, assets=list(facts.assets), policy=scenario.style.audio,
+                seed=facts.seed,
             )
             if effects:
-                changes["audio"] = staged.audio + effects
+                staged = dataclasses.replace(staged, audio=staged.audio + effects)
                 produced.extend(
                     Produced(rule.id, "audio", effect.at_sec, effect.duration_sec,
                              effect.source_path)
                     for effect in effects
                 )
-        elif rule.rule not in (model.RULE_KEYWORD_BROLL,):
+        elif rule.rule not in (
+            model.RULE_KEYWORD_BROLL, model.RULE_CADENCE, model.RULE_ON_LOUDEST,
+        ):
             notes.append(CompileWarning(
                 "unimplemented_rule",
                 f"the {rule.rule!r} rule has no implementation yet; it did nothing",
                 rule.id,
             ))
 
-    return dataclasses.replace(composition, **changes) if changes else composition
+    return staged
+
+
+def _cadence_times(rule: model.RuleElement, duration_sec: float) -> list[float]:
+    """Every `every_sec` seconds, inside the guards.
+
+    The simplest rule there is, and the one worth having for exactly that
+    reason: a logo every thirty seconds is a thing people ask for, and writing
+    it as four elements with four anchors is how a scenario stops surviving a
+    clip of a different length.
+    """
+    every = float(rule.params.get("every_sec") or 15.0)
+    if every <= 0:
+        return []
+    at = rule.guard_head_sec
+    last = duration_sec - rule.guard_tail_sec
+    times: list[float] = []
+    while at <= last and len(times) < 500:
+        times.append(round(at, 3))
+        at += every
+    return times
+
+
+def _loudest_times(
+    rule: model.RuleElement, facts: fact_module.ClipFacts, duration_sec: float
+) -> list[float]:
+    """The loudest moments first, in output time.
+
+    The curve is measured over the clip, so a reading at clip-second 40 is at
+    output-second 35 once a five-second pause has been cut out of the middle —
+    and placing it at 40 would land it after the moment it was chosen for.
+    `ClipFacts.output_time` does that mapping, and drops the readings that fall
+    inside a pause that was removed: they are not in the clip at all.
+    """
+    if not facts.loudness:
+        return []
+    inside: list[tuple[float, float]] = []
+    for at, level in facts.loudness:
+        mapped = facts.output_time(at)
+        if mapped is None:
+            continue
+        if mapped < rule.guard_head_sec or mapped > duration_sec - rule.guard_tail_sec:
+            continue
+        inside.append((level, mapped))
+    # Loudest first, and among equally loud moments the earliest, so the same
+    # clip compiles the same way twice.
+    inside.sort(key=lambda pair: (-pair[0], pair[1]))
+    return [at for _, at in inside]
+
+
+def _place(
+    rule: model.RuleElement,
+    composition: comp.Composition,
+    times: list[float],
+    *,
+    facts: fact_module.ClipFacts,
+    notes: list[CompileWarning],
+    used: set[str],
+    produced: list[Produced],
+) -> comp.Composition:
+    """Put the rule's template at each of those moments, within its limits.
+
+    A rule is an element that says how to make several, so what it makes is an
+    element — its template. Without one it has nothing to place, and that is
+    worth saying out loud rather than quietly doing nothing.
+    """
+    template = rule.template
+    if template is None:
+        notes.append(CompileWarning(
+            "rule_without_template",
+            f"the {rule.rule!r} rule has nothing to place: give it a template element",
+            rule.id,
+        ))
+        return composition
+
+    clip = composition.duration_sec
+    budget = rule.max_share * clip if rule.max_share else clip
+    layers: list[comp.Layer] = []
+    sounds: list[comp.AudioTrack] = []
+    spent = 0.0
+    placed: list[float] = []
+
+    for at in times:
+        if rule.limit and len(placed) >= rule.limit:
+            break
+        if any(abs(at - taken) < rule.min_gap_sec for taken in placed):
+            continue
+        length, _ = _length(template, at, clip, facts, {}, ())
+        if length <= 0:
+            continue
+        if spent + length > budget:
+            continue
+        path, source_start, still = _path_of(template, facts, notes, used)
+        if not path:
+            # The library has nothing for it. `_path_of` has already said so,
+            # and saying it once per moment would bury everything else.
+            break
+
+        if template.audio.enabled:
+            sounds.append(comp.AudioTrack(
+                source_path=path, at_sec=at, duration_sec=length,
+                gain_db=template.audio.gain_db.static,
+            ))
+            produced.append(Produced(rule.id, "audio", at, length, path))
+        else:
+            layers.append(comp.Layer(
+                source_path=path, at_sec=at, duration_sec=length,
+                source_start_sec=source_start, still=still,
+                frame=_edl_frame(template.frame),
+                z=_z_of(rule, composition),
+            ))
+            produced.append(Produced(rule.id, "layer", at, length, path))
+        placed.append(at)
+        spent += length
+
+    if not layers and not sounds:
+        return composition
+    return dataclasses.replace(
+        composition,
+        layers=composition.layers + tuple(layers),
+        audio=composition.audio + tuple(sounds),
+    )
+
+
+def _z_of(rule: model.RuleElement, composition: comp.Composition) -> int:
+    """Above whatever is already there: a rule's output is an overlay."""
+    return max((layer.z for layer in composition.layers), default=0) + 1
 
 
 def _insert_policy(scenario: model.Scenario, rule: model.RuleElement):

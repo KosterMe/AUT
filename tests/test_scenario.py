@@ -206,6 +206,33 @@ class TestWhatALeanScenarioCosts:
         assert "склейки" in sc.describes(wants)
 
 
+class TestAFactNobodyCanProduce:
+    """The silent failure this whole mechanism is exposed to: a scenario names
+    a fact, the provider has no source for it, the compile carries on with an
+    empty value, and the thing that wanted it does nothing — forever, without
+    a word. Trap 37."""
+
+    def test_it_says_so_rather_than_returning_nothing_quietly(self, caplog):
+        provider = sc.CachingProvider(sources={})
+
+        with caplog.at_level("WARNING"):
+            value = provider.get(sc.FactKind.LOUDNESS)
+
+        assert value is None
+        assert "nothing provides the loudness fact" in caplog.text
+
+    def test_and_only_once_per_fact(self, caplog):
+        """It is asked again for every element that wants it, and a warning
+        per element would bury the compile's real notes."""
+        provider = sc.CachingProvider(sources={})
+
+        with caplog.at_level("WARNING"):
+            provider.get(sc.FactKind.LOUDNESS)
+            provider.get(sc.FactKind.LOUDNESS)
+
+        assert caplog.text.count("nothing provides the loudness fact") == 1
+
+
 class TestBuyingOnlyWhatWasAsked:
     def test_a_fact_nobody_wants_is_never_computed(self):
         provider = sc.CachingProvider(sources={
