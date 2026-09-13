@@ -32,6 +32,7 @@ from app.domain import profiles
 from app.services import assets
 from montage import client as montage
 from montage import composition as comp
+from montage import scenario as sc
 from montage import style as style_module
 from montage.rules import inserts as insert_planner
 
@@ -81,6 +82,7 @@ def compose_clip(
     job,
     options: dict[str, Any],
     style: style_module.StyleSpec,
+    scenario: sc.Scenario | None = None,
     scenario_name: str = profiles.DEFAULT,
     library: Library | None = None,
     seed: int | None = None,
@@ -98,7 +100,11 @@ def compose_clip(
     shelf = library or Library()
     clip_seed = seed if seed is not None else int(clip.id or 0)
 
-    scenario = montage.scenario_for(scenario_name, style)
+    # Resolved by the caller when the job names one of its own, because that
+    # takes a database session and this function outlives it — composing a
+    # clip can mean transcribing it.
+    if scenario is None:
+        scenario = montage.scenario_for(scenario_name, style)
 
     # Asked before the words are fetched, not after. A montage with no
     # subtitles and no keyword b-roll has no use for a transcript, and finding

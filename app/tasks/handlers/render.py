@@ -22,7 +22,7 @@ from app.domain import captions as caption_builder
 from montage import composition as comp
 from app.domain import profiles
 from montage import style as style_module
-from app.services import assets, clip_jobs, clips, rendering
+from app.services import assets, clip_jobs, clips, rendering, scenarios
 from app.tasks.context import TaskContext
 from app.tasks.registry import register_handler
 
@@ -67,7 +67,10 @@ def handle_render(ctx: TaskContext) -> dict:
             source_path=options.get("source_path") or job.original_path or "",
             source_title=options.get("source_title") or job.display_title,
             thumbnail_path=options.get("thumbnail_path") or job.thumbnail_path,
-            scenario=job.profile,
+            # Read here rather than downstream because a stored scenario is a
+            # row: resolving it needs the session, and the session is gone by
+            # the time the clip is composed.
+            scenario=scenarios.for_job(session, job, style),
         )
         library = rendering.library_for(session, style=style, seed=clip_id)
         clips.mark_rendering(session, clip_id)
@@ -93,7 +96,7 @@ def handle_render(ctx: TaskContext) -> dict:
 
     plan = rendering.compose_clip(
         clip=spec, job=spec, options=options, style=style,
-        scenario_name=spec.scenario,
+        scenario=spec.scenario,
         library=library, seed=clip_id, on_progress=ctx.progress,
     )
     composition = plan.composition

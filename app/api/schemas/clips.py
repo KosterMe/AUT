@@ -6,7 +6,7 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field, model_validator
 
 from app.api.schemas.common import ORM, UtcTimestamps
-from app.domain import profiles, sources
+from app.domain import sources
 
 
 class RenderOptions(BaseModel):
@@ -126,8 +126,14 @@ class ClipJobCreate(BaseModel):
     # When set, these tags are used exclusively for every clip of this video.
     caption_tags: Optional[str] = Field(default=None, max_length=500)
 
-    # What kind of video this is; it picks the cutter and the frame.
-    profile: Literal["talking", "plain", "split", "film"] = profiles.DEFAULT
+    # Which montage to render with, by id. Omitted means the built-in the
+    # profile names, which is what every job had before scenarios were stored.
+    scenario_id: Optional[int] = None
+    # Which signal the cuts follow. Omitted means the profile's.
+    cutter: Optional[Literal["speech", "scenes", "plain"]] = None
+    # Deprecated, accepted for one release: a profile said both of the above at
+    # once, plus a default look. Sending one is logged.
+    profile: Optional[Literal["talking", "plain", "split", "film"]] = None
     # A saved look. Omitted means the profile's own defaults, which is what an
     # unattended job gets and why nothing has to be chosen for one to run.
     style_id: Optional[int] = None
@@ -151,7 +157,10 @@ class ClipJobCreate(BaseModel):
 class ClipJobStart(BaseModel):
     """Re-run planning for an existing job, optionally with new boundaries."""
 
-    # Omitted keeps the profile the job was created with.
+    # Omitted keeps what the job was created with, for all three.
+    scenario_id: Optional[int] = None
+    cutter: Optional[Literal["speech", "scenes", "plain"]] = None
+    # Deprecated, as on creation: it re-derives the cutter and the default look.
     profile: Optional[Literal["talking", "plain", "split", "film"]] = None
     # As does an omitted style.
     style_id: Optional[int] = None
@@ -213,6 +222,8 @@ class ClipJobRead(UtcTimestamps):
     source_platform: str
     source_ref: str
     profile: str
+    scenario_id: Optional[int] = None
+    cutter: str = ""
     style_id: Optional[int] = None
     title: Optional[str]
     custom_title: Optional[str]

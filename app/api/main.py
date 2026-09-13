@@ -26,6 +26,7 @@ from app.api.routers import (
     clips,
     login,
     publications,
+    scenarios,
     styles,
     system,
 )
@@ -45,9 +46,27 @@ async def lifespan(app: FastAPI):
             "APP_AUTH_TOKEN is not set — the API is unauthenticated. That is fine "
             "bound to localhost, but set it before exposing this port."
         )
+    _seed_scenarios()
     _seed_cleanup()
     yield
     log.info("API stopped")
+
+
+def _seed_scenarios() -> None:
+    """Make sure the four built-in montages are in the database.
+
+    They are code rather than data — `montage/scenario/builtin.py` is the
+    source — so their rows are refreshed at every start. An operator's own
+    scenarios are never touched.
+    """
+    from app.db.session import session_scope
+    from app.services import scenarios
+
+    try:
+        with session_scope() as session:
+            scenarios.seed(session)
+    except Exception:  # pragma: no cover - a job can still name a built-in
+        log.exception("could not seed the built-in scenarios")
 
 
 def _seed_cleanup() -> None:
@@ -104,6 +123,7 @@ def create_app() -> FastAPI:
     app.include_router(clip_jobs.router)
     app.include_router(clips.router)
     app.include_router(styles.router)
+    app.include_router(scenarios.router)
     app.include_router(publications.router)
     app.include_router(login.router)
     return app

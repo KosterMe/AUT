@@ -21,7 +21,7 @@ from app.adapters.media import ffmpeg as media
 from app.api.deps import db_session
 from app.api.schemas.clips import ClipPreviewRequest, ClipRead, ClipRenderRequest
 from app.core.errors import ValidationError
-from app.services import clip_jobs, clips, rendering, styles
+from app.services import clip_jobs, clips, rendering, scenarios, styles
 
 log = logging.getLogger(__name__)
 
@@ -103,7 +103,7 @@ def preview_clip(
     library = rendering.library_for(session, style=style, seed=clip_id)
     plan = rendering.compose_clip(
         clip=clip, job=job, options=options, style=style,
-        scenario_name=job.profile,
+        scenario=scenarios.for_job(session, job, style),
         library=library, seed=clip_id, allow_transcription=False,
     )
 

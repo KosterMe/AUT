@@ -53,6 +53,10 @@ def handle_download(ctx: TaskContext) -> dict:
     with ctx.db() as session:
         job = clip_jobs.get(session, job_id)
         source_ref, platform = job.source_ref, job.source_platform
+        # Which signal to cut on is the job's own field now, read here while
+        # the session is open. Empty only for a task queued before the column
+        # existed, and that is the one case the payload is still asked.
+        cutter = job.cutter or ""
         existing_path = job.original_path or clip_jobs.source_downloaded_elsewhere(
             session, job_id, source_ref
         )
@@ -86,7 +90,7 @@ def handle_download(ctx: TaskContext) -> dict:
         clip_jobs.set_progress(session, job_id, JobStatus.TRANSCRIBING, "transcribing", 0.15)
 
     profile = profiles.get(ctx.get("profile"))
-    cutter = str(ctx.get("cutter") or profile.cutter)
+    cutter = cutter or str(ctx.get("cutter") or profile.cutter)
 
     transcript = None
     if cutting.needs_transcript(cutter):
