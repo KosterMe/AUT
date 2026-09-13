@@ -21,6 +21,7 @@ from app.domain.transcript import TranscriptSegment, TranscriptWord
 from app.services import clip_jobs, publications
 from app.tasks import queue, runner
 from app.tasks.registry import load_handlers
+from montage import composition as comp
 
 load_handlers()
 
@@ -547,8 +548,14 @@ class TestRenderHandler:
         assert runner.run_once([TaskKind.RENDER]) is True
 
         composition = self.rendered_compositions[-1]
-        assert composition.layouts == frozenset({"split"})
-        assert composition.spine[0].companion_path == background.path
+        # Two elements, each in its half of the canvas: the speaker up top and
+        # the gameplay below, as one layer running the length of the clip.
+        assert composition.spine[0].frame == comp.TOP_HALF
+        assert composition.spine[0].backdrop is False
+        bottom = composition.stack[0]
+        assert bottom.source_path == background.path
+        assert bottom.frame == comp.BOTTOM_HALF
+        assert bottom.duration_sec == composition.duration_sec
 
     def test_a_split_screen_with_nothing_to_put_under_it_falls_back(self, db, source_file):
         """A missing background should cost the split screen, not the clip."""
@@ -559,7 +566,9 @@ class TestRenderHandler:
         assert runner.run_once([TaskKind.RENDER]) is True
 
         db.expire_all()
-        assert self.rendered_compositions[-1].layouts == frozenset({"blur"})
+        composition = self.rendered_compositions[-1]
+        assert composition.spine[0].backdrop is True     # fell back to a backdrop
+        assert composition.layers == ()                  # and nothing below
         assert db.get(Clip, clip_id).status == ClipStatus.READY
 
     def test_a_soundtrack_is_chosen_from_the_library(self, db, source_file):

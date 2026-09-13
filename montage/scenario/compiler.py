@@ -93,17 +93,15 @@ def compile(
         ))
         frame_layout = LAYOUT_BLUR
 
-    segments = _segments(
-        laid, facts, layout=frame_layout, companion_path=companion,
-        notes=notes, used=used,
-    )
+    segments = _segments(laid, facts, layout=frame_layout, notes=notes, used=used)
     if not segments:
         notes.append(CompileWarning(
             "empty_spine", "the spine placed nothing; used the whole clip as one segment"
         ))
         segments = comp.single_source(
             facts.source_path, start_sec=facts.start_sec, end_sec=facts.end_sec,
-            layout=frame_layout, companion_path=companion,
+            frame=comp.frame_for_layout(frame_layout),
+            backdrop=frame_layout == LAYOUT_BLUR,
         ).spine
 
     draft = comp.Composition(
@@ -117,11 +115,31 @@ def compile(
     spans = _spans(scenario, laid, facts, cues, notes)
     draft = dataclasses.replace(
         draft,
-        layers=_layers(scenario, spans, facts, notes, used),
+        layers=_bottom_half(companion, draft) + _layers(
+            scenario, spans, facts, notes, used
+        ),
         audio=_audio(scenario, spans, facts, notes, used),
         subtitles=_subtitle_spec(scenario, cues, facts),
     )
     return _apply_rules(scenario, draft, facts, notes), tuple(notes)
+
+
+def _bottom_half(companion: str | None, draft: comp.Composition) -> tuple[comp.Layer, ...]:
+    """A split screen's lower half: one layer across the clip.
+
+    Not a second source on every segment, which is what it used to be. The
+    footage down there runs continuously and the per-segment cursor existed
+    only because a segment was the only place to keep it.
+    """
+    if not companion:
+        return ()
+    return (comp.Layer(
+        source_path=companion,
+        at_sec=0.0,
+        duration_sec=draft.duration_sec,
+        frame=comp.BOTTOM_HALF,
+        z=-1,
+    ),)
 
 
 # --- 1. the spine -----------------------------------------------------------
@@ -425,7 +443,6 @@ def _segments(
     facts: fact_module.ClipFacts,
     *,
     layout: str,
-    companion_path: str | None,
     notes: list[CompileWarning],
     used: set[str],
 ) -> tuple[comp.Segment, ...]:
@@ -435,13 +452,13 @@ def _segments(
     single elastic `source` element — the shape every clip has today — gives
     exactly the segments `composition.single_source` gives.
 
-    A split screen's companion advances across segments rather than restarting
-    on each: the bottom half is background, and background that jumps back on
-    every cut above it draws the attention it is there not to draw.
+    How they fill the canvas is a rectangle now. A split screen's bottom half
+    is a layer across the whole clip rather than a second source on every
+    segment — it is background, and background that jumps back on every cut
+    above it draws the attention it is there not to draw.
     """
     windows = list(facts.keep) or [(0.0, facts.duration_sec)]
     segments: list[comp.Segment] = []
-    companion_cursor = 0.0
 
     for placement in laid.placements:
         element = placement.element
@@ -460,11 +477,9 @@ def _segments(
                 source_path=path,
                 source_start_sec=round(base_sec + rel_start, 3),
                 source_end_sec=round(base_sec + rel_end, 3),
-                layout=layout,
-                companion_path=companion_path,
-                companion_start_sec=round(companion_cursor, 3),
+                frame=comp.frame_for_layout(layout),
+                backdrop=layout == LAYOUT_BLUR,
             ))
-            companion_cursor += rel_end - rel_start
     return tuple(segments)
 
 

@@ -72,7 +72,7 @@ def test_source_paths_are_deduplicated_in_first_use_order():
         spine=(
             comp.Segment("a.mp4", 0.0, 5.0),
             comp.Segment("a.mp4", 10.0, 15.0),
-            comp.Segment("b.mp4", 0.0, 5.0, layout=comp.LAYOUT_FILL),
+            comp.Segment("b.mp4", 0.0, 5.0),
         ),
         layers=(comp.Layer("c.mp4", frame=PIP, at_sec=1.0, duration_sec=2.0),),
     )
@@ -88,11 +88,6 @@ def test_an_insert_cannot_run_past_the_end_of_the_clip():
         )
 
 
-def test_a_split_screen_segment_needs_a_companion():
-    with pytest.raises(ValueError, match="companion"):
-        comp.Segment("a.mp4", 0.0, 10.0, layout=comp.LAYOUT_SPLIT)
-
-
 def test_a_composition_needs_at_least_one_segment():
     with pytest.raises(ValueError, match="at least one segment"):
         comp.Composition(spine=())
@@ -103,9 +98,13 @@ def test_a_segment_shorter_than_the_floor_is_rejected():
         comp.Segment("a.mp4", 5.0, 5.01)
 
 
-def test_an_unknown_layout_is_rejected():
-    with pytest.raises(ValueError, match="unknown layout"):
-        comp.Segment("a.mp4", 0.0, 5.0, layout="ken-burns")
+def test_a_segment_has_no_layout_left_to_get_wrong():
+    """Three words that named three pictures became a rectangle and a flag,
+    and a rectangle cannot be misspelled. What a segment still refuses is a
+    source it cannot read and a piece too short to cut."""
+    assert comp.Segment("a.mp4", 0.0, 5.0).frame == comp.CONTAINED
+    with pytest.raises(ValueError, match="source path"):
+        comp.Segment("", 0.0, 5.0)
 
 
 def test_a_layer_has_no_kind_left_to_get_wrong():
@@ -125,7 +124,7 @@ def test_a_composition_round_trips_through_json():
     original = comp.Composition(
         spine=(
             comp.Segment("/media/a.mp4", 10.0, 20.0),
-            comp.Segment("/media/a.mp4", 40.0, 45.0, layout=comp.LAYOUT_FILL),
+            comp.Segment("/media/a.mp4", 40.0, 45.0),
         ),
         layers=(comp.Layer("/media/broll.mp4", at_sec=4.0, duration_sec=2.0),),
         subtitles=comp.SubtitleSpec(
@@ -397,3 +396,69 @@ class TestAFrameIsARectangle:
     def test_a_frame_that_leaves_its_height_alone_reports_none(self):
         """Which is what tells the renderer to write `scale=W:-2`."""
         assert comp.Frame(width=40.0).box(comp.Canvas())[3] == 0
+
+
+class TestALayoutWasAlwaysARectangle:
+    """The evidence for removing the enum, printed rather than asserted vaguely.
+
+    `LAYOUT_FILL`, `LAYOUT_BLUR` and `LAYOUT_SPLIT` named three pictures. The
+    claim is that a frame and a backdrop name the same three and nothing else
+    changed, so each case here computes the geometry the old renderer would
+    have produced and checks the frame lands on it exactly.
+    """
+
+    CANVAS = comp.Canvas(1080, 1920, 30)
+
+    @staticmethod
+    def old_half(canvas: comp.Canvas) -> int:
+        """`Canvas.half_height`, as it read before it was deleted.
+
+        Written out here rather than imported: an equivalence proof that asks
+        the code under test what the old answer was is not a proof.
+        """
+        return max(2, (canvas.height // 2) // 2 * 2)
+
+    def test_fill_covered_the_canvas(self):
+        """`filters.fill(canvas.width, canvas.height)` — the whole frame."""
+        frame = comp.frame_for_layout(comp.LAYOUT_FILL)
+
+        assert frame.box(self.CANVAS) == (0, 0, 1080, 1920)
+        assert frame.fit == "cover"
+
+    def test_blur_was_the_canvas_too_with_something_behind_it(self):
+        """The foreground was fitted inside the frame — `force_original_aspect
+        _ratio=decrease` — which is `contain`, and the backdrop filled the rest."""
+        frame = comp.frame_for_layout(comp.LAYOUT_BLUR)
+
+        assert frame.box(self.CANVAS) == (0, 0, 1080, 1920)
+        assert frame.fit == "contain"
+
+    def test_split_was_the_top_half_exactly(self):
+        """`vstack` of two `fill(width, canvas.half_height)` put the source in
+        the upper 1080x960 and the companion directly below it."""
+        half = self.old_half(self.CANVAS)
+        top = comp.frame_for_layout(comp.LAYOUT_SPLIT)
+
+        assert top.box(self.CANVAS) == (0, 0, 1080, half)
+
+    def test_and_the_companion_was_the_bottom_half_exactly(self):
+        half = self.old_half(self.CANVAS)
+
+        assert comp.BOTTOM_HALF.box(self.CANVAS) == (0, half, 1080, half)
+
+    def test_the_two_halves_meet_with_no_seam_and_no_overlap(self):
+        """Which is the whole of what `vstack` guaranteed."""
+        _, top_y, _, top_h = comp.frame_for_layout(comp.LAYOUT_SPLIT).box(self.CANVAS)
+        _, bottom_y, _, bottom_h = comp.BOTTOM_HALF.box(self.CANVAS)
+
+        assert top_y + top_h == bottom_y
+        assert bottom_y + bottom_h == self.CANVAS.height
+
+    def test_the_halves_stay_even_on_an_odd_canvas(self):
+        """The old `half_height` rounded down to an even number because yuv420p
+        subsamples chroma by two; a frame has to do the same or the picture is
+        rejected at encode time."""
+        odd = comp.Canvas(1080, 1921, 30)
+
+        for frame in (comp.frame_for_layout(comp.LAYOUT_SPLIT), comp.BOTTOM_HALF):
+            assert frame.box(odd)[3] % 2 == 0

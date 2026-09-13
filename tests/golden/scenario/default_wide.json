@@ -8,25 +8,46 @@
   "layers": [],
   "spine": [
     {
-      "companion_path": null,
-      "companion_start_sec": 0.0,
-      "layout": "blur",
+      "backdrop": true,
+      "frame": {
+        "fit": "contain",
+        "height": 100.0,
+        "opacity": 1.0,
+        "rotate": 0.0,
+        "width": 100.0,
+        "x": 50.0,
+        "y": 50.0
+      },
       "source_end_sec": 40.0,
       "source_path": "/media/source.mp4",
       "source_start_sec": 10.0
     },
     {
-      "companion_path": null,
-      "companion_start_sec": 30.0,
-      "layout": "blur",
+      "backdrop": true,
+      "frame": {
+        "fit": "contain",
+        "height": 100.0,
+        "opacity": 1.0,
+        "rotate": 0.0,
+        "width": 100.0,
+        "x": 50.0,
+        "y": 50.0
+      },
       "source_end_sec": 70.0,
       "source_path": "/media/source.mp4",
       "source_start_sec": 42.0
     },
     {
-      "companion_path": null,
-      "companion_start_sec": 58.0,
-      "layout": "blur",
+      "backdrop": true,
+      "frame": {
+        "fit": "contain",
+        "height": 100.0,
+        "opacity": 1.0,
+        "rotate": 0.0,
+        "width": 100.0,
+        "x": 50.0,
+        "y": 50.0
+      },
       "source_end_sec": 100.0,
       "source_path": "/media/source.mp4",
       "source_start_sec": 72.0

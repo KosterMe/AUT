@@ -68,29 +68,40 @@ class Canvas:
         if self.fps <= 0:
             raise ValueError("canvas fps must be positive")
 
-    @property
-    def half_height(self) -> int:
-        """Height of one half of a split screen, kept even for yuv420p."""
-        return max(2, (self.height // 2) // 2 * 2)
-
 
 @dataclass(frozen=True)
 class Segment:
-    """One continuous piece of the output timeline, cut from one source."""
+    """One continuous piece of the output timeline, cut from one source.
+
+    How it fills the canvas is a rectangle and a flag, not a word from a list
+    of three. `LAYOUT_FILL`, `LAYOUT_BLUR` and `LAYOUT_SPLIT` were three
+    branches in the renderer and three values threaded through the profile, the
+    API schema, the planner and the cache key, and between them they could
+    express exactly three pictures. A frame and a backdrop express those three
+    and the ones nobody could ask for before — a source letterboxed on black,
+    a source in the upper third, a source inset with a blur behind it.
+
+    The frame is per segment rather than per clip because the fragment cache
+    keys on it: a cached piece of spine has already been fitted, and two clips
+    that frame the same seconds differently are not the same fragment (§7.4).
+    """
 
     source_path: str
     source_start_sec: float
     source_end_sec: float
-    layout: str = LAYOUT_BLUR
-    # Only for LAYOUT_SPLIT: what plays in the bottom half.
-    companion_path: str | None = None
-    companion_start_sec: float = 0.0
+    # Where in the canvas this segment's picture goes, and what fills the rest.
+    # The default is the blurred backdrop, which is what `layout` defaulted to
+    # before it was two fields: it is the framing that never crops anything
+    # away, so it is the safe answer for a caller that did not say.
+    frame: "Frame" = field(default_factory=lambda: CONTAINED)
+    # Whether a blurred copy of this same segment fills what the frame does
+    # not. Derived from the segment itself, which is why it is a property of
+    # the segment and not a layer: there is no other source to take it from.
+    backdrop: bool = True
 
     def __post_init__(self) -> None:
         if not self.source_path:
             raise ValueError("a segment needs a source path")
-        if self.layout not in LAYOUTS:
-            raise ValueError(f"unknown layout {self.layout!r}; expected one of {LAYOUTS}")
         if self.source_start_sec < 0:
             raise ValueError("a segment cannot start before the source does")
         if self.duration_sec < MIN_SEGMENT_SECONDS:
@@ -98,8 +109,6 @@ class Segment:
                 f"segment is {self.duration_sec}s long, shorter than the "
                 f"{MIN_SEGMENT_SECONDS}s floor"
             )
-        if self.layout == LAYOUT_SPLIT and not self.companion_path:
-            raise ValueError("a split-screen segment needs a companion source")
 
     @property
     def duration_sec(self) -> float:
@@ -165,7 +174,14 @@ class Frame:
         return left, top, width, height
 
 
+
+
 FULL_FRAME = Frame(width=100.0, height=100.0)
+# Fitted inside the canvas rather than cropped to it, which is what leaves room
+# for a backdrop to show.
+CONTAINED = Frame(width=100.0, height=100.0, fit="contain")
+TOP_HALF = Frame(y=25.0, width=100.0, height=50.0)
+BOTTOM_HALF = Frame(y=75.0, width=100.0, height=50.0)
 
 
 @dataclass(frozen=True)
@@ -326,8 +342,15 @@ class Composition:
         return self.style.delivery.crf
 
     @property
-    def layouts(self) -> frozenset[str]:
-        return frozenset(segment.layout for segment in self.spine)
+    def framings(self) -> frozenset[tuple]:
+        """The distinct ways this spine fills the canvas.
+
+        More than one means the graph has to build more than one kind of
+        segment chain, which is what the one-pass ceiling is really counting.
+        """
+        return frozenset(
+            (segment.frame, segment.backdrop) for segment in self.spine
+        )
 
     @property
     def has_own_audio(self) -> bool:
@@ -358,9 +381,8 @@ class Composition:
         """Every distinct file this composition reads, in first-use order."""
         seen: list[str] = []
         for segment in self.spine:
-            for path in (segment.source_path, segment.companion_path):
-                if path and path not in seen:
-                    seen.append(path)
+            if segment.source_path not in seen:
+                seen.append(segment.source_path)
         for layer in self.stack:
             if layer.source_path not in seen:
                 seen.append(layer.source_path)
@@ -399,9 +421,8 @@ def single_source(
     end_sec: float,
     keep_segments: Iterable[tuple[float, float]] | None = None,
     canvas: Canvas | None = None,
-    layout: str = LAYOUT_BLUR,
-    companion_path: str | None = None,
-    companion_start_sec: float = 0.0,
+    frame: "Frame | None" = None,
+    backdrop: bool = True,
     layers: Iterable[Layer] = (),
     subtitles: SubtitleSpec | None = None,
     style: StyleSpec | None = None,
@@ -413,15 +434,14 @@ def single_source(
     Windows shorter than the floor are dropped rather than rejected: silence
     detection produces slivers, and losing one is better than losing the clip.
 
-    For a split screen the companion advances across segments rather than
-    restarting at each one: the footage in the bottom half is background, and
-    background that jumps back on every cut above it draws exactly the
-    attention it is there not to draw.
+    The frame and the backdrop apply to every segment alike: one call describes
+    one clip cut from one file, and a clip that framed its own pieces
+    differently would not be one clip.
     """
     windows = list(keep_segments) if keep_segments else [(0.0, max(0.0, end_sec - start_sec))]
 
+    shape = frame or CONTAINED
     segments: list[Segment] = []
-    companion_cursor = max(0.0, float(companion_start_sec))
     for rel_start, rel_end in windows:
         rel_start = max(0.0, float(rel_start))
         rel_end = max(rel_start, float(rel_end))
@@ -432,12 +452,10 @@ def single_source(
                 source_path=source_path,
                 source_start_sec=round(start_sec + rel_start, 3),
                 source_end_sec=round(start_sec + rel_end, 3),
-                layout=layout,
-                companion_path=companion_path,
-                companion_start_sec=round(companion_cursor, 3),
+                frame=shape,
+                backdrop=backdrop,
             )
         )
-        companion_cursor += rel_end - rel_start
 
     if not segments:
         segments = [
@@ -445,9 +463,8 @@ def single_source(
                 source_path=source_path,
                 source_start_sec=round(start_sec, 3),
                 source_end_sec=round(max(start_sec + MIN_SEGMENT_SECONDS, end_sec), 3),
-                layout=layout,
-                companion_path=companion_path,
-                companion_start_sec=round(max(0.0, float(companion_start_sec)), 3),
+                frame=shape,
+                backdrop=backdrop,
             )
         ]
 
@@ -486,7 +503,10 @@ def to_dict(composition: Composition) -> dict[str, Any]:
             "height": composition.canvas.height,
             "fps": composition.canvas.fps,
         },
-        "spine": [_asdict(segment) for segment in composition.spine],
+        "spine": [
+            {**_asdict(segment), "frame": _asdict(segment.frame)}
+            for segment in composition.spine
+        ],
         "layers": [
             {**_asdict(layer), "frame": _asdict(layer.frame)}
             for layer in composition.stack
@@ -530,18 +550,86 @@ def from_dict(data: Mapping[str, Any]) -> Composition:
             title_text=subtitles_data.get("title_text"),
         )
 
-    spine_data = data.get("spine")
-    if spine_data is None:
-        spine_data = data.get("segments") or []
     style = StyleSpec.from_dict(data.get("style"))
+    spine, companion = _spine_from(data, canvas)
     return Composition(
-        spine=tuple(Segment(**_only(item, Segment)) for item in spine_data),
+        spine=spine,
         canvas=canvas,
-        layers=_layers_from(data, style, canvas),
+        layers=_layers_from(data, style, canvas) + companion,
         subtitles=subtitles,
         audio=_audio_from(data),
         style=style,
     )
+
+
+def _spine_from(
+    data: Mapping[str, Any], canvas: Canvas
+) -> tuple[tuple[Segment, ...], tuple[Layer, ...]]:
+    """The spine, and whatever an older document's layout implied beside it.
+
+    A layout named one of three pictures, and each is a frame: `fill` covers
+    the canvas, `blur` is contained inside it with a blurred copy behind, and
+    `split` puts the source in the top half and something else in the bottom.
+    The third is the one that produces a layer as well — the companion was a
+    second source all along, sitting in the half the spine does not fill.
+    """
+    if data.get("spine") is not None:
+        rows = data["spine"]
+        return tuple(
+            Segment(
+                **{k: v for k, v in _only(row, Segment).items() if k != "frame"},
+                frame=(
+                    Frame(**_only(row["frame"], Frame))
+                    if isinstance(row.get("frame"), Mapping) else FULL_FRAME
+                ),
+            )
+            for row in rows
+        ), ()
+
+    segments: list[Segment] = []
+    companion_path = ""
+    companion_start = 0.0
+    for row in data.get("segments") or []:
+        layout = row.get("layout", LAYOUT_BLUR)
+        fields = _only(row, Segment)
+        fields.pop("frame", None)
+        fields.pop("backdrop", None)
+        segments.append(Segment(
+            **fields,
+            frame=frame_for_layout(layout),
+            backdrop=layout == LAYOUT_BLUR,
+        ))
+        if layout == LAYOUT_SPLIT and row.get("companion_path") and not companion_path:
+            companion_path = row["companion_path"]
+            companion_start = float(row.get("companion_start_sec") or 0.0)
+
+    if not companion_path:
+        return tuple(segments), ()
+
+    # The companion ran continuously under every segment, picked up rather than
+    # restarted on each cut — which is one layer spanning the clip, and always
+    # was. Its per-segment cursor existed only because a segment was the only
+    # place to keep it.
+    length = round(sum(segment.duration_sec for segment in segments), 3)
+    return tuple(segments), (Layer(
+        source_path=companion_path,
+        at_sec=0.0,
+        duration_sec=length,
+        source_start_sec=companion_start,
+        frame=BOTTOM_HALF,
+        z=-1,
+    ),)
+
+
+def frame_for_layout(layout: str) -> Frame:
+    """The rectangle a layout named."""
+    if layout == LAYOUT_SPLIT:
+        return TOP_HALF
+    if layout == LAYOUT_FILL:
+        return FULL_FRAME
+    # `blur` and `auto`: the picture is contained in the canvas, and whatever
+    # it does not cover is the blurred copy behind it.
+    return CONTAINED
 
 
 def _layers_from(data: Mapping[str, Any], style: StyleSpec, canvas: Canvas) -> tuple[Layer, ...]:
@@ -652,11 +740,8 @@ def excerpt(composition: Composition, *, at_sec: float, duration_sec: float) -> 
                 source_path=segment.source_path,
                 source_start_sec=round(segment.source_start_sec + lead, 3),
                 source_end_sec=round(segment.source_start_sec + lead + (end - start), 3),
-                layout=segment.layout,
-                companion_path=segment.companion_path,
-                # The companion runs continuously under the clip, so it is
-                # picked up where the window starts rather than restarted.
-                companion_start_sec=round(segment.companion_start_sec + lead, 3),
+                frame=segment.frame,
+                backdrop=segment.backdrop,
             )
         )
     if not segments:

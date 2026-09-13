@@ -99,8 +99,9 @@ class TestTheDefaultScenarioIsTodaysMontage:
         """
         draft = comp.single_source(
             clip.source_path, start_sec=clip.start_sec, end_sec=clip.end_sec,
-            keep_segments=clip.keep, canvas=scenario.canvas,
-            style=scenario.style, layout=layout,
+            keep_segments=clip.keep, canvas=scenario.canvas, style=scenario.style,
+            frame=comp.frame_for_layout(layout),
+            backdrop=layout == comp.LAYOUT_BLUR,
         )
         cues = subtitle_builder.make_subtitle_cues(
             list(clip.speech), timeline_segments=draft.timeline(),
@@ -158,30 +159,30 @@ class TestTheFitDecidesTheFrame:
     def test_auto_crops_a_source_already_shaped_like_the_canvas(self):
         got, _ = sc.compile(self.spined(sc.FIT_AUTO), facts(width=1080, height=1920))
 
-        assert got.spine[0].layout == comp.LAYOUT_FILL
+        assert got.spine[0].frame == comp.FULL_FRAME and not got.spine[0].backdrop
 
     def test_auto_keeps_a_backdrop_behind_a_wide_one(self):
         got, _ = sc.compile(self.spined(sc.FIT_AUTO), facts())
 
-        assert got.spine[0].layout == comp.LAYOUT_BLUR
+        assert got.spine[0].frame == comp.CONTAINED and got.spine[0].backdrop
 
     def test_a_source_of_unknown_shape_keeps_the_backdrop(self):
         """Cropping to a shape nobody measured is the worse guess."""
         got, _ = sc.compile(self.spined(sc.FIT_AUTO), facts(width=0, height=0))
 
-        assert got.spine[0].layout == comp.LAYOUT_BLUR
+        assert got.spine[0].frame == comp.CONTAINED and got.spine[0].backdrop
 
     def test_cover_with_nothing_behind_it_fills_the_frame(self):
         got, _ = sc.compile(self.spined(sc.FIT_COVER, backdrop=False), facts())
 
-        assert got.spine[0].layout == comp.LAYOUT_FILL
+        assert got.spine[0].frame == comp.FULL_FRAME and not got.spine[0].backdrop
 
     def test_an_explicit_layout_is_still_honoured(self):
         got, _ = sc.compile(
             self.spined(sc.FIT_AUTO, framing={"layout": comp.LAYOUT_FILL}), facts()
         )
 
-        assert got.spine[0].layout == comp.LAYOUT_FILL
+        assert got.spine[0].frame == comp.FULL_FRAME and not got.spine[0].backdrop
 
 
 def talking() -> sc.Scenario:
@@ -289,7 +290,7 @@ class TestOverlaysAreAnchoredNotTimed:
         got, _ = sc.compile(sc.default(), facts())
 
         assert got.layers == ()
-        assert got.spine[0].layout == comp.LAYOUT_BLUR
+        assert got.spine[0].frame == comp.CONTAINED and got.spine[0].backdrop
 
 
 class TestSlotsBecomePaths:

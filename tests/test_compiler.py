@@ -138,30 +138,30 @@ def test_sharpening_is_on_by_default_and_can_be_turned_off(configure):
     assert "unsharp" not in one_pass(build())
 
 
-def test_split_screen_stacks_a_companion_source_underneath():
+def test_a_split_screen_is_a_half_frame_spine_and_a_layer_under_it():
+    """Two elements, each in its half of the canvas — which is what a split
+    screen always was. The bottom half is one layer across the clip rather
+    than a second source attached to every segment."""
     composition = build(
-        spine=(
-            comp.Segment(SOURCE, 0.0, 10.0, layout=comp.LAYOUT_SPLIT,
-                         companion_path=BROLL, companion_start_sec=4.0),
-        )
+        spine=(comp.Segment(SOURCE, 0.0, 10.0, frame=comp.TOP_HALF,
+                            backdrop=False),),
+        layers=(comp.Layer(BROLL, at_sec=0.0, duration_sec=10.0,
+                           source_start_sec=4.0, frame=comp.BOTTOM_HALF, z=-1),),
     )
-    args = compiler.one_pass_args(
-        composition, "/out/clip.mp4", subtitle_path=None,
-        audio_by_source={SOURCE: True, BROLL: True}, has_audio=True, encoder="libx264",
-    )
+    graph = one_pass(composition, has_audio=True)
 
-    # The companion gets its own seeked input, running for the segment's length,
-    # and loops: background footage is usually far shorter than the clip over it,
-    # and a background that runs out leaves half the frame black.
-    assert ["-stream_loop", "-1", "-ss", "4.000", "-t", "10.000", "-i", BROLL] == args[8:16]
-    graph = graph_of(args)
-    assert "crop=1080:960[s0top]" in graph
-    assert "crop=1080:960[s0bottom]" in graph
-    assert "[s0top][s0bottom]vstack=inputs=2[v0]" in graph
+    # The spine fills the top half and is padded into a full canvas, leaving
+    # the bottom black for the layer to sit in.
+    assert "crop=1080:960,pad=1080:1920:0:0:black[v0]" in graph
+    # And the companion fills its own half rather than being stretched to it.
+    assert "scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960" in graph
+    assert "overlay=0:960" in graph
 
 
-def test_fill_layout_crops_instead_of_blurring():
-    graph = one_pass(build(spine=(comp.Segment(SOURCE, 0.0, 10.0, layout=comp.LAYOUT_FILL),)))
+def test_a_frame_covering_the_canvas_crops_instead_of_blurring():
+    graph = one_pass(build(spine=(
+        comp.Segment(SOURCE, 0.0, 10.0, frame=comp.FULL_FRAME, backdrop=False),
+    )))
 
     assert "boxblur" not in graph
     assert "crop=1080:1920[v0]" in graph
@@ -324,7 +324,7 @@ def test_a_large_graph_falls_back_to_two_stages(configure):
 def test_mixed_layouts_go_through_two_stages():
     mixed = build(spine=(
         comp.Segment(SOURCE, 0.0, 10.0),
-        comp.Segment(SOURCE, 20.0, 30.0, layout=comp.LAYOUT_FILL),
+        comp.Segment(SOURCE, 20.0, 30.0, frame=comp.FULL_FRAME, backdrop=False),
     ))
 
     assert compiler.choose_strategy(mixed) == compiler.STRATEGY_TWO_STAGE
@@ -347,7 +347,7 @@ def test_the_configured_strategy_overrides_every_rule(configure):
     configure(AUTOCLIPS_RENDER_STRATEGY="one_pass")
     mixed = build(spine=(
         comp.Segment(SOURCE, 0.0, 10.0),
-        comp.Segment(SOURCE, 20.0, 30.0, layout=comp.LAYOUT_FILL),
+        comp.Segment(SOURCE, 20.0, 30.0, frame=comp.FULL_FRAME, backdrop=False),
     ))
     assert compiler.choose_strategy(mixed) == compiler.STRATEGY_ONE_PASS
 
@@ -365,18 +365,28 @@ def probing(monkeypatch, **info):
     monkeypatch.setattr(compiler, "probe_media", lambda path: info)
 
 
-class TestChooseLayout:
+class TestFramingASource:
+    """What `auto` decides, now that the answer is a rectangle.
+
+    The rule did not change — a source already about as tall and narrow as the
+    canvas is cropped to fill it, anything wider keeps a blurred backdrop — but
+    it comes back as the frame it always meant rather than as a word the
+    renderer would branch on.
+    """
+
     def test_a_vertical_source_is_cropped_rather_than_blurred(self, monkeypatch):
         """Giving a 9:16 video a blurred backdrop made of itself is a frame of
         wasted screen."""
         probing(monkeypatch, width=1080, height=1920)
 
-        assert compiler.choose_layout("/media/phone.mp4", comp.Canvas()) == comp.LAYOUT_FILL
+        frame, backdrop = compiler.frame_for_source("/media/phone.mp4", comp.Canvas())
+
+        assert (frame, backdrop) == (comp.FULL_FRAME, False)
 
     def test_a_taller_than_vertical_source_is_cropped_too(self, monkeypatch):
         probing(monkeypatch, width=1080, height=2400)
 
-        assert compiler.choose_layout("/media/tall.mp4", comp.Canvas()) == comp.LAYOUT_FILL
+        assert compiler.frame_for_source("/media/tall.mp4", comp.Canvas())[1] is False
 
     @pytest.mark.parametrize("width,height", [(1920, 1080), (1080, 1350), (1080, 1080)])
     def test_anything_wider_keeps_the_backdrop(self, monkeypatch, width, height):
@@ -384,19 +394,32 @@ class TestChooseLayout:
         exactly what the backdrop exists to avoid."""
         probing(monkeypatch, width=width, height=height)
 
-        assert compiler.choose_layout("/media/wide.mp4", comp.Canvas()) == comp.LAYOUT_BLUR
+        frame, backdrop = compiler.frame_for_source("/media/wide.mp4", comp.Canvas())
 
-    def test_an_explicit_layout_is_taken_as_given(self, monkeypatch):
+        assert (frame, backdrop) == (comp.CONTAINED, True)
+
+    def test_an_explicit_framing_is_taken_as_given(self, monkeypatch):
         probing(monkeypatch, width=1080, height=1920)
 
-        assert compiler.choose_layout(
+        frame, backdrop = compiler.frame_for_source(
             "/media/phone.mp4", comp.Canvas(), requested=comp.LAYOUT_BLUR
-        ) == comp.LAYOUT_BLUR
+        )
+
+        assert (frame, backdrop) == (comp.CONTAINED, True)
+
+    def test_a_split_screen_frames_the_source_into_the_top_half(self, monkeypatch):
+        probing(monkeypatch, width=1920, height=1080)
+
+        frame, backdrop = compiler.frame_for_source(
+            "/media/wide.mp4", comp.Canvas(), requested=comp.LAYOUT_SPLIT
+        )
+
+        assert (frame, backdrop) == (comp.TOP_HALF, False)
 
     def test_an_unprobeable_source_falls_back_to_the_backdrop(self, monkeypatch):
         probing(monkeypatch, exists=False)
 
-        assert compiler.choose_layout("/media/gone.mp4", comp.Canvas()) == comp.LAYOUT_BLUR
+        assert compiler.frame_for_source("/media/gone.mp4", comp.Canvas())[1] is True
 
 
 # --- the soundtrack ---------------------------------------------------------
