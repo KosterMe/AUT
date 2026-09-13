@@ -64,10 +64,58 @@ class CompileWarning:
     element_id: str = ""
 
 
+@dataclass(frozen=True)
+class Produced:
+    """One thing a rule made, and when it put it there.
+
+    Drawn as a ghost in the editor: its position is what the rule did on *this*
+    material, and on the next clip it will be somewhere else.
+    """
+
+    rule_id: str
+    kind: str            # layer | audio
+    at_sec: float
+    duration_sec: float
+    source_path: str = ""
+
+
+@dataclass(frozen=True)
+class Plan:
+    """One compile with its working shown.
+
+    `compile` returns the EDL and the warnings, because that is everything a
+    render needs. An editor needs the rest of it — where each element landed,
+    which layout the frame resolved to, what the rules made — and working that
+    out a second time in a second place is exactly how an editor comes to draw
+    something the renderer does not do. So there is one traversal and two
+    views of it.
+    """
+
+    composition: comp.Composition
+    warnings: tuple[CompileWarning, ...]
+    # Element id → when it is on screen. The spine is in here too.
+    spans: dict[str, anchors.Span]
+    # How long the scenario laid itself out to be. Not the composition's
+    # duration: an element this renderer cannot draw yet (a colour, a text
+    # slot) takes its place on the timeline and contributes nothing to the
+    # file, and an editor that showed only the second number would draw a
+    # timeline that does not match its own blocks.
+    timeline_sec: float
+    # The layout the frame resolved to, in v1's vocabulary (§3.1).
+    layout: str
+    produced: tuple[Produced, ...] = ()
+
+
 def compile(
     scenario: model.Scenario, facts: fact_module.ClipFacts
 ) -> tuple[comp.Composition, tuple[CompileWarning, ...]]:
     """This scenario applied to this clip."""
+    made = plan(scenario, facts)
+    return made.composition, made.warnings
+
+
+def plan(scenario: model.Scenario, facts: fact_module.ClipFacts) -> Plan:
+    """The same compile, keeping what it worked out along the way."""
     notes: list[CompileWarning] = []
     # What this clip has already put on screen. One set for the whole compile,
     # because "once per clip" is a property of the clip and not of one track.
@@ -121,7 +169,15 @@ def compile(
         audio=_audio(scenario, spans, facts, notes, used),
         subtitles=_subtitle_spec(scenario, cues, facts),
     )
-    return _apply_rules(scenario, draft, facts, notes), tuple(notes)
+    produced: list[Produced] = []
+    return Plan(
+        composition=_apply_rules(scenario, draft, facts, notes, produced),
+        warnings=tuple(notes),
+        spans=spans,
+        timeline_sec=laid.duration_sec,
+        layout=frame_layout,
+        produced=tuple(produced),
+    )
 
 
 def _bottom_half(companion: str | None, draft: comp.Composition) -> tuple[comp.Layer, ...]:
@@ -740,6 +796,7 @@ def _apply_rules(
     composition: comp.Composition,
     facts: fact_module.ClipFacts,
     notes: list[CompileWarning],
+    produced: list[Produced],
 ) -> comp.Composition:
     """Expand the automation against the clip that now exists.
 
@@ -769,6 +826,11 @@ def _apply_rules(
             )
             if chosen:
                 changes["layers"] = composition.layers + chosen
+                produced.extend(
+                    Produced(rule.id, "layer", layer.at_sec, layer.duration_sec,
+                             layer.source_path)
+                    for layer in chosen
+                )
 
     staged = dataclasses.replace(composition, **changes) if changes else composition
     for rule in rules:
@@ -778,6 +840,11 @@ def _apply_rules(
             )
             if effects:
                 changes["audio"] = staged.audio + effects
+                produced.extend(
+                    Produced(rule.id, "audio", effect.at_sec, effect.duration_sec,
+                             effect.source_path)
+                    for effect in effects
+                )
         elif rule.rule not in (model.RULE_KEYWORD_BROLL,):
             notes.append(CompileWarning(
                 "unimplemented_rule",

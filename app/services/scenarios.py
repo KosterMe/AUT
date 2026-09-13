@@ -8,6 +8,7 @@ an edit — it is a migration nobody asked for and nobody can see.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 
 from sqlmodel import Session, col, select
@@ -91,7 +92,17 @@ def compiled(session: Session, scenario_id: int, style: style_module.StyleSpec) 
     preset and a few switches of its own and those are still the last word.
     """
     row = get(session, scenario_id)
-    return _with_style(_read(row), style)
+    return with_style(_read(row), style)
+
+
+def stored(session: Session, scenario_id: int) -> sc.Scenario:
+    """A stored scenario as it was written, style and all.
+
+    Unlike `compiled`, nothing is laid over it: this is what the editor opens
+    and what the layout view takes apart, and a scenario shown through some
+    job's style would be a different scenario from the one being edited.
+    """
+    return _read(get(session, scenario_id))
 
 
 def compiled_builtin(name: str, style: style_module.StyleSpec) -> sc.Scenario:
@@ -151,7 +162,14 @@ def create(
     return row
 
 
-def update(session: Session, scenario_id: int, *, data: dict, name: str = "") -> ScenarioRow:
+def update(
+    session: Session,
+    scenario_id: int,
+    *,
+    data: dict,
+    name: str = "",
+    description: str | None = None,
+) -> ScenarioRow:
     """Save an edit — or, for a built-in, save a copy of it.
 
     Copying rather than refusing: the operator asked to change something and
@@ -166,11 +184,13 @@ def update(session: Session, scenario_id: int, *, data: dict, name: str = "") ->
         log.info("scenario %r is built in; saved the edit as %r instead", row.name, copy_name)
         return create(
             session, name=copy_name, data=checked,
-            description=f"На основе «{row.name}»",
+            description=description if description is not None else f"На основе «{row.name}»",
         )
 
     if name.strip():
         row.name = name.strip()[:64]
+    if description is not None:
+        row.description = description[:500]
     # One name, not two: the row's. A scenario carries its own, and the two
     # drifting apart means the thing an operator renamed still calls itself
     # something else everywhere it is logged or compiled.
@@ -232,9 +252,12 @@ def _checked(data: dict) -> dict:
         raise ValidationError(str(exc)) from exc
 
 
-def _with_style(scenario: sc.Scenario, style: style_module.StyleSpec) -> sc.Scenario:
-    import dataclasses
+def with_style(scenario: sc.Scenario, style: style_module.StyleSpec) -> sc.Scenario:
+    """The scenario, wearing this look instead of its own.
 
+    A job may carry a preset and a few switches, and those are the last word:
+    the scenario says what is on screen, the style says how it is dressed.
+    """
     return dataclasses.replace(scenario, style=style)
 
 

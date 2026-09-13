@@ -21,15 +21,18 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from typing import Any, Callable
 
 from sqlmodel import Session
 
+from app.adapters.media import ffmpeg as media_paths
 from app.adapters.asr import cache as transcript_cache
 from app.adapters.asr import selection
 from app.domain import captions as caption_builder
 from app.domain import profiles
-from app.services import assets
+from app.core.errors import ValidationError
+from app.services import assets, clips as clip_store
 from montage import client as montage
 from montage import composition as comp
 from montage import scenario as sc
@@ -177,3 +180,62 @@ def cached_segments(source_path: str, transcript_settings: Any) -> list[dict]:
 def _report(on_progress: Progress | None, stage: str, fraction: float) -> None:
     if on_progress is not None:
         on_progress(stage, fraction)
+
+
+def preview(
+    session: Session,
+    clip,
+    job,
+    *,
+    style: style_module.StyleSpec,
+    scenario: sc.Scenario | None = None,
+    at_sec: float = 0.0,
+    duration_sec: float = 4.0,
+    scale: float = 0.5,
+) -> str:
+    """A few seconds of this clip, rendered small, as a file on disk.
+
+    Composed by exactly the same code the real render uses, so what comes back
+    is the clip rather than an approximation of it — only shorter and smaller.
+    The one difference is that it will not start a transcription: a preview
+    waits on nothing, and a window whose words are not on disk yet gets the
+    job's transcript instead.
+
+    Two callers want this: previewing a clip in a style, and previewing a
+    scenario on a clip. They differ by one argument, and writing it twice is
+    how the second one quietly stops being the thing the first one renders.
+    """
+    options = clip_store.render_options_of(session, clip)
+    source_path = options.get("source_path") or job.original_path or ""
+    if not source_path or not os.path.isfile(source_path):
+        raise ValidationError(
+            "the source video is not on disk, so there is nothing to preview. "
+            "Re-run the job to download it again."
+        )
+
+    seed = int(clip.id or 0)
+    plan = compose_clip(
+        clip=clip, job=job, options=options, style=style, scenario=scenario,
+        library=library_for(session, style=style, seed=seed),
+        seed=seed, allow_transcription=False,
+    )
+
+    # Clamped rather than refused: the montage is shorter than the clip
+    # whenever silence was removed, so a slider positioned against the source
+    # can legitimately point past the end of what was rendered.
+    length = plan.composition.duration_sec
+    start = max(0.0, min(at_sec, max(0.0, length - duration_sec)))
+
+    output_path = media_paths.preview_output_path(seed)
+    try:
+        montage.preview(
+            plan.composition,
+            output_path,
+            spec=montage.PreviewSpec(
+                at_sec=start, duration_sec=min(duration_sec, length), scale=scale,
+            ),
+        )
+    except ValueError as error:
+        raise ValidationError(f"that window cannot be previewed: {error}") from error
+    log.info("previewed clip %s at %.1fs", seed, start)
+    return output_path

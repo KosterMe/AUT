@@ -1,0 +1,281 @@
+"""What the editor is shown, and why it can be trusted.
+
+The rule this file holds: the editor decides nothing. Every number it draws
+comes from one compile of the scenario, so a timeline that shows a block at
+25 seconds is showing where the renderer put it — not where a second
+implementation of the layout rules thinks it goes. §8.3 refuses a browser-side
+renderer for the same reason, and this is that refusal one level up.
+"""
+from __future__ import annotations
+
+import dataclasses
+
+import pytest
+
+from montage.rules.inserts import AssetOption
+from montage.scenario import inspect as inspector, mock, model
+from montage.style import StyleSpec
+
+
+def style(**groups) -> StyleSpec:
+    base = StyleSpec.from_settings()
+    for name, fields in groups.items():
+        base = dataclasses.replace(
+            base, **{name: dataclasses.replace(getattr(base, name), **fields)}
+        )
+    return base
+
+
+def with_intro_and_outro(**kwargs) -> model.Scenario:
+    """A spine that cannot always fit: two fixed ends and an elastic middle."""
+    spine = model.Track(id="spine", kind=model.TRACK_SPINE, elements=(
+        model.Element(
+            id="intro", slot=model.Slot(kind=model.SLOT_SOURCE),
+            duration=model.Duration(mode=model.DurationMode.FIXED, value=20.0),
+            label="интро",
+        ),
+        model.Element(
+            id="source", slot=model.Slot(kind=model.SLOT_SOURCE),
+            duration=model.Duration(mode=model.DurationMode.ELASTIC, grow=1.0),
+        ),
+        model.Element(
+            id="outro", slot=model.Slot(kind=model.SLOT_SOURCE),
+            duration=model.Duration(mode=model.DurationMode.FIXED, value=20.0),
+            label="аутро", optional=True,
+        ),
+    ))
+    over = model.Track(id="over", kind=model.TRACK_OVERLAY, z=2, elements=(
+        model.Element(
+            id="cta", slot=model.Slot(kind=model.SLOT_LIBRARY, tag="cta"),
+            start=model.Anchor(mode=model.AnchorMode.END, offset_sec=-5.0),
+            duration=model.Duration(mode=model.DurationMode.FIXED, value=4.0),
+            label="CTA",
+        ),
+    ))
+    return model.Scenario(
+        name="t", tracks=(spine, over), style=style(**kwargs) if kwargs else style(),
+    )
+
+
+def report(scenario: model.Scenario, duration_sec: float, assets=()):
+    return inspector.inspect(
+        scenario, mock.facts(scenario, duration_sec, assets=tuple(assets))
+    )
+
+
+def block(made, element_id: str) -> inspector.Block:
+    return next(item for item in made.blocks if item.element_id == element_id)
+
+
+class TestTheLayoutSwitcher:
+    """The editor's most important control (§8.2): the same scenario on
+    material it has never been tried on."""
+
+    def test_the_elastic_middle_takes_what_is_left(self):
+        short = report(with_intro_and_outro(), 60.0)
+        long = report(with_intro_and_outro(), 180.0)
+
+        assert block(short, "source").duration_sec == 20.0   # 60 − 20 − 20
+        assert block(long, "source").duration_sec == 140.0
+
+    def test_a_fixed_end_that_does_not_fit_is_shown_as_dropped(self):
+        """The mistake the switcher exists to catch: an outro that quietly
+        stops existing on a short clip. It is a block that says so, not an
+        absence — an absence is what a scenario looks like when it is fine."""
+        made = report(with_intro_and_outro(), 30.0)
+
+        outro = block(made, "outro")
+        assert outro.placed is False
+        assert "too short" in outro.note or "не поместил" in outro.note
+        assert [w.code for w in made.warnings if w.element_id == "outro"] == ["dropped"]
+
+    def test_an_element_pinned_to_the_end_moves_with_the_end(self):
+        """And is reported as pinned, so the timeline can draw it held to the
+        right edge rather than sitting at some number that looks arbitrary."""
+        made = report(with_intro_and_outro(), 120.0)
+
+        cta = block(made, "cta")
+        assert cta.at_sec == 115.0
+        assert cta.anchor == "end"
+
+    def test_the_three_lengths_agree_on_a_scenario_that_renders_whole(self):
+        made = report(with_intro_and_outro(), 90.0)
+
+        assert made.material_sec == 90.0
+        assert made.timeline_sec == 90.0
+        assert made.duration_sec == 90.0
+
+    def test_and_disagree_when_something_cannot_be_rendered_yet(self):
+        """A colour slot takes its place on the timeline and contributes
+        nothing to the file. An editor shown only the file's length would draw
+        a timeline that does not match its own blocks."""
+        scenario = with_intro_and_outro()
+        spine = scenario.tracks[0]
+        painted = dataclasses.replace(
+            spine.elements[0], slot=model.Slot(kind=model.SLOT_COLOR, color="#000")
+        )
+        scenario = dataclasses.replace(scenario, tracks=(
+            dataclasses.replace(spine, elements=(painted,) + spine.elements[1:]),
+        ) + scenario.tracks[1:])
+
+        made = report(scenario, 90.0)
+
+        assert made.timeline_sec == 90.0
+        assert made.duration_sec == 70.0
+        assert any(w.code == "unsupported_slot" for w in made.warnings)
+        assert block(made, "intro").note
+
+
+class TestWhatABlockSays:
+    def test_a_block_carries_its_slot_so_the_canvas_can_colour_it(self):
+        made = report(with_intro_and_outro(), 90.0)
+
+        cta = block(made, "cta")
+        assert (cta.slot_kind, cta.slot_tag) == (model.SLOT_LIBRARY, "cta")
+        assert cta.label == "CTA"
+        assert cta.track_kind == model.TRACK_OVERLAY
+
+    def test_the_spine_is_drawn_as_the_layout_it_becomes(self):
+        """Trap 32: the compiler reads the spine element's `fit` and gives
+        every segment the rectangle that layout names, dropping the rectangle
+        the element carried. Showing the element's own numbers would make the
+        editor draw a spine the renderer will not produce."""
+        bottom = (AssetOption(9, "/m/bg/loop.mp4", ("background",), 60.0),)
+        made = report(with_intro_and_outro(framing={"layout": "split"}), 90.0, assets=bottom)
+
+        assert made.layout == "split"
+        assert block(made, "source").frame.height == 50.0
+
+    def test_a_split_with_nothing_to_put_under_it_is_shown_falling_back(self):
+        """Not a failure and not a surprise on the rendered file: the editor
+        shows the blurred backdrop it will actually get, and the reason."""
+        made = report(with_intro_and_outro(framing={"layout": "split"}), 90.0)
+
+        assert made.layout == "blur"
+        assert block(made, "source").frame.height == 100.0
+        assert [w.code for w in made.warnings if w.code == "no_companion"] == ["no_companion"]
+
+    def test_an_overlay_keeps_its_own_rectangle(self):
+        scenario = with_intro_and_outro()
+        over = scenario.tracks[1]
+        cornered = dataclasses.replace(
+            over.elements[0],
+            frame=model.Frame(
+                x=model.Animated(75.0), y=model.Animated(20.0),
+                width=model.Animated(40.0), height=model.Animated(25.0),
+            ),
+        )
+        scenario = dataclasses.replace(scenario, tracks=(
+            scenario.tracks[0], dataclasses.replace(over, elements=(cornered,)),
+        ))
+
+        frame = block(report(scenario, 90.0), "cta").frame
+
+        assert (frame.x, frame.y, frame.width, frame.height) == (75.0, 20.0, 40.0, 25.0)
+
+    def test_a_muted_track_is_reported_as_not_placed(self):
+        scenario = with_intro_and_outro()
+        scenario = dataclasses.replace(scenario, tracks=(
+            scenario.tracks[0], dataclasses.replace(scenario.tracks[1], muted=True),
+        ))
+
+        cta = block(report(scenario, 90.0), "cta")
+
+        assert cta.placed is False
+        assert "выключена" in cta.note
+
+
+class TestGhosts:
+    """A rule's output is where it fired on *this* material. Drawn dashed, and
+    reported separately from the blocks for exactly that reason (§8.2)."""
+
+    def spoken(self):
+        return (
+            AssetOption(1, "/m/broll/city.mp4", ("город",), 6.0),
+            AssetOption(2, "/m/broll/code.mp4", ("код",), 5.0),
+        )
+
+    def with_broll(self) -> model.Scenario:
+        scenario = with_intro_and_outro(inserts={"enabled": True})
+        rule = model.RuleElement(
+            id="broll", rule=model.RULE_KEYWORD_BROLL, label="b-roll по словам", limit=4,
+        )
+        over = scenario.tracks[1]
+        return dataclasses.replace(scenario, tracks=(
+            scenario.tracks[0],
+            dataclasses.replace(over, elements=over.elements + (rule,)),
+        ))
+
+    def test_a_rule_fires_where_the_words_are(self):
+        made = report(self.with_broll(), 90.0, assets=self.spoken())
+
+        ghosts = next(rule for rule in made.rules if rule.element_id == "broll").ghosts
+        assert ghosts, "the library says the words the mock speaks"
+        assert all(ghost.kind == "layer" for ghost in ghosts)
+        assert all(0.0 <= ghost.at_sec <= made.duration_sec for ghost in ghosts)
+
+    def test_an_empty_library_fires_nothing_and_says_nothing_else(self):
+        """A b-roll rule that can never fire should look exactly like that.
+        Inventing fragments to make the picture busier would hide the one
+        thing worth seeing."""
+        made = report(self.with_broll(), 90.0)
+
+        rule = next(item for item in made.rules if item.element_id == "broll")
+        assert rule.ghosts == ()
+        assert rule.rule == model.RULE_KEYWORD_BROLL
+        assert rule.limit == 4
+
+    def test_a_rule_is_not_a_block(self):
+        made = report(self.with_broll(), 90.0, assets=self.spoken())
+
+        assert "broll" not in {item.element_id for item in made.blocks}
+
+
+class TestTheInventedClip:
+    def test_its_joins_become_the_windows_the_spine_is_laid_out_over(self):
+        """A mock with no cuts has to say so as one window rather than leave
+        it empty: empty means "nothing was measured", and the spine would be
+        laid out over the raw length instead (trap 22)."""
+        scenario = dataclasses.replace(
+            with_intro_and_outro(), mock=model.MockClip(cuts=(10.0, 25.0)),
+        )
+
+        facts = mock.facts(scenario, 40.0)
+
+        assert facts.keep == ((0.0, 10.0), (10.0, 25.0), (25.0, 40.0))
+        assert facts.cuts == (10.0, 25.0)
+
+    def test_a_cut_past_the_end_is_not_a_cut(self):
+        scenario = dataclasses.replace(
+            with_intro_and_outro(), mock=model.MockClip(cuts=(10.0, 500.0)),
+        )
+
+        assert mock.facts(scenario, 40.0).keep == ((0.0, 10.0), (10.0, 40.0))
+
+    def test_it_says_the_words_the_library_is_tagged_with(self):
+        assets = (AssetOption(1, "/m/a.mp4", ("город", "код"), 5.0),)
+
+        facts = mock.facts(with_intro_and_outro(), 30.0, assets=assets)
+
+        spoken = {word["text"] for line in facts.speech for word in line["words"]}
+        assert spoken == {"город", "код"}
+
+    def test_and_neutral_filler_when_there_are_none(self):
+        """Neutral on purpose: material that says real words invites reading
+        meaning into where a rule happened to fire."""
+        facts = mock.facts(with_intro_and_outro(), 30.0)
+
+        spoken = {word["text"] for line in facts.speech for word in line["words"]}
+        assert spoken == {"раз", "два", "три", "четыре"}
+
+    def test_a_mock_never_names_a_real_file(self):
+        """Nothing reads the mock's source, and one that named a path on disk
+        would eventually be handed to ffmpeg by somebody who did not know."""
+        assert mock.facts(with_intro_and_outro(), 30.0).source_path == mock.SOURCE
+
+    @pytest.mark.parametrize("duration", mock.DURATIONS)
+    def test_every_offered_length_compiles(self, duration):
+        made = report(with_intro_and_outro(), duration)
+
+        assert made.timeline_sec > 0
+        assert made.blocks
