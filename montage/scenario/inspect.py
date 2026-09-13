@@ -243,11 +243,15 @@ def _frame(
     library, a slot this renderer cannot draw — where what it *asked* for is
     the only thing left to show.
     """
+    given = made.frames.get(element.id)
     if track.kind == model.TRACK_SPINE:
-        frame = comp.frame_for_layout(made.layout)
+        # The spine's rectangle is its own when it has one, and the layout's
+        # when it does not — which is the compiler's rule, read here rather
+        # than repeated. A spine element that produced no segment at all falls
+        # through to what it asked for, below.
+        frame = given or comp.frame_for_layout(made.layout)
         return Rect(frame.x, frame.y, frame.width, frame.height, frame.fit)
 
-    given = made.frames.get(element.id)
     if given is None:
         own = element.frame
         return Rect(

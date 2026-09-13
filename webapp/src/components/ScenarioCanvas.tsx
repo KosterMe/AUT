@@ -13,10 +13,11 @@ import { SLOT_COLORS, findElement, numberOf } from "../pages/scenarioModel";
  * because a rectangle that waited for a round trip before following the mouse
  * is not direct manipulation, it is a form with a slow submit button.
  *
- * The spine is the exception and is not draggable. The compiler still reads
- * only its `fit` and gives every segment the rectangle that layout names
- * (trap 32), so letting somebody drag it would draw one thing and render
- * another. It says so rather than silently ignoring the mouse.
+ * The spine can be dragged like anything else now (trap 32 is closed): the
+ * rectangle it carries reaches the segments. What it cannot do is *move* —
+ * a segment is framed before the join, where every segment's clock starts
+ * again — so a spine with keyframes is refused by the compiler and drawn
+ * here as the still rectangle it will actually be.
  */
 export default function ScenarioCanvas({
   data,
@@ -45,11 +46,12 @@ export default function ScenarioCanvas({
     .sort((a, b) => a.z - b.z);
 
   function rectOf(block: InspectBlock): Rect {
-    // The spine is a layout rather than a rectangle (trap 32), and a moving
-    // element only exists at a moment — both come from the compile. The draft
-    // is consulted for anything still, and only so that dragging follows the
-    // mouse instead of the network.
-    if (block.track_kind === "spine" || block.frame.moving) {
+    // A spine left alone carries the default rectangle, which means "the
+    // layout decides" and comes back from the compile as whatever it decided;
+    // a moving element only exists at a moment. The draft is consulted for
+    // anything still and dragged, and only so that it follows the mouse
+    // instead of the network.
+    if ((block.track_kind === "spine" && !draggedSpine(data, block)) || block.frame.moving) {
       return {
         x: block.frame.x,
         y: block.frame.y,
@@ -74,7 +76,7 @@ export default function ScenarioCanvas({
     // A moving element is not dragged: its position at this moment is one
     // frame of a curve, and dropping it somewhere would have to mean editing
     // the curve — which is what the keyframe lane is for.
-    if (block.track_kind === "spine" || block.frame.moving) return;
+    if (block.frame.moving) return;
     event.preventDefault();
     event.stopPropagation();
     onSelect(block.element_id);
@@ -119,7 +121,7 @@ export default function ScenarioCanvas({
           const rect = rectOf(block);
           const isSelected = block.element_id === selected;
           const spine = block.track_kind === "spine";
-          const fixed = spine || block.frame.moving;
+          const fixed = block.frame.moving;
           return (
             <div
               key={block.element_id}
@@ -138,10 +140,10 @@ export default function ScenarioCanvas({
                 opacity: spine ? 0.85 : 0.9,
               }}
               title={
-                spine
-                  ? "Позвоночник рисуется раскладкой, а не прямоугольником"
-                  : block.frame.moving
-                    ? `${block.label}: это один кадр движения — правится ключами`
+                block.frame.moving
+                  ? `${block.label}: это один кадр движения — правится ключами`
+                  : spine && !draggedSpine(data, block)
+                    ? `${block.label}: рамку выбрала раскладка — потяните, и она станет вашей`
                     : block.label
               }
             >
@@ -241,4 +243,25 @@ function snap(rect: Rect, off: boolean): { rect: Rect; guides: { x: number[]; y:
     }
   }
   return { rect: { ...rect, x, y }, guides };
+}
+
+
+/**
+ * Whether the spine carries a rectangle somebody put there.
+ *
+ * The default rectangle is not "middle, full size": it is the compiler's way
+ * of saying the layout decides (`auto` meeting the shape of the source, a
+ * blurred backdrop, a split). Drawing the draft's numbers while that is true
+ * would show a full-canvas box over a picture that is actually contained in
+ * one — so until it is dragged, the spine is drawn from the compile.
+ */
+function draggedSpine(data: ScenarioData, block: InspectBlock): boolean {
+  const frame = findElement(data, block.element_id)?.frame;
+  if (!frame) return false;
+  return !(
+    numberOf(frame.x, 50) === 50 &&
+    numberOf(frame.y, 50) === 50 &&
+    numberOf(frame.width, 100) === 100 &&
+    numberOf(frame.height, 100) === 100
+  );
 }

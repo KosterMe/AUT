@@ -410,6 +410,60 @@ class TestSoundIsOneStructure:
         assert got.beds == ()
 
 
+class TestTheSpineIsARectangle:
+    """Trap 32, closed: what the spine element says about its rectangle now
+    reaches the segments, so an editor can let somebody drag it."""
+
+    def with_spine_frame(self, frame: sc.Frame) -> tuple:
+        scenario = sc.Scenario(
+            name="framed",
+            tracks=(
+                sc.Track(id="spine", kind=sc.TRACK_SPINE, elements=(
+                    sc.Element(
+                        id="source", duration=sc.Duration(mode=sc.DurationMode.ELASTIC),
+                        frame=frame,
+                    ),
+                )),
+            ),
+            style=style(),
+        )
+        return sc.compile(scenario, facts())
+
+    def test_the_default_rectangle_still_means_the_layout_decides(self):
+        """A scenario nobody has dragged anything in has to compile to the
+        graph it always did — `auto` meeting the shape of a wide source."""
+        got, _ = self.with_spine_frame(sc.Frame(fit=sc.FIT_AUTO))
+
+        assert got.spine[0].frame == comp.CONTAINED
+        assert got.spine[0].backdrop is True
+
+    def test_a_rectangle_of_its_own_is_taken_as_written(self):
+        got, _ = self.with_spine_frame(sc.Frame(
+            y=sc.Animated(30.0), width=sc.Animated(100.0), height=sc.Animated(60.0),
+        ))
+
+        frame = got.spine[0].frame
+        assert (frame.y, frame.width, frame.height) == (30.0, 100.0, 60.0)
+
+    def test_a_segments_height_is_a_number_rather_than_the_aspect_ratio(self):
+        """A layer may leave its height to the picture, because there is
+        something behind it to work it out against. A segment may not."""
+        got, _ = self.with_spine_frame(sc.Frame(
+            width=sc.Animated(60.0), height=sc.Animated(40.0),
+        ))
+
+        assert got.spine[0].frame.height == 40.0
+
+    def test_a_moving_spine_is_refused_with_the_reason(self):
+        got, notes = self.with_spine_frame(sc.Frame(x=sc.Animated(50.0, keys=(
+            sc.Keyframe(at=sc.Anchor(), value=20.0),
+            sc.Keyframe(at=sc.Anchor(mode=sc.AnchorMode.END), value=80.0),
+        ))))
+
+        assert got.spine[0].frame.motion is None
+        assert any(note.code == "no_spine_animation" for note in notes)
+
+
 class TestKeyframesReachTheRenderer:
     """Stage 6's floor: a keyframe written in a scenario has to arrive at the
     EDL as something the renderer can actually move, and everything else has

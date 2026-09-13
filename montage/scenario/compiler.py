@@ -139,6 +139,12 @@ def plan(scenario: model.Scenario, facts: fact_module.ClipFacts) -> Plan:
     # because "once per clip" is a property of the clip and not of one track.
     used: set[str] = set()
 
+    # Element id → the rectangle it was given. Filled as the spine and the
+    # layers are emitted, so the editor can be shown what the renderer got
+    # rather than a second opinion about it.
+    frames: dict[str, comp.Frame] = {}
+    keys: dict[str, dict[str, tuple[tuple[float, float, str], ...]]] = {}
+
     spine = _spine_elements(scenario, notes)
     laid = spine_layout.lay_out(
         spine,
@@ -159,7 +165,9 @@ def plan(scenario: model.Scenario, facts: fact_module.ClipFacts) -> Plan:
         ))
         frame_layout = LAYOUT_BLUR
 
-    segments = _segments(laid, facts, layout=frame_layout, notes=notes, used=used)
+    segments = _segments(
+        laid, facts, layout=frame_layout, notes=notes, used=used, frames=frames,
+    )
     if not segments:
         notes.append(CompileWarning(
             "empty_spine", "the spine placed nothing; used the whole clip as one segment"
@@ -179,8 +187,6 @@ def plan(scenario: model.Scenario, facts: fact_module.ClipFacts) -> Plan:
     # and a cue is what puts it there.
     cues = _cues(scenario, draft, facts)
     spans = _spans(scenario, laid, facts, cues, notes)
-    frames: dict[str, comp.Frame] = {}
-    keys: dict[str, dict[str, tuple[tuple[float, float, str], ...]]] = {}
     draft = dataclasses.replace(
         draft,
         layers=_bottom_half(companion, draft) + _layers(
@@ -524,6 +530,7 @@ def _segments(
     layout: str,
     notes: list[CompileWarning],
     used: set[str],
+    frames: dict[str, comp.Frame] | None = None,
 ) -> tuple[comp.Segment, ...]:
     """The spine as pieces of source, silence already taken out.
 
@@ -531,10 +538,19 @@ def _segments(
     single elastic `source` element — the shape every clip has today — gives
     exactly the segments `composition.single_source` gives.
 
-    How they fill the canvas is a rectangle now. A split screen's bottom half
-    is a layer across the whole clip rather than a second source on every
-    segment — it is background, and background that jumps back on every cut
-    above it draws the attention it is there not to draw.
+    How they fill the canvas is a rectangle — the element's own, when it has
+    one. A spine that was left alone carries the default rectangle, and that
+    is not "put the picture in the middle at full size": it means *the layout
+    decides*, which is how `auto` still meets the shape of the source and how
+    a scenario nobody has dragged anything in compiles to the graph it always
+    did. Drag the spine and the rectangle becomes yours, `blur`/`fill`/`split`
+    stop applying to it, and what is left of the canvas is still the
+    backdrop's business.
+
+    A split screen's bottom half is a layer across the whole clip rather than
+    a second source on every segment — it is background, and background that
+    jumps back on every cut above it draws the attention it is there not to
+    draw.
     """
     windows = list(facts.keep) or [(0.0, facts.duration_sec)]
     segments: list[comp.Segment] = []
@@ -549,6 +565,9 @@ def _segments(
         else:
             pieces = [(0.0, placement.duration_sec)]
 
+        frame = _spine_frame(element.frame, layout, notes)
+        if frames is not None:
+            frames[element.id] = frame
         for rel_start, rel_end in pieces:
             if rel_end - rel_start < comp.MIN_SEGMENT_SECONDS:
                 continue
@@ -556,10 +575,47 @@ def _segments(
                 source_path=path,
                 source_start_sec=round(base_sec + rel_start, 3),
                 source_end_sec=round(base_sec + rel_end, 3),
-                frame=comp.frame_for_layout(layout),
+                frame=frame,
                 backdrop=layout == LAYOUT_BLUR,
             ))
     return tuple(segments)
+
+
+def _spine_frame(
+    frame: model.Frame, layout: str, notes: list[CompileWarning]
+) -> comp.Frame:
+    """Where a piece of the spine sits in the canvas.
+
+    The default rectangle means the layout decides — see `_segments`. Anything
+    else is taken as written, height included: a segment's height is a real
+    number rather than the "let the aspect ratio work it out" a layer is
+    allowed to leave behind, because there is nothing behind a segment to work
+    it out against.
+
+    A spine that moves is still refused, and not for lack of a rectangle: a
+    segment is scaled and padded *before* the join, where `t` is the segment's
+    own clock and not the clip's, so an expression there would animate every
+    segment identically from its own zero. Layers are applied after the join,
+    which is why they can move and this cannot.
+    """
+    if frame.fills_canvas:
+        return comp.frame_for_layout(layout)
+    if not frame.is_static:
+        notes.append(CompileWarning(
+            "no_spine_animation",
+            "the spine cannot move: it is framed before the segments are "
+            "joined, where every segment's clock starts again. Put what moves "
+            "on a layer.",
+        ))
+    return comp.Frame(
+        x=frame.x.static,
+        y=frame.y.static,
+        width=frame.width.static,
+        height=frame.height.static,
+        fit=frame.fit if frame.fit != model.FIT_AUTO else "cover",
+        opacity=frame.opacity.static,
+        rotate=frame.rotate.static,
+    )
 
 
 def _take(
