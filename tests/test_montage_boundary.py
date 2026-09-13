@@ -100,3 +100,86 @@ class TestTheClientIsTheDoor:
         }
 
         assert {k: v for k, v in offenders.items() if v} == {}
+
+
+class TestEveryCallAcrossTheSeamFits:
+    """Arity, checked statically, on both sides of the door.
+
+    Trap 45: `client.preview` took `(output_path, spec, style)` while
+    `render_preview` took `(composition, output_path, spec)`, and both preview
+    endpoints raised `TypeError` in production while the suite stayed green —
+    because every test replaced the very function whose call was wrong.
+
+    This checks what no amount of patching can: that each call written down
+    actually fits the signature it is written against. It says nothing about
+    types, and it does not need to — the bug it exists for was arity, and so
+    are most of the others that survive a package boundary.
+    """
+
+    def calls(self, path: Path, modules: dict) -> list[str]:
+        import inspect
+
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        problems: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            owner = node.func.value
+            if not isinstance(owner, ast.Name) or owner.id not in modules:
+                continue
+            target = getattr(modules[owner.id], node.func.attr, None)
+            if target is None or not callable(target):
+                continue
+            if any(keyword.arg is None for keyword in node.keywords):
+                continue  # **kwargs at the call site: nothing to check here
+            if any(isinstance(argument, ast.Starred) for argument in node.args):
+                continue
+            try:
+                signature = inspect.signature(target)
+            except (TypeError, ValueError):  # pragma: no cover - builtins
+                continue
+            try:
+                signature.bind(
+                    *[inspect.Parameter.empty] * len(node.args),
+                    **{keyword.arg: None for keyword in node.keywords},
+                )
+            except TypeError as exc:
+                problems.append(f"{path.name}: {owner.id}.{node.func.attr}() — {exc}")
+        return problems
+
+    def test_the_door_fits_what_it_opens_onto(self):
+        """Every call `montage.client` makes into the package behind it."""
+        from montage import client
+        from montage import composition as comp
+        from montage import style as style_module
+        from montage.render import capabilities as build_capabilities
+        from montage.render import compiler
+        from montage.render import probe
+        from montage.scenario import builtin
+
+        modules = {
+            "comp": comp, "compiler": compiler, "probe": probe,
+            "style_module": style_module, "builtin": builtin,
+            "build_capabilities": build_capabilities, "scenario": client.scenario,
+        }
+        path = MONTAGE / "client.py"
+
+        assert self.calls(path, modules) == []
+
+    def test_aut_fits_the_door(self):
+        """And every call AUT makes into it, which is the other half of the
+        same mistake and the half that reaches a user."""
+        from montage import client
+
+        aut = MONTAGE.parent / "app"
+        callers = [
+            path for path in sorted(aut.rglob("*.py"))
+            if "from montage import client as montage" in path.read_text(encoding="utf-8")
+        ]
+        assert callers, "somebody renamed the import; this test is now blind"
+
+        problems = [
+            problem for path in callers for problem in self.calls(path, {"montage": client})
+        ]
+
+        assert problems == []
