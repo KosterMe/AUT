@@ -110,10 +110,10 @@ def render(
     # per clip spent confirming what putting them there already asserted.
     audio_by_source = {
         segment.source_path: ffprobe_has_audio(segment.source_path)
-        for segment in composition.segments
+        for segment in composition.spine
     }
     has_audio = (
-        any(audio_by_source.get(s.source_path, False) for s in composition.segments)
+        any(audio_by_source.get(s.source_path, False) for s in composition.spine)
         or composition.has_own_audio
     )
 
@@ -141,13 +141,13 @@ def render(
     )
     log.info(
         "rendered %s via %s: %d segment(s), %d insert(s), %d fragment(s) reused",
-        os.path.basename(output_path), chosen, len(composition.segments),
-        len(composition.inserts), reused,
+        os.path.basename(output_path), chosen, len(composition.spine),
+        len(composition.layers), reused,
     )
     return ClipRenderResult(
         output_path=output_path,
         output_duration=round(duration, 3),
-        segment_count=len(composition.segments),
+        segment_count=len(composition.spine),
         subtitles_path=subtitle_path,
         subtitle_count=subtitle_count,
         silence_removed_seconds=round(removed, 3),
@@ -218,9 +218,9 @@ def choose_strategy(composition: comp.Composition) -> str:
     if configured in (STRATEGY_ONE_PASS, STRATEGY_TWO_STAGE):
         return configured
 
-    if len(composition.segments) > settings.one_pass_max_segments:
+    if len(composition.spine) > settings.one_pass_max_segments:
         return STRATEGY_TWO_STAGE
-    if len(composition.inserts) > settings.one_pass_max_inserts:
+    if len(composition.layers) > settings.one_pass_max_inserts:
         return STRATEGY_TWO_STAGE
     if len(composition.layouts) > 1:
         return STRATEGY_TWO_STAGE
@@ -317,7 +317,7 @@ def plan_vertical_clip(
             style=look.subtitles,
         )
     return comp.Composition(
-        segments=draft.segments,
+        spine=draft.spine,
         canvas=canvas,
         subtitles=comp.SubtitleSpec(cues=tuple(cues), title_text=title_text),
         style=look,
@@ -368,7 +368,7 @@ def one_pass_args(
     video_labels: list[str] = []
     audio_labels: list[str] = []
 
-    for index, segment in enumerate(composition.segments):
+    for index, segment in enumerate(composition.spine):
         video_input = _add_input(inputs, segment.source_path,
                                  start=segment.source_start_sec, duration=segment.duration_sec)
         companion_input = None
@@ -393,8 +393,8 @@ def one_pass_args(
 
     video_label, audio_label = _concat(parts, video_labels, audio_labels if has_audio else [])
 
-    insert_chains, video_label = _insert_chains(composition, inputs, video_in=video_label)
-    parts.extend(insert_chains)
+    layer_chains, video_label = _layer_chains(composition, inputs, video_in=video_label)
+    parts.extend(layer_chains)
     parts.append(
         _look_chain(
             video_in=video_label, subtitle_path=subtitle_path, grade=composition.style.grade
@@ -422,8 +422,8 @@ def final_pass_args(
     """The second stage: inserts, look and audio over the joined segments."""
     inputs = ["-i", joined_path]
     parts: list[str] = []
-    insert_chains, video_label = _insert_chains(composition, inputs, video_in="0:v")
-    parts.extend(insert_chains)
+    layer_chains, video_label = _layer_chains(composition, inputs, video_in="0:v")
+    parts.extend(layer_chains)
     parts.append(
         _look_chain(
             video_in=video_label, subtitle_path=subtitle_path, grade=composition.style.grade
@@ -486,7 +486,7 @@ def _render_two_stage(
     settings = get_settings().render
     fragments: list[str] = []
     reused = 0
-    for index, segment in enumerate(composition.segments):
+    for index, segment in enumerate(composition.spine):
         path = fragment_path(composition.canvas, segment, framing=composition.style.framing)
         if settings.fragment_cache and os.path.exists(path) and os.path.getsize(path) > 2048:
             reused += 1
@@ -683,48 +683,63 @@ def _concat(
     return "vcat", ("acat" if has_audio else "")
 
 
-def _insert_chains(
+def _layer_chains(
     composition: comp.Composition, inputs: list[str], *, video_in: str
 ) -> tuple[list[str], str]:
-    """Lay every insert over the assembled video, in timeline order.
+    """Lay every layer over the assembled spine, bottom of the stack first.
 
-    Each insert is padded at the front with `tpad` so overlay always has a
-    frame available at the moment it becomes visible; `enable` does the actual
-    switching. Insert audio is dropped — the clip's own soundtrack keeps
-    running underneath, which is what keeps subtitles aligned.
+    `overlay` has no z of its own — it composites one picture onto another, in
+    the order it is applied — so the stack order *is* the order of these
+    filters, and `Composition.stack` is the single place that order is decided.
+
+    Each layer is padded at the front with `tpad` so overlay always has a frame
+    available at the moment it becomes visible; `enable` does the actual
+    switching. Layer audio is dropped: the clip's own soundtrack keeps running
+    underneath, which is what keeps subtitles aligned.
+
+    Where the old code branched on `broll_full` versus `broll_pip`, this reads
+    the layer's frame. The two kinds were a rectangle covering the canvas and a
+    rectangle in the corner, and a rectangle is something you can write down.
     """
     parts: list[str] = []
     current = video_in
     canvas = composition.canvas
-    policy = composition.style.inserts
-    for order, insert in enumerate(sorted(composition.inserts, key=lambda i: i.at_sec)):
-        index = _add_input(inputs, insert.source_path, start=insert.source_start_sec,
-                           duration=insert.duration_sec, still=insert.still)
+    for order, layer in enumerate(composition.stack):
+        index = _add_input(inputs, layer.source_path, start=layer.source_start_sec,
+                           duration=layer.duration_sec, still=layer.still)
         tag = f"ins{order}"
-        if insert.kind == comp.INSERT_FULL:
-            fit = (
-                f"scale={canvas.width}:{canvas.height}:force_original_aspect_ratio=increase,"
-                f"crop={canvas.width}:{canvas.height}"
-            )
-            position = "0:0"
-        else:
-            box_width = max(2, int(canvas.width * policy.pip_width_share) // 2 * 2)
-            fit = f"scale={box_width}:-2"
-            position = (
-                f"{canvas.width - box_width - policy.pip_margin_px}"
-                f":{int(canvas.height * policy.pip_top_share)}"
-            )
+        fit, position = _layer_geometry(layer.frame, canvas)
         parts.append(
             f"[{index}:v]fps={canvas.fps},{fit},setpts=PTS-STARTPTS,"
-            f"tpad=start_duration={filters.flt(insert.at_sec)}:start_mode=add:color=black[{tag}]"
+            f"tpad=start_duration={filters.flt(layer.at_sec)}:start_mode=add:color=black[{tag}]"
         )
         out = f"vins{order}"
         parts.append(
             f"[{current}][{tag}]overlay={position}:eof_action=pass:"
-            f"enable='between(t,{filters.flt(insert.at_sec)},{filters.flt(insert.end_sec)})'[{out}]"
+            f"enable='between(t,{filters.flt(layer.at_sec)},{filters.flt(layer.end_sec)})'[{out}]"
         )
         current = out
     return parts, current
+
+
+def _layer_geometry(frame: comp.Frame, canvas: comp.Canvas) -> tuple[str, str]:
+    """How to scale a layer and where to put it, from its frame.
+
+    A frame covering the canvas is scaled up and cropped — there is nothing
+    beside it to position against. Anything smaller keeps its aspect ratio
+    (`-2` lets ffmpeg choose the height, as the picture-in-picture always did)
+    and is placed by its top-left corner, which is the one number `overlay`
+    takes.
+    """
+    if frame.fills_canvas:
+        return (
+            f"scale={canvas.width}:{canvas.height}:force_original_aspect_ratio=increase,"
+            f"crop={canvas.width}:{canvas.height}",
+            "0:0",
+        )
+    left, top, width, height = frame.box(canvas)
+    fit = f"scale={width}:{height}" if height else f"scale={width}:-2"
+    return fit, f"{left}:{top}"
 
 
 def _look_chain(
@@ -767,32 +782,38 @@ def _audio_chains(
     voice = audio_in
     extra: list[str] = []
 
-    if composition.music is not None:
-        music = composition.music
-        # The voice is needed twice: once in the mix, once as the trigger that
-        # tells the compressor when to pull the music down.
-        parts.append(f"[{voice}]asplit=2[voicemix][voicekey]")
-        voice = "voicemix"
+    for order, bed in enumerate(composition.beds):
+        label = "bed" if order == 0 else f"bed{order}"
         index = _add_input(
-            inputs, music.source_path,
-            start=music.start_sec, duration=duration, loop=True,
+            inputs, bed.source_path,
+            start=bed.source_start_sec, duration=duration, loop=True,
         )
-        fade_out_start = max(0.0, duration - music.fade_out_sec)
+        fade_out_start = max(0.0, duration - bed.fade_out_sec)
         parts.append(
-            f"[{index}:a]{_conform()},volume={music.gain_db:.2f}dB,"
-            f"afade=t=in:st=0:d={filters.flt(music.fade_in_sec)},"
-            f"afade=t=out:st={filters.flt(fade_out_start)}:d={filters.flt(music.fade_out_sec)}"
-            "[bed]"
+            f"[{index}:a]{_conform()},volume={bed.gain_db:.2f}dB,"
+            f"afade=t=in:st=0:d={filters.flt(bed.fade_in_sec)},"
+            f"afade=t=out:st={filters.flt(fade_out_start)}:d={filters.flt(bed.fade_out_sec)}"
+            f"[{label}]"
         )
+        if not bed.ducks:
+            extra.append(label)
+            continue
+        # The voice is needed twice: once in the mix, once as the trigger that
+        # tells the compressor when to pull the bed down. Split once, however
+        # many beds ask to be ducked.
+        if voice == audio_in:
+            parts.append(f"[{voice}]asplit=2[voicemix][voicekey]")
+            voice = "voicemix"
+        ducked = "ducked" if order == 0 else f"ducked{order}"
         parts.append(
-            f"[bed][voicekey]sidechaincompress="
-            f"threshold={music.duck_threshold:.4f}:ratio={music.duck_ratio:.2f}:"
-            f"attack={music.duck_attack_ms:.2f}:release={music.duck_release_ms:.2f}:"
-            "makeup=1[ducked]"
+            f"[{label}][voicekey]sidechaincompress="
+            f"threshold={bed.duck_threshold:.4f}:ratio={bed.duck_ratio:.2f}:"
+            f"attack={bed.duck_attack_ms:.2f}:release={bed.duck_release_ms:.2f}:"
+            f"makeup=1[{ducked}]"
         )
-        extra.append("ducked")
+        extra.append(ducked)
 
-    for order, effect in enumerate(sorted(composition.effects, key=lambda e: e.at_sec)):
+    for order, effect in enumerate(sorted(composition.stingers, key=lambda e: e.at_sec)):
         index = _add_input(inputs, effect.source_path, start=0.0, duration=effect.duration_sec)
         label = f"sfx{order}"
         delay_ms = int(round(effect.at_sec * 1000))
@@ -888,7 +909,7 @@ def _cached_share(composition: comp.Composition) -> float:
         return 0.0
     cached = sum(
         segment.duration_sec
-        for segment in composition.segments
+        for segment in composition.spine
         if os.path.exists(
             fragment_path(composition.canvas, segment, framing=composition.style.framing)
         )

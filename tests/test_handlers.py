@@ -515,9 +515,9 @@ class TestRenderHandler:
         assert runner.run_once([TaskKind.RENDER]) is True
 
         composition = self.rendered_compositions[-1]
-        assert [insert.source_path for insert in composition.inserts] == [asset.path]
+        assert [insert.source_path for insert in composition.layers] == [asset.path]
         # Placed on the word itself, not somewhere near it.
-        assert composition.inserts[0].at_sec == 12.0
+        assert composition.layers[0].at_sec == 12.0
         # Using a fragment is recorded, so the next clip reaches for another one.
         db.expire_all()
         assert db.get(type(asset), asset.id).use_count == 1
@@ -531,7 +531,7 @@ class TestRenderHandler:
 
         assert runner.run_once([TaskKind.RENDER]) is True
 
-        assert self.rendered_compositions[-1].inserts == ()
+        assert self.rendered_compositions[-1].layers == ()
 
     def test_the_split_profile_puts_a_background_under_the_speaker(self, db, source_file):
         from app.services import assets
@@ -548,7 +548,7 @@ class TestRenderHandler:
 
         composition = self.rendered_compositions[-1]
         assert composition.layouts == frozenset({"split"})
-        assert composition.segments[0].companion_path == background.path
+        assert composition.spine[0].companion_path == background.path
 
     def test_a_split_screen_with_nothing_to_put_under_it_falls_back(self, db, source_file):
         """A missing background should cost the split screen, not the clip."""
@@ -578,11 +578,11 @@ class TestRenderHandler:
         assert runner.run_once([TaskKind.RENDER]) is True
 
         composition = self.rendered_compositions[-1]
-        assert composition.music is not None
-        assert composition.music.source_path == track.path
+        assert composition.beds
+        assert composition.beds[0].source_path == track.path
         # The b-roll appears at 12s, so the transition sound leads it.
-        assert [effect.source_path for effect in composition.effects] == [whoosh.path]
-        assert composition.effects[0].at_sec == pytest.approx(11.88)
+        assert [effect.source_path for effect in composition.stingers] == [whoosh.path]
+        assert composition.stingers[0].at_sec == pytest.approx(11.88)
 
     def test_a_soundtrack_is_recorded_as_used_like_any_other_asset(self, db, source_file):
         from app.services import assets
@@ -605,15 +605,15 @@ class TestRenderHandler:
 
         assert runner.run_once([TaskKind.RENDER]) is True
 
-        assert self.rendered_compositions[-1].music is None
-        assert self.rendered_compositions[-1].effects == ()
+        assert self.rendered_compositions[-1].beds == ()
+        assert self.rendered_compositions[-1].stingers == ()
 
     def test_a_library_without_music_leaves_the_clip_alone(self, db, source_file):
         self._planned_clip(db, source_file, render_options={"music": True, "sfx": True})
 
         assert runner.run_once([TaskKind.RENDER]) is True
 
-        assert self.rendered_compositions[-1].music is None
+        assert self.rendered_compositions[-1].beds == ()
 
     def test_a_failed_render_marks_only_that_clip(self, db, source_file, monkeypatch):
         from montage.render import compiler
@@ -1153,7 +1153,7 @@ class TestRenderedStyle(TestRenderHandler):
 
         db.expire_all()
         stored = json.loads(db.get(Clip, clip_id).composition_json)
-        assert stored["segments"]
+        assert stored["spine"]
         assert stored["style"]["delivery"]["width"] == 1080
         # And it loads back into the very thing that produced it.
         from montage import composition as comp

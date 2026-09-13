@@ -130,7 +130,7 @@ class TestTheDefaultScenarioIsTodaysMontage:
     def test_the_segments_are_the_kept_stretches_of_the_source(self):
         got, _ = sc.compile(sc.default(), facts())
 
-        assert [(s.source_start_sec, s.source_end_sec) for s in got.segments] == [
+        assert [(s.source_start_sec, s.source_end_sec) for s in got.spine] == [
             (10.0, 40.0), (42.0, 70.0), (72.0, 100.0),
         ]
 
@@ -158,30 +158,30 @@ class TestTheFitDecidesTheFrame:
     def test_auto_crops_a_source_already_shaped_like_the_canvas(self):
         got, _ = sc.compile(self.spined(sc.FIT_AUTO), facts(width=1080, height=1920))
 
-        assert got.segments[0].layout == comp.LAYOUT_FILL
+        assert got.spine[0].layout == comp.LAYOUT_FILL
 
     def test_auto_keeps_a_backdrop_behind_a_wide_one(self):
         got, _ = sc.compile(self.spined(sc.FIT_AUTO), facts())
 
-        assert got.segments[0].layout == comp.LAYOUT_BLUR
+        assert got.spine[0].layout == comp.LAYOUT_BLUR
 
     def test_a_source_of_unknown_shape_keeps_the_backdrop(self):
         """Cropping to a shape nobody measured is the worse guess."""
         got, _ = sc.compile(self.spined(sc.FIT_AUTO), facts(width=0, height=0))
 
-        assert got.segments[0].layout == comp.LAYOUT_BLUR
+        assert got.spine[0].layout == comp.LAYOUT_BLUR
 
     def test_cover_with_nothing_behind_it_fills_the_frame(self):
         got, _ = sc.compile(self.spined(sc.FIT_COVER, backdrop=False), facts())
 
-        assert got.segments[0].layout == comp.LAYOUT_FILL
+        assert got.spine[0].layout == comp.LAYOUT_FILL
 
     def test_an_explicit_layout_is_still_honoured(self):
         got, _ = sc.compile(
             self.spined(sc.FIT_AUTO, framing={"layout": comp.LAYOUT_FILL}), facts()
         )
 
-        assert got.segments[0].layout == comp.LAYOUT_FILL
+        assert got.spine[0].layout == comp.LAYOUT_FILL
 
 
 def talking() -> sc.Scenario:
@@ -236,7 +236,7 @@ class TestOverlaysAreAnchoredNotTimed:
             self.overlay(start=sc.Anchor(mode=sc.AnchorMode.START, value=3.0)), facts()
         )
 
-        assert (got.inserts[0].at_sec, got.inserts[0].duration_sec) == (3.0, 3.0)
+        assert (got.layers[0].at_sec, got.layers[0].duration_sec) == (3.0, 3.0)
 
     def test_an_overlay_before_the_end_moves_with_the_clip(self):
         """The reason anchors exist: the same element on two lengths of clip."""
@@ -245,8 +245,8 @@ class TestOverlaysAreAnchoredNotTimed:
         long_clip, _ = sc.compile(at_end, facts())
         short_clip, _ = sc.compile(at_end, facts(end_sec=30.0, keep=((0.0, 20.0),)))
 
-        assert long_clip.inserts[0].at_sec == 81.0     # a 86s spine after pauses
-        assert short_clip.inserts[0].at_sec == 15.0    # a 20s one
+        assert long_clip.layers[0].at_sec == 81.0     # a 86s spine after pauses
+        assert short_clip.layers[0].at_sec == 15.0    # a 20s one
 
     def test_an_overlay_on_a_spoken_word_lands_on_the_word(self):
         """On the word and not on its line: karaoke cues are split per word
@@ -260,17 +260,18 @@ class TestOverlaysAreAnchoredNotTimed:
 
         got, notes = sc.compile(on_word, facts())
 
-        assert got.inserts[0].at_sec == 3.5
+        assert got.layers[0].at_sec == 3.5
         assert [n.code for n in notes] == []
 
-    def test_a_full_frame_overlay_and_a_smaller_one_are_different_kinds(self):
+    def test_a_full_frame_overlay_and_a_smaller_one_are_different_shapes(self):
         full, _ = sc.compile(self.overlay(frame=sc.Frame()), facts())
         small, _ = sc.compile(
             self.overlay(frame=sc.Frame(width=sc.Animated(40.0), height=sc.Animated(30.0))),
             facts(),
         )
 
-        assert full.inserts[0].kind != small.inserts[0].kind
+        assert full.layers[0].frame.fills_canvas
+        assert not small.layers[0].frame.fills_canvas
 
     def test_an_overlay_runs_off_the_end_is_cut_short_and_says_so(self):
         late = self.overlay(
@@ -280,15 +281,15 @@ class TestOverlaysAreAnchoredNotTimed:
 
         got, notes = sc.compile(late, facts())
 
-        assert got.inserts[0].duration_sec == 1.0
+        assert got.layers[0].duration_sec == 1.0
         assert any(n.code == "duration" for n in notes)
 
     def test_a_backdrop_is_the_layout_and_not_a_blur_laid_over_the_clip(self):
         """Emitting it twice would put a blurred copy of the clip on the clip."""
         got, _ = sc.compile(sc.default(), facts())
 
-        assert got.inserts == ()
-        assert got.segments[0].layout == comp.LAYOUT_BLUR
+        assert got.layers == ()
+        assert got.spine[0].layout == comp.LAYOUT_BLUR
 
 
 class TestSlotsBecomePaths:
@@ -308,18 +309,18 @@ class TestSlotsBecomePaths:
     def test_a_tag_resolves_to_an_asset_carrying_it(self):
         got, _ = sc.compile(self.library("дорогу"), facts())
 
-        assert got.inserts[0].source_path == "/media/library/road.mp4"
+        assert got.layers[0].source_path == "/media/library/road.mp4"
 
     def test_rotation_takes_the_least_recently_used(self):
         """What stops one asset turning up in every clip of a job."""
         got, _ = sc.compile(self.library("broll"), facts())
 
-        assert got.inserts[0].source_path == "/media/library/machine.mp4"
+        assert got.layers[0].source_path == "/media/library/machine.mp4"
 
     def test_a_tag_nothing_carries_leaves_the_element_out_and_says_so(self):
         got, notes = sc.compile(self.library("самолёт"), facts())
 
-        assert got.inserts == ()
+        assert got.layers == ()
         assert [(n.code, n.element_id) for n in notes] == [("no_asset", "asset")]
 
     def test_the_same_clip_picks_the_same_asset_twice(self):
@@ -331,7 +332,7 @@ class TestSlotsBecomePaths:
         first, _ = sc.compile(scenario, facts())
         again, _ = sc.compile(scenario, facts())
 
-        assert first.inserts[0].source_path == again.inserts[0].source_path
+        assert first.layers[0].source_path == again.layers[0].source_path
 
     def test_a_text_slot_says_it_needs_a_layer_this_renderer_lacks(self):
         """Loudly: a montage that renders without the text somebody put in it
@@ -350,7 +351,7 @@ class TestSlotsBecomePaths:
 
         got, notes = sc.compile(scenario, facts())
 
-        assert got.inserts == ()
+        assert got.layers == ()
         assert any(n.code == "unsupported_slot" for n in notes)
 
 
@@ -358,8 +359,8 @@ class TestSoundIsOneStructure:
     def test_a_looping_ducked_element_is_the_music_bed(self):
         got, _ = sc.compile(talking(), facts())
 
-        assert got.music.source_path == "/media/library/bed.mp3"
-        assert got.music.duck_threshold == 0.03      # ducked by speech
+        assert got.beds[0].source_path == "/media/library/bed.mp3"
+        assert got.beds[0].duck_threshold == 0.03      # ducked by speech
 
     def test_an_element_that_is_not_ducked_says_so_in_the_only_way_v1_can(self):
         scenario = talking()
@@ -377,7 +378,7 @@ class TestSoundIsOneStructure:
         got, _ = sc.compile(scenario, facts())
 
         # A threshold above any signal is a compressor that never triggers.
-        assert got.music.duck_threshold == 1.0
+        assert got.beds[0].duck_threshold == 1.0
 
     def test_a_muted_track_contributes_nothing(self):
         scenario = talking()
@@ -390,14 +391,14 @@ class TestSoundIsOneStructure:
 
         got, _ = sc.compile(scenario, facts())
 
-        assert got.music is None
+        assert got.beds == ()
 
 
 class TestRulesExpandAgainstTheClip:
     def test_keyword_broll_lands_on_the_words_that_name_it(self):
         got, _ = sc.compile(talking(), facts())
 
-        assert [insert.source_path for insert in got.inserts] == [
+        assert [layer.source_path for layer in got.layers] == [
             "/media/library/machine.mp4", "/media/library/road.mp4",
         ]
 
@@ -406,21 +407,21 @@ class TestRulesExpandAgainstTheClip:
         got, _ = sc.compile(talking(), facts())
         spine = got.duration_sec
 
-        assert all(insert.at_sec >= 2.5 for insert in got.inserts)
-        assert sum(insert.duration_sec for insert in got.inserts) <= spine * 0.35
+        assert all(layer.at_sec >= 2.5 for layer in got.layers)
+        assert sum(layer.duration_sec for layer in got.layers) <= spine * 0.35
 
     def test_a_rule_with_an_empty_library_does_nothing_rather_than_failing(self):
         got, _ = sc.compile(talking(), facts(assets=()))
 
-        assert got.inserts == () and got.music is None
+        assert got.layers == () and got.beds == ()
 
     def test_sounds_land_on_the_cuts_once_the_broll_exists(self):
         """B-roll first, deliberately: an insert appearing is one of the
         moments a transition sound belongs on."""
         got, _ = sc.compile(talking(), facts())
 
-        assert got.effects
-        assert all(effect.source_path == "/media/library/whoosh.wav" for effect in got.effects)
+        assert got.stingers
+        assert all(effect.source_path == "/media/library/whoosh.wav" for effect in got.stingers)
 
     def test_a_rule_nobody_has_implemented_says_so(self):
         scenario = talking()
@@ -472,7 +473,7 @@ class TestAClipTooShortForTheScenario:
 
         got, notes = sc.compile(self.with_outro(optional=True), short)
 
-        assert got.segments
+        assert got.spine
         assert any(n.code == "dropped" and n.element_id == "outro" for n in notes)
 
     def test_an_outro_that_cannot_be_dropped_truncates_and_warns(self):
@@ -480,7 +481,7 @@ class TestAClipTooShortForTheScenario:
 
         got, notes = sc.compile(self.with_outro(optional=False), short)
 
-        assert got.segments
+        assert got.spine
         assert any(n.code == "truncated" for n in notes)
 
     def test_a_scenario_with_no_spine_says_so_rather_than_emitting_nothing(self):
@@ -488,7 +489,7 @@ class TestAClipTooShortForTheScenario:
 
         got, notes = sc.compile(empty, facts())
 
-        assert got.segments            # the whole clip, as a fallback
+        assert got.spine            # the whole clip, as a fallback
         assert {n.code for n in notes} >= {"no_spine", "empty_spine"}
 
 
@@ -509,7 +510,7 @@ class TestAnchorCyclesAreReported:
         got, notes = sc.compile(scenario, facts())
 
         assert any(n.code == "anchor_cycle" for n in notes)
-        assert got.segments      # and the clip is still made
+        assert got.spine      # and the clip is still made
 
 
 class TestASpineOfSeveralElements:
@@ -531,7 +532,7 @@ class TestASpineOfSeveralElements:
     def test_each_element_plays_its_own_material_in_turn(self):
         got, notes = sc.compile(self.hooked(), facts())
 
-        assert [s.source_path for s in got.segments] == [
+        assert [s.source_path for s in got.spine] == [
             "/media/library/machine.mp4", "/media/source.mp4",
             "/media/source.mp4", "/media/source.mp4",
         ]
@@ -541,7 +542,7 @@ class TestASpineOfSeveralElements:
         """86s of kept material, 5 of them spent on the hook, 81 left — and the
         kept windows are consumed in order rather than restarted."""
         got, _ = sc.compile(self.hooked(), facts())
-        source = [s for s in got.segments if s.source_path == "/media/source.mp4"]
+        source = [s for s in got.spine if s.source_path == "/media/source.mp4"]
 
         assert sum(s.duration_sec for s in source) == 81.0
         assert (source[0].source_start_sec, source[0].source_end_sec) == (10.0, 40.0)
@@ -550,7 +551,7 @@ class TestASpineOfSeveralElements:
     def test_a_hook_on_the_spine_pushes_the_clip_it_precedes(self):
         got, _ = sc.compile(self.hooked(), facts())
 
-        assert got.segments[0].duration_sec == 5.0
+        assert got.spine[0].duration_sec == 5.0
         assert got.duration_sec == 86.0
 
 
@@ -574,10 +575,10 @@ class TestTracksStackByTheirZ:
         got, _ = sc.compile(self.stacked(5, 1), facts())
 
         # Written 5 then 1; emitted 1 then 5, so 5 ends up on top.
-        assert [i.source_path for i in got.inserts] == [
+        assert [layer.source_path for layer in got.layers] == [
             "/media/library/machine.mp4", "/media/library/road.mp4",
         ]
-        assert len(got.inserts) == 2
+        assert len(got.layers) == 2
 
 
 class TestOneFragmentOncePerClip:
@@ -599,7 +600,7 @@ class TestOneFragmentOncePerClip:
     def test_two_slots_on_one_tag_take_different_assets(self):
         got, _ = sc.compile(self.layers(2), facts())
 
-        assert len({insert.source_path for insert in got.inserts}) == 2
+        assert len({layer.source_path for layer in got.layers}) == 2
 
     def test_a_library_too_small_repeats_rather_than_leaving_a_hole(self):
         """The same shot twice beats an element that renders as nothing."""
@@ -607,8 +608,8 @@ class TestOneFragmentOncePerClip:
 
         got, notes = sc.compile(self.layers(3), facts(assets=one_asset))
 
-        assert len(got.inserts) == 3
-        assert len({insert.source_path for insert in got.inserts}) == 1
+        assert len(got.layers) == 3
+        assert len({layer.source_path for layer in got.layers}) == 1
         assert not any(n.code == "no_asset" for n in notes)
 
     def test_the_spine_and_an_overlay_do_not_show_the_same_fragment(self):
@@ -629,7 +630,7 @@ class TestOneFragmentOncePerClip:
 
         got, _ = sc.compile(scenario, facts())
         from_library = {
-            s.source_path for s in got.segments if "library" in s.source_path
-        } | {i.source_path for i in got.inserts}
+            s.source_path for s in got.spine if "library" in s.source_path
+        } | {layer.source_path for layer in got.layers}
 
         assert len(from_library) == 2

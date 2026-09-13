@@ -43,8 +43,6 @@ from montage.rules import inserts as insert_planner
 from montage import subtitles as subtitle_builder
 from montage.scenario import anchors, facts as fact_module, layout as spine_layout, model
 from montage.style import (
-    INSERT_FULL,
-    INSERT_PIP,
     LAYOUT_AUTO,
     LAYOUT_BLUR,
     LAYOUT_FILL,
@@ -106,10 +104,10 @@ def compile(
         segments = comp.single_source(
             facts.source_path, start_sec=facts.start_sec, end_sec=facts.end_sec,
             layout=frame_layout, companion_path=companion,
-        ).segments
+        ).spine
 
     draft = comp.Composition(
-        segments=segments,
+        spine=segments,
         canvas=scenario.canvas,
         style=scenario.style,
     )
@@ -119,9 +117,8 @@ def compile(
     spans = _spans(scenario, laid, facts, cues, notes)
     draft = dataclasses.replace(
         draft,
-        inserts=_inserts(scenario, spans, facts, notes, used),
-        music=_music(scenario, spans, facts, notes, used),
-        effects=_effects(scenario, spans, facts, notes, used),
+        layers=_layers(scenario, spans, facts, notes, used),
+        audio=_audio(scenario, spans, facts, notes, used),
         subtitles=_subtitle_spec(scenario, cues, facts),
     )
     return _apply_rules(scenario, draft, facts, notes), tuple(notes)
@@ -512,13 +509,13 @@ def _overlays(scenario: model.Scenario, *kinds: str) -> tuple[tuple[model.Elemen
     return tuple((element, z) for element, z, _ in found)
 
 
-def _inserts(
+def _layers(
     scenario: model.Scenario,
     spans: dict[str, anchors.Span],
     facts: fact_module.ClipFacts,
     notes: list[CompileWarning],
     used: set[str],
-) -> tuple[comp.Insert, ...]:
+) -> tuple[comp.Layer, ...]:
     """Picture laid over the assembled video.
 
     A backdrop is not one of these. `blur_of(the source)` is the blurred
@@ -526,8 +523,8 @@ def _inserts(
     read as the layout it is rather than emitted a second time on top of it —
     which would put a blurred copy of the clip over the clip.
     """
-    made: list[comp.Insert] = []
-    for element, _ in _overlays(scenario, model.TRACK_VIDEO, model.TRACK_OVERLAY):
+    made: list[comp.Layer] = []
+    for element, z in _overlays(scenario, model.TRACK_VIDEO, model.TRACK_OVERLAY):
         if element.slot.kind == model.SLOT_BLUR_OF:
             continue
         span = spans.get(element.id)
@@ -537,15 +534,39 @@ def _inserts(
         if not path:
             continue
         _warn_unrenderable(element, notes)
-        made.append(comp.Insert(
-            kind=INSERT_FULL if element.frame.fills_canvas else INSERT_PIP,
+        made.append(comp.Layer(
             source_path=path,
             at_sec=span.start_sec,
             duration_sec=span.duration_sec,
             source_start_sec=source_start,
             still=still,
+            frame=_edl_frame(element.frame),
+            z=z,
         ))
     return tuple(made)
+
+
+def _edl_frame(frame: model.Frame) -> comp.Frame:
+    """The scenario's frame as the EDL's: the static values it resolved to.
+
+    Two `Frame`s on purpose. The scenario's carries `Animated` values because
+    a scenario is written before the clip exists; the EDL's is what they came
+    out as for *this* clip, and an EDL that still held a curve would be a plan
+    rather than a description. Keyframes are dropped here with a warning
+    raised beside it — animating them is stage 6.
+    """
+    height = frame.height.static
+    return comp.Frame(
+        x=frame.x.static,
+        y=frame.y.static,
+        width=frame.width.static,
+        # A frame covering the canvas keeps its height; a smaller one leaves it
+        # to the aspect ratio, which is what a picture-in-picture always did.
+        height=height if frame.fills_canvas or height >= 100.0 else 0.0,
+        fit=frame.fit if frame.fit != model.FIT_AUTO else "cover",
+        opacity=frame.opacity.static,
+        rotate=frame.rotate.static,
+    )
 
 
 def _warn_unrenderable(element: model.Element, notes: list[CompileWarning]) -> None:
@@ -571,13 +592,32 @@ def _warn_unrenderable(element: model.Element, notes: list[CompileWarning]) -> N
         ))
 
 
-def _music(
+def _audio(
     scenario: model.Scenario,
     spans: dict[str, anchors.Span],
     facts: fact_module.ClipFacts,
     notes: list[CompileWarning],
     used: set[str],
-) -> comp.MusicBed | None:
+) -> tuple[comp.AudioTrack, ...]:
+    """Every sound this scenario makes, in one list.
+
+    A bed and a stinger are one structure with different values now, so there
+    is one function rather than two — which is the point of §3.1's third
+    paragraph: three entities that shared most of their fields are why adding
+    a fourth meant a fourth code path.
+    """
+    bed = _bed(scenario, spans, facts, notes, used)
+    stingers = _stingers(scenario, spans, facts, notes, used)
+    return ((bed,) if bed is not None else ()) + stingers
+
+
+def _bed(
+    scenario: model.Scenario,
+    spans: dict[str, anchors.Span],
+    facts: fact_module.ClipFacts,
+    notes: list[CompileWarning],
+    used: set[str],
+) -> comp.AudioTrack | None:
     """A bed under the whole clip: an audio element that loops and ducks."""
     for element, _ in _overlays(scenario, model.TRACK_AUDIO):
         if not (element.audio.enabled and element.audio.loop):
@@ -597,10 +637,11 @@ def _music(
             duck_attack_ms=policy.duck_attack_ms,
             duck_release_ms=policy.duck_release_ms,
         ) if element.audio.ducked_by_speech else {"duck_threshold": 1.0, "duck_ratio": 1.0}
-        return comp.MusicBed(
+        return comp.AudioTrack(
             source_path=path,
+            loop=True,
             gain_db=element.audio.gain_db.static or policy.music_gain_db,
-            start_sec=span.start_sec,
+            source_start_sec=span.start_sec,
             fade_in_sec=element.audio.fade_in_sec or policy.music_fade_in_sec,
             fade_out_sec=element.audio.fade_out_sec or policy.music_fade_out_sec,
             **ducking,
@@ -608,15 +649,15 @@ def _music(
     return None
 
 
-def _effects(
+def _stingers(
     scenario: model.Scenario,
     spans: dict[str, anchors.Span],
     facts: fact_module.ClipFacts,
     notes: list[CompileWarning],
     used: set[str],
-) -> tuple[comp.SoundEffect, ...]:
+) -> tuple[comp.AudioTrack, ...]:
     """One-shot sounds: audio elements that do not loop."""
-    made: list[comp.SoundEffect] = []
+    made: list[comp.AudioTrack] = []
     for element, _ in _overlays(scenario, model.TRACK_AUDIO):
         if not element.audio.enabled or element.audio.loop:
             continue
@@ -626,7 +667,7 @@ def _effects(
         path, _, _ = _path_of(element, facts, notes, used)
         if not path:
             continue
-        made.append(comp.SoundEffect(
+        made.append(comp.AudioTrack(
             source_path=path,
             at_sec=span.start_sec,
             duration_sec=span.duration_sec or 1.0,
@@ -699,7 +740,7 @@ def _apply_rules(
                 policy=_insert_policy(scenario, rule), seed=facts.seed,
             )
             if chosen:
-                changes["inserts"] = composition.inserts + chosen
+                changes["layers"] = composition.layers + chosen
 
     staged = dataclasses.replace(composition, **changes) if changes else composition
     for rule in rules:
@@ -708,7 +749,7 @@ def _apply_rules(
                 staged, assets=assets, policy=scenario.style.audio, seed=facts.seed,
             )
             if effects:
-                changes["effects"] = staged.effects + effects
+                changes["audio"] = staged.audio + effects
         elif rule.rule not in (model.RULE_KEYWORD_BROLL,):
             notes.append(CompileWarning(
                 "unimplemented_rule",

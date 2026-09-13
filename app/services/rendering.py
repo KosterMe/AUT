@@ -138,10 +138,8 @@ def compose_clip(
 
 def library_paths(composition: comp.Composition, companion_path: str | None) -> list[str]:
     """Every library file this clip actually used, for the rotation counter."""
-    paths = [insert.source_path for insert in composition.inserts]
-    paths.extend(effect.source_path for effect in composition.effects)
-    if composition.music is not None:
-        paths.append(composition.music.source_path)
+    paths = [layer.source_path for layer in composition.layers]
+    paths.extend(track.source_path for track in composition.audio)
     if companion_path:
         paths.append(companion_path)
     return paths
