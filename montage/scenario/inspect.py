@@ -26,6 +26,9 @@ class Rect:
     y: float = 50.0
     width: float = 100.0
     height: float = 100.0
+    # Degrees. Sampled like the rest, so a turning element is drawn turning
+    # rather than drawn still while the render turns it.
+    rotate: float = 0.0
     fit: str = model.FIT_AUTO
     # Whether this rectangle is one frame of a moving one. The editor draws a
     # moving element from here rather than from the draft, because the draft
@@ -250,7 +253,10 @@ def _frame(
         # than repeated. A spine element that produced no segment at all falls
         # through to what it asked for, below.
         frame = given or comp.frame_for_layout(made.layout)
-        return Rect(frame.x, frame.y, frame.width, frame.height, frame.fit)
+        return Rect(
+            x=frame.x, y=frame.y, width=frame.width, height=frame.height,
+            fit=frame.fit,
+        )
 
     if given is None:
         own = element.frame
@@ -264,13 +270,24 @@ def _frame(
     return Rect(
         x=curve.value_at(motion.x, at_sec, static=given.x) if motion else given.x,
         y=curve.value_at(motion.y, at_sec, static=given.y) if motion else given.y,
-        width=given.width,
+        width=(
+            curve.value_at(motion.width, at_sec, static=given.width)
+            if motion else given.width
+        ),
         # The EDL flattens a height smaller than the canvas to zero, meaning
         # "the aspect ratio decides" — which is true of the render and useless
         # to a canvas, since the height then depends on a picture the editor
         # has not got. The asked-for height is the closest true statement
         # available, and it is the number the operator typed.
-        height=given.height or element.frame.height.static,
+        height=(
+            curve.value_at(motion.height, at_sec, static=given.height)
+            if motion and motion.height
+            else given.height or element.frame.height.static
+        ),
+        rotate=(
+            curve.value_at(motion.rotate, at_sec, static=given.rotate)
+            if motion else given.rotate
+        ),
         fit=given.fit,
         moving=bool(motion and motion.moves),
     )

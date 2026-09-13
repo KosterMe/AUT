@@ -233,6 +233,7 @@ def _inspect(scenario_id: int, name: str, report: inspector.Report) -> ScenarioI
                 frame=InspectRect(
                     x=block.frame.x, y=block.frame.y,
                     width=block.frame.width, height=block.frame.height,
+                    rotate=block.frame.rotate,
                     fit=block.frame.fit, moving=block.frame.moving,
                 ),
                 z=block.z,

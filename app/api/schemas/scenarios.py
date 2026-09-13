@@ -94,6 +94,8 @@ class InspectRect(BaseModel):
     y: float
     width: float
     height: float
+    # Degrees, sampled at the report's moment like everything else here.
+    rotate: float = 0.0
     fit: str
     # One frame of a moving rectangle. The editor draws a moving element from
     # here rather than from its own copy of the draft, which only knows where

@@ -519,48 +519,57 @@ class TestKeyframesReachTheRenderer:
             (round(clip - 2.0, 3), 50.0), (round(clip - 0.5, 3), 150.0),
         )
 
-    def test_what_still_cannot_move_says_which_half_was_dropped(self):
-        """Position animates on this build and the rest does not, cheaply
-        (§7.2). One warning saying "the keyframes were ignored" would read as
-        though nothing moved at all."""
+    def test_a_size_that_moves_reaches_the_edl_too(self):
+        """Measured on this build (§7.2): `scale` takes an expression with
+        `eval=frame`, and `overlay` then reads the layer's current `w`/`h`."""
+        got = self.moving(sc.Frame(width=sc.Animated(40.0, keys=(
+            sc.Keyframe(at=sc.Anchor(mode=sc.AnchorMode.START, value=0.0), value=20.0),
+            sc.Keyframe(at=sc.Anchor(mode=sc.AnchorMode.START, value=4.0), value=80.0),
+        ))))
+
+        assert got.layers[0].frame.motion.width == ((0.0, 20.0), (4.0, 80.0))
+        assert got.layers[0].frame.motion.resizes is True
+
+    def test_an_angle_that_moves_reaches_the_edl_in_degrees(self):
+        """Degrees here because that is what somebody types; the renderer
+        converts, because that is what ffmpeg reads."""
+        got = self.moving(sc.Frame(rotate=sc.Animated(0.0, keys=(
+            sc.Keyframe(at=sc.Anchor(mode=sc.AnchorMode.START, value=0.0), value=-15.0),
+            sc.Keyframe(at=sc.Anchor(mode=sc.AnchorMode.START, value=4.0), value=15.0),
+        ))))
+
+        assert got.layers[0].frame.motion.rotate == ((0.0, -15.0), (4.0, 15.0))
+
+    def test_opacity_is_the_one_that_still_cannot_move(self):
+        """And it says so. `geq` was measured at ×23 — a different
+        conversation from "does it work"."""
+        got, notes = sc.compile(
+            with_rule(),  # a plain spine; the overlay is added below
+            facts(),
+        )
+        element = sc.Element(
+            id="fading", slot=sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"),
+            duration=sc.Duration(mode=sc.DurationMode.FIXED, value=5.0),
+            frame=sc.Frame(opacity=sc.Animated(1.0, keys=(
+                sc.Keyframe(at=sc.Anchor(), value=0.2),
+                sc.Keyframe(at=sc.Anchor(mode=sc.AnchorMode.END), value=1.0),
+            ))),
+        )
         scenario = sc.Scenario(
-            name="growing",
+            name="fading",
             tracks=(
                 sc.Track(id="spine", kind=sc.TRACK_SPINE, elements=(
                     sc.Element(id="source", duration=sc.Duration(mode=sc.DurationMode.ELASTIC)),
                 )),
-                sc.Track(id="over", kind=sc.TRACK_OVERLAY, z=1, elements=(
-                    sc.Element(
-                        id="zoom", slot=sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"),
-                        duration=sc.Duration(mode=sc.DurationMode.FIXED, value=5.0),
-                        frame=sc.Frame(
-                            x=sc.Animated(50.0, keys=(
-                                sc.Keyframe(at=sc.Anchor(), value=10.0),
-                                sc.Keyframe(
-                                    at=sc.Anchor(mode=sc.AnchorMode.START, value=3.0),
-                                    value=90.0,
-                                ),
-                            )),
-                            width=sc.Animated(40.0, keys=(
-                                sc.Keyframe(at=sc.Anchor(), value=40.0),
-                                sc.Keyframe(
-                                    at=sc.Anchor(mode=sc.AnchorMode.START, value=3.0),
-                                    value=80.0,
-                                ),
-                            )),
-                        ),
-                    ),
-                )),
+                sc.Track(id="over", kind=sc.TRACK_OVERLAY, z=1, elements=(element,)),
             ),
             style=style(),
         )
 
         got, notes = sc.compile(scenario, facts())
 
-        assert got.layers[0].frame.moves, "the position still moves"
-        dropped = [note for note in notes if note.code == "no_animation"]
-        assert len(dropped) == 1
-        assert "размер" in dropped[0].message
+        assert [n.code for n in notes if n.code == "no_animation"] == ["no_animation"]
+        assert "opacity" in next(n for n in notes if n.code == "no_animation").message
 
 
 class TestRulesExpandAgainstTheClip:

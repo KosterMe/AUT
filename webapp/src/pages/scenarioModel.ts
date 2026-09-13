@@ -308,10 +308,27 @@ function round(value: number): number {
 // keys by default and drags those; a key anchored to the end is shown and
 // respected but dragged by its offset, because that is the number it has.
 
-export const ANIMATABLE = ["x", "y"] as const;
+export const ANIMATABLE = ["x", "y", "width", "height", "rotate"] as const;
 export type Animatable = (typeof ANIMATABLE)[number];
 
-export const PROPERTY_LABELS: Record<Animatable, string> = { x: "по горизонтали", y: "по вертикали" };
+export const PROPERTY_LABELS: Record<Animatable, string> = {
+  x: "по горизонтали",
+  y: "по вертикали",
+  width: "ширина",
+  height: "высота",
+  rotate: "поворот",
+};
+
+/** What each property is worth when nothing has been said about it. */
+const RESTING: Record<Animatable, number> = {
+  x: 50,
+  y: 50,
+  width: 100,
+  // Zero is not "flat": it is "the aspect ratio decides", which is a
+  // different thing and the reason this table exists rather than one number.
+  height: 0,
+  rotate: 0,
+};
 
 export function keysOf(element: ScenarioElement, property: Animatable): ScenarioKeyframe[] {
   const value = element.frame?.[property];
@@ -320,7 +337,7 @@ export function keysOf(element: ScenarioElement, property: Animatable): Scenario
 }
 
 export function staticOf(element: ScenarioElement, property: Animatable): number {
-  return numberOf(element.frame?.[property], 50);
+  return numberOf(element.frame?.[property], RESTING[property]);
 }
 
 export function setKeys(
@@ -461,6 +478,28 @@ export const MOTION_PRESETS: {
     name: "Уезд вправо",
     hint: "Уходит за правый край в конце, прижато к концу клипа",
     apply: (data, id) => offscreenAtEnd(data, id, "x", 120),
+  },
+  {
+    name: "Зум 1.0→1.15",
+    hint: "Медленно наезжает, пока элемент на экране (§8.2)",
+    apply: (data, id) => {
+      const element = findElement(data, id);
+      if (!element) return data;
+      const from = staticOf(element, "width");
+      return setKeys(data, id, "width", [
+        { at: { mode: "start", value: 0 }, value: from, easing: "in_out" },
+        { at: { mode: "end", offset_sec: 0 }, value: Math.round(from * 1.15 * 10) / 10 },
+      ]);
+    },
+  },
+  {
+    name: "Доворот",
+    hint: "Приезжает под углом и выравнивается за полсекунды",
+    apply: (data, id) =>
+      setKeys(data, id, "rotate", [
+        { at: { mode: "start", value: 0 }, value: -8, easing: "out" },
+        { at: { mode: "start", value: 0.5 }, value: 0, easing: "linear" },
+      ]),
   },
   {
     name: "Проезд насквозь",

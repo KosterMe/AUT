@@ -137,6 +137,9 @@ export default function ScenarioCanvas({
                 top: `${rect.y - rect.height / 2}%`,
                 width: `${rect.width}%`,
                 height: `${rect.height}%`,
+                // Degrees, and the same angle the renderer turns it by — the
+                // sample comes from the compile rather than from the draft.
+                transform: block.frame.rotate ? `rotate(${block.frame.rotate}deg)` : undefined,
                 opacity: spine ? 0.85 : 0.9,
               }}
               title={
