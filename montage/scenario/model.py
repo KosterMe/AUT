@@ -352,6 +352,10 @@ class RuleElement:
     guard_head_sec: float = 2.5
     guard_tail_sec: float = 1.5
     max_share: float = 0.35
+    # What the editor writes under the dashed box — "by keyword, up to 4" —
+    # so the automation reads as part of the montage rather than as something
+    # that will happen later by itself (§5).
+    label: str = ""
 
     def __post_init__(self) -> None:
         if not self.id:

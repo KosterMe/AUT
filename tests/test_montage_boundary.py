@@ -82,7 +82,7 @@ class TestTheClientIsTheDoor:
         fields = {f.name: f.type for f in dataclasses.fields(client.ClipRequest)}
         assert set(fields) == {
             "source_path", "start_sec", "end_sec", "style", "speech",
-            "fallback_text", "title_text", "library", "seed",
+            "fallback_text", "title_text", "library", "seed", "index", "scenario",
         }
 
     def test_the_words_arrive_as_a_fact_rather_than_being_fetched(self):

@@ -637,10 +637,10 @@ def _bed(
     for element, _ in _overlays(scenario, model.TRACK_AUDIO):
         if not (element.audio.enabled and element.audio.loop):
             continue
+        chosen = _pick(element.slot, facts, used)
         path, _, _ = _path_of(element, facts, notes, used)
         if not path:
             continue
-        span = spans.get(element.id, anchors.Span(0.0, 0.0))
         policy = scenario.style.audio
         # v1 has no "ducked" flag: ducking is the sidechain compressor's
         # settings, and it is off when the compressor cannot trigger. A
@@ -656,12 +656,25 @@ def _bed(
             source_path=path,
             loop=True,
             gain_db=element.audio.gain_db.static or policy.music_gain_db,
-            source_start_sec=span.start_sec,
+            # Where in the *track* to begin, not where in the clip: a long bed
+            # always started from zero means every clip of a job opens on the
+            # same four bars. Stepping in by a seeded amount costs nothing and
+            # stays deterministic per clip — the same function the planner has
+            # always used, because this is the same decision.
+            source_start_sec=(
+                audio_planner._offset_into(chosen, _clip_duration(spans), facts.seed)
+                if chosen is not None else 0.0
+            ),
             fade_in_sec=element.audio.fade_in_sec or policy.music_fade_in_sec,
             fade_out_sec=element.audio.fade_out_sec or policy.music_fade_out_sec,
             **ducking,
         )
     return None
+
+
+def _clip_duration(spans: dict[str, anchors.Span]) -> float:
+    """How long the clip runs, from the spans already resolved against it."""
+    return round(max((span.end_sec for span in spans.values()), default=0.0), 3)
 
 
 def _stingers(

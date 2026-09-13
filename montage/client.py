@@ -30,9 +30,12 @@ from montage import style as style_module
 from montage import subtitles as subtitle_builder
 from montage.render import capabilities as build_capabilities
 from montage.render import compiler
+from montage import scenario
 from montage.render import probe
 from montage.rules import audio as audio_planner
 from montage.rules import inserts as insert_planner
+from montage.scenario import builtin
+from montage.scenario import model as scenario_model
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +75,10 @@ class ClipRequest:
     title_text: str = ""
     library: Library = field(default_factory=Library)
     seed: int = 0
+    index: int = 1
+    # Which montage to apply. A built-in by name today; a stored scenario once
+    # jobs carry a `scenario_id` rather than a profile (§9.2).
+    scenario: "scenario_model.Scenario | None" = None
 
 
 @dataclass(frozen=True)
@@ -80,29 +87,76 @@ class ClipPlan:
 
     composition: comp.Composition
     companion_path: str | None = None
+    # What the scenario could not do on this clip and did anyway: an outro
+    # dropped for want of room, a tag the library has nothing under. Warnings
+    # rather than failures, because losing the clip to say them is a poor trade.
+    notes: tuple[str, ...] = ()
+
+
+def scenario_for(name: str, style: style_module.StyleSpec) -> scenario_model.Scenario:
+    """The built-in scenario a profile name became."""
+    return builtin.for_profile(name, style)
+
+
+def wants_transcript(montage: scenario_model.Scenario) -> bool:
+    """Whether this montage needs to know what is said in the clip.
+
+    The one question worth asking across the seam before composing, because
+    the answer is worth tens of seconds of Whisper on a CPU. Subtitles want
+    words; so does b-roll, which is placed on the words that name it; so does
+    an anchor on a spoken word. A montage with none of those should never cause
+    a transcription, and this is how the caller finds out without guessing.
+    """
+    return scenario.FactKind.CUES in scenario.required_facts(montage)
 
 
 def compose(request: ClipRequest) -> ClipPlan:
-    """Everything between "this clip exists" and "hand it to ffmpeg"."""
-    plan = compiler.plan_vertical_clip(
-        request.source_path,
+    """Everything between "this clip exists" and "hand it to ffmpeg".
+
+    The scenario says what it needs to know about the clip, and only that is
+    measured. A montage with no subtitles never asks for word timings, so
+    nothing transcribes; one that keeps its pauses never runs `silencedetect`;
+    one source element with a fit is a single `ffprobe` and a render. That is
+    §6.1, and it is the reason this asks `required_facts` first rather than
+    probing everything and discarding half of it.
+    """
+    montage = request.scenario or scenario_for("talking", request.style)
+    needed = scenario.required_facts(montage)
+
+    provider = scenario.CachingProvider(sources={
+        scenario.FactKind.DIMENSIONS: lambda: _dimensions(request.source_path),
+        scenario.FactKind.HAS_AUDIO: lambda: probe.ffprobe_has_audio(request.source_path),
+        scenario.FactKind.CUTS: lambda: tuple(probe.montage_keep_segments(
+            request.source_path, start_sec=request.start_sec,
+            end_sec=request.end_sec, pacing=request.style.pacing,
+        ) or ()),
+        scenario.FactKind.ASSETS: lambda: tuple(request.library.options),
+        # The words are not measured here: ASR belongs to the cutter that needs
+        # it for its own work, and AUT hands them over as a fact.
+        scenario.FactKind.CUES: lambda: tuple(request.speech),
+    })
+    facts = scenario.facts.resolve(needed, provider, base=scenario.ClipFacts(
+        source_path=request.source_path,
         start_sec=request.start_sec,
         end_sec=request.end_sec,
-        style=request.style,
-        companion_path=request.library.companion_path,
-        transcript_segments=list(request.speech),
-        fallback_subtitle_text=request.fallback_text,
-        title_text=request.title_text,
-    )
-    dressed = dress(
-        plan,
-        request.library.options,
+        title=request.title_text or request.fallback_text,
+        index=request.index,
         seed=request.seed,
-        broll=request.style.inserts.enabled,
-        music=request.style.audio.music and request.style.audio.enabled,
-        sfx=request.style.audio.sfx and request.style.audio.enabled,
+    ))
+
+    composition, notes = scenario.compile(montage, facts)
+    for note in notes:
+        log.info("clip %s: %s", request.seed, note.message)
+    return ClipPlan(
+        composition=composition,
+        companion_path=request.library.companion_path,
+        notes=tuple(note.message for note in notes),
     )
-    return ClipPlan(composition=dressed, companion_path=request.library.companion_path)
+
+
+def _dimensions(source_path: str) -> tuple[int, int]:
+    probed = probe.probe_media(source_path)
+    return int(probed.get("width") or 0), int(probed.get("height") or 0)
 
 
 def dress(

@@ -28,6 +28,7 @@ from sqlmodel import Session
 from app.adapters.asr import cache as transcript_cache
 from app.adapters.asr import selection
 from app.domain import captions as caption_builder
+from app.domain import profiles
 from app.services import assets
 from montage import client as montage
 from montage import composition as comp
@@ -80,6 +81,7 @@ def compose_clip(
     job,
     options: dict[str, Any],
     style: style_module.StyleSpec,
+    scenario_name: str = profiles.DEFAULT,
     library: Library | None = None,
     seed: int | None = None,
     allow_transcription: bool = True,
@@ -96,16 +98,26 @@ def compose_clip(
     shelf = library or Library()
     clip_seed = seed if seed is not None else int(clip.id or 0)
 
-    _report(on_progress, "preparing_subtitles", 0.1)
-    subtitle_segments, subtitle_meta = selection.select_subtitle_transcript(
-        source_path,
-        fallback_segments=cached_segments(source_path, options.get("transcript_settings")),
-        start_sec=clip.start_sec,
-        end_sec=clip.end_sec,
-        enabled=style.subtitles.enabled,
-        job_transcript_model=options.get("transcript_settings"),
-        allow_transcription=allow_transcription,
-    )
+    scenario = montage.scenario_for(scenario_name, style)
+
+    # Asked before the words are fetched, not after. A montage with no
+    # subtitles and no keyword b-roll has no use for a transcript, and finding
+    # that out first is what stops a `film` job sending every one of its clips
+    # through Whisper — the slowest thing in the pipeline, for an answer
+    # nothing reads.
+    subtitle_segments: list = []
+    subtitle_meta: dict[str, Any] = {"source": "not_needed"}
+    if montage.wants_transcript(scenario):
+        _report(on_progress, "preparing_subtitles", 0.1)
+        subtitle_segments, subtitle_meta = selection.select_subtitle_transcript(
+            source_path,
+            fallback_segments=cached_segments(source_path, options.get("transcript_settings")),
+            start_sec=clip.start_sec,
+            end_sec=clip.end_sec,
+            enabled=style.subtitles.enabled,
+            job_transcript_model=options.get("transcript_settings"),
+            allow_transcription=allow_transcription,
+        )
 
     # The burned-in headline mirrors the caption's first line, so what a viewer
     # reads on the video and in the description agree.
@@ -117,6 +129,7 @@ def compose_clip(
 
     _report(on_progress, "planning_montage", 0.2)
     plan = montage.compose(montage.ClipRequest(
+        scenario=scenario,
         source_path=source_path,
         start_sec=clip.start_sec,
         end_sec=clip.end_sec,
@@ -126,6 +139,7 @@ def compose_clip(
         title_text=headline,
         library=shelf,
         seed=clip_seed,
+        index=clip.index,
     ))
 
     return ClipPlan(
