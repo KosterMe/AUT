@@ -410,6 +410,105 @@ class TestSoundIsOneStructure:
         assert got.beds == ()
 
 
+class TestKeyframesReachTheRenderer:
+    """Stage 6's floor: a keyframe written in a scenario has to arrive at the
+    EDL as something the renderer can actually move, and everything else has
+    to keep compiling to exactly what it compiled to before."""
+
+    def moving(self, frame: sc.Frame) -> comp.Composition:
+        element = sc.Element(
+            id="mover", slot=sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"),
+            start=sc.Anchor(mode=sc.AnchorMode.START, value=0.0),
+            duration=sc.Duration(mode=sc.DurationMode.FIXED, value=10.0),
+            frame=frame,
+        )
+        scenario = sc.Scenario(
+            name="moving",
+            tracks=(
+                sc.Track(id="spine", kind=sc.TRACK_SPINE, elements=(
+                    sc.Element(id="source", duration=sc.Duration(mode=sc.DurationMode.ELASTIC)),
+                )),
+                sc.Track(id="over", kind=sc.TRACK_OVERLAY, z=1, elements=(element,)),
+            ),
+            style=style(),
+        )
+        got, _ = sc.compile(scenario, facts())
+        return got
+
+    def test_a_still_overlay_carries_no_motion_at_all(self):
+        """`is_static` is not decoration: a scenario without animation must
+        not pay for animation it does not have (§4.3)."""
+        got = self.moving(sc.Frame(x=sc.Animated(25.0)))
+
+        assert got.layers[0].frame.motion is None
+        assert got.layers[0].frame.moves is False
+
+    def test_keyframes_become_a_polyline_in_output_seconds(self):
+        got = self.moving(sc.Frame(x=sc.Animated(0.0, keys=(
+            sc.Keyframe(at=sc.Anchor(mode=sc.AnchorMode.START, value=0.0), value=-20.0),
+            sc.Keyframe(at=sc.Anchor(mode=sc.AnchorMode.START, value=4.0), value=120.0),
+        ))))
+
+        assert got.layers[0].frame.motion.x == ((0.0, -20.0), (4.0, 120.0))
+        assert got.layers[0].frame.motion.y == ()
+
+    def test_an_anchored_keyframe_moves_with_the_clip(self):
+        """The reason a keyframe carries an anchor: "leave half a second
+        before the end" has to mean that on a clip of any length."""
+        got = self.moving(sc.Frame(x=sc.Animated(50.0, keys=(
+            sc.Keyframe(at=sc.Anchor(mode=sc.AnchorMode.END, offset_sec=-2.0), value=50.0),
+            sc.Keyframe(at=sc.Anchor(mode=sc.AnchorMode.END, offset_sec=-0.5), value=150.0),
+        ))))
+
+        clip = got.duration_sec
+        assert got.layers[0].frame.motion.x == (
+            (round(clip - 2.0, 3), 50.0), (round(clip - 0.5, 3), 150.0),
+        )
+
+    def test_what_still_cannot_move_says_which_half_was_dropped(self):
+        """Position animates on this build and the rest does not, cheaply
+        (§7.2). One warning saying "the keyframes were ignored" would read as
+        though nothing moved at all."""
+        scenario = sc.Scenario(
+            name="growing",
+            tracks=(
+                sc.Track(id="spine", kind=sc.TRACK_SPINE, elements=(
+                    sc.Element(id="source", duration=sc.Duration(mode=sc.DurationMode.ELASTIC)),
+                )),
+                sc.Track(id="over", kind=sc.TRACK_OVERLAY, z=1, elements=(
+                    sc.Element(
+                        id="zoom", slot=sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"),
+                        duration=sc.Duration(mode=sc.DurationMode.FIXED, value=5.0),
+                        frame=sc.Frame(
+                            x=sc.Animated(50.0, keys=(
+                                sc.Keyframe(at=sc.Anchor(), value=10.0),
+                                sc.Keyframe(
+                                    at=sc.Anchor(mode=sc.AnchorMode.START, value=3.0),
+                                    value=90.0,
+                                ),
+                            )),
+                            width=sc.Animated(40.0, keys=(
+                                sc.Keyframe(at=sc.Anchor(), value=40.0),
+                                sc.Keyframe(
+                                    at=sc.Anchor(mode=sc.AnchorMode.START, value=3.0),
+                                    value=80.0,
+                                ),
+                            )),
+                        ),
+                    ),
+                )),
+            ),
+            style=style(),
+        )
+
+        got, notes = sc.compile(scenario, facts())
+
+        assert got.layers[0].frame.moves, "the position still moves"
+        dropped = [note for note in notes if note.code == "no_animation"]
+        assert len(dropped) == 1
+        assert "размер" in dropped[0].message
+
+
 class TestRulesExpandAgainstTheClip:
     def test_keyword_broll_lands_on_the_words_that_name_it(self):
         got, _ = sc.compile(talking(), facts())

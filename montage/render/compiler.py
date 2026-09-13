@@ -755,6 +755,7 @@ def _layer_geometry(frame: comp.Frame, canvas: comp.Canvas) -> tuple[str, str]:
             "0:0",
         )
     left, top, width, height = frame.box(canvas)
+    moving = _moving_position(frame, canvas, width=width, height=height)
     if not height:
         # No height asked for, so the aspect ratio decides it — `-2` keeps the
         # dimension even, which yuv420p requires.
@@ -768,7 +769,50 @@ def _layer_geometry(frame: comp.Frame, canvas: comp.Canvas) -> tuple[str, str]:
         )
     else:
         fit = f"scale={width}:{height}"
-    return fit, f"{left}:{top}"
+    return fit, moving or f"{left}:{top}"
+
+
+def _moving_position(
+    frame: comp.Frame, canvas: comp.Canvas, *, width: int, height: int
+) -> str:
+    """`overlay`'s x and y as expressions in `t`, when the frame moves.
+
+    Empty for a frame that does not, and that is the point: a composition
+    without animation has to compile to the string it compiled to before
+    animation existed, or every scenario starts paying for a feature it does
+    not use (§4.3). So the named form appears only where there is something to
+    name.
+
+    The curve is in per cent of the canvas, because that is what survives a
+    change of canvas; `overlay` wants pixels of the top-left corner, and the
+    conversion is `Frame.box`'s, applied point by point. The size does not
+    animate yet, so it is taken once.
+    """
+    motion = frame.motion
+    if motion is None or not motion.moves:
+        return ""
+
+    def horizontal(value: float) -> float:
+        return round(canvas.width * value / 100.0 - width / 2.0, 3)
+
+    def vertical(value: float) -> float:
+        # The same asymmetry `box` has: a layer whose height follows from its
+        # width is positioned by the number itself, because there is no height
+        # to take half of yet.
+        return round(
+            canvas.height * value / 100.0 - (height / 2.0 if height else 0.0), 3
+        )
+
+    left, top, _, _ = frame.box(canvas)
+    x = (
+        filters.polyline([(at, horizontal(value)) for at, value in motion.x])
+        if motion.x else str(left)
+    )
+    y = (
+        filters.polyline([(at, vertical(value)) for at, value in motion.y])
+        if motion.y else str(top)
+    )
+    return f"x='{x}':y='{y}'"
 
 
 def _look_chain(

@@ -209,6 +209,34 @@ def test_an_excerpt_moves_everything_laid_over_the_clip_with_it():
     assert window.stingers[0].at_sec == pytest.approx(1.2)
 
 
+def test_an_excerpt_moves_a_curve_onto_its_own_clock():
+    """A preview of a moving layer that showed it parked where it starts
+    would be a preview of the one thing it is there to check."""
+    composition = build(
+        layers=(
+            comp.Layer(
+                "/media/b.mp4", at_sec=11.0, duration_sec=2.0,
+                frame=comp.Frame(
+                    width=40.0,
+                    motion=comp.Motion(x=((11.0, -20.0), (13.0, 120.0))),
+                ),
+            ),
+        ),
+    )
+
+    window = comp.excerpt(composition, at_sec=10.0, duration_sec=4.0)
+
+    assert window.layers[0].frame.motion.x == ((1.0, -20.0), (3.0, 120.0))
+
+
+def test_an_excerpt_leaves_a_still_layer_exactly_as_it_was():
+    composition = build(layers=(comp.Layer("/media/b.mp4", at_sec=11.0, duration_sec=2.0),))
+
+    window = comp.excerpt(composition, at_sec=10.0, duration_sec=4.0)
+
+    assert window.layers[0].frame.motion is None
+
+
 def test_an_excerpt_advances_the_music_rather_than_restarting_it():
     """A preview of the last ten seconds should hear the part of the track
     that plays there."""

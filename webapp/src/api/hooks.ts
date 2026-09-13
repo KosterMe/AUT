@@ -27,8 +27,8 @@ export const keys = {
   styles: ["styles"] as const,
   styleDefaults: (profile?: string) => ["styles", "defaults", profile ?? "talking"] as const,
   scenarios: ["scenarios"] as const,
-  scenarioInspect: (fingerprint: string, duration: number) =>
-    ["scenarios", "inspect", duration, fingerprint] as const,
+  scenarioInspect: (fingerprint: string, duration: number, at: number) =>
+    ["scenarios", "inspect", duration, at, fingerprint] as const,
 };
 
 export function useScenarios() {
@@ -45,11 +45,15 @@ export function useScenarios() {
  * the renderer in exactly the small ways nobody notices until a clip is
  * wrong.
  */
-export function useScenarioInspect(data: ScenarioData | null, duration: number) {
+export function useScenarioInspect(
+  data: ScenarioData | null,
+  duration: number,
+  at = 0,
+) {
   const fingerprint = data ? JSON.stringify(data) : "";
   return useQuery({
-    queryKey: keys.scenarioInspect(fingerprint, duration),
-    queryFn: () => Scenarios.inspect(data as ScenarioData, duration),
+    queryKey: keys.scenarioInspect(fingerprint, duration, at),
+    queryFn: () => Scenarios.inspect(data as ScenarioData, duration, at),
     enabled: !!data,
     // A compile of the same draft at the same length is the same answer.
     staleTime: Infinity,

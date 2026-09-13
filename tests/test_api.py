@@ -669,6 +669,41 @@ class TestScenarioEditing:
 
         assert response.status_code == 422
 
+    def test_inspect_answers_for_the_moment_it_was_asked_about(self, client):
+        """Once something moves, "where is this" has no answer without "when".
+        The playhead is that when, and it comes back with the answer so a
+        canvas cannot draw one moment while believing it is another."""
+        data = self.a_scenario()
+        data["tracks"].append({
+            "id": "over",
+            "kind": "overlay",
+            "z": 2,
+            "elements": [{
+                "id": "mover",
+                # The source itself rather than the library: this test is
+                # about where a moving overlay is at a moment, and an empty
+                # library would leave it out before the question is asked.
+                "slot": {"kind": "source"},
+                "start": {"mode": "start", "value": 0},
+                "duration": {"mode": "fixed", "value": 10},
+                "frame": {"x": {"static": 0, "keys": [
+                    {"at": {"mode": "start", "value": 0}, "value": 0},
+                    {"at": {"mode": "start", "value": 10}, "value": 100},
+                ]}},
+            }],
+        })
+
+        def where(at: float) -> dict:
+            body = client.post(
+                "/api/scenarios/inspect",
+                json={"data": data, "duration_sec": 60, "at_sec": at},
+            ).json()
+            return next(b for b in body["blocks"] if b["element_id"] == "mover")
+
+        assert where(0.0)["frame"]["x"] == 0.0
+        assert where(5.0)["frame"]["x"] == 50.0
+        assert where(5.0)["frame"]["moving"] is True
+
     def test_inspecting_an_unknown_scenario_is_404(self, client):
         assert client.get("/api/scenarios/999/inspect").status_code == 404
 

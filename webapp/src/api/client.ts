@@ -195,9 +195,9 @@ export const Scenarios = {
    * rather than the id: the editor asks on every edit, and what it needs laid
    * out is what is on screen, not what was last written down.
    */
-  inspect: (data: ScenarioData, duration_sec?: number) =>
+  inspect: (data: ScenarioData, duration_sec?: number, at_sec = 0) =>
     api
-      .post<ScenarioInspect>("/scenarios/inspect", { data, duration_sec })
+      .post<ScenarioInspect>("/scenarios/inspect", { data, duration_sec, at_sec })
       .then((r) => r.data),
   /** «Примерить»: the draft on one real clip, small and fast. */
   preview: async (

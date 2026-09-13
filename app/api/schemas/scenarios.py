@@ -77,6 +77,10 @@ class ScenarioInspectRequest(BaseModel):
 
     data: dict[str, Any]
     duration_sec: Optional[float] = Field(default=None, ge=1.0, le=1800.0)
+    # Where the playhead is. It matters only once something moves: a canvas
+    # drawing a moving element where it starts, at every point of the
+    # timeline, draws a frame that exists for one instant of the clip.
+    at_sec: float = Field(default=0.0, ge=0.0)
 
 
 class InspectRect(BaseModel):
@@ -85,6 +89,22 @@ class InspectRect(BaseModel):
     width: float
     height: float
     fit: str
+    # One frame of a moving rectangle. The editor draws a moving element from
+    # here rather than from its own copy of the draft, which only knows where
+    # it starts.
+    moving: bool = False
+
+
+class InspectKey(BaseModel):
+    """One keyframe, at the second it resolved to on this clip."""
+
+    property: str
+    at_sec: float
+    value: float
+    easing: str = "linear"
+    # How the key was written, so a key held to the end reads as held to the
+    # end rather than as a number that happens to be large.
+    anchor: str = "start"
 
 
 class InspectBlock(BaseModel):
@@ -106,6 +126,7 @@ class InspectBlock(BaseModel):
     # fill it. This is the mistake the layout switcher exists to catch.
     placed: bool = True
     note: str = ""
+    keys: list[InspectKey] = Field(default_factory=list)
 
 
 class InspectGhost(BaseModel):
@@ -152,5 +173,7 @@ class ScenarioInspect(BaseModel):
     rules: list[InspectRule] = Field(default_factory=list)
     warnings: list[InspectWarning] = Field(default_factory=list)
     subtitle_count: int = 0
+    # The moment these rectangles are for.
+    at_sec: float = 0.0
     # The lengths worth a button in the editor.
     durations: list[float] = Field(default_factory=list)

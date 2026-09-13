@@ -173,6 +173,58 @@ class TestWhatABlockSays:
 
         assert (frame.x, frame.y, frame.width, frame.height) == (75.0, 20.0, 40.0, 25.0)
 
+    def test_a_resolved_overlay_reports_the_box_that_was_asked_for(self):
+        """The EDL flattens a height smaller than the canvas to zero — "the
+        aspect ratio decides" — which is true of the render and useless to a
+        canvas, which has no picture to take the ratio of."""
+        scenario = with_intro_and_outro()
+        over = scenario.tracks[1]
+        boxed = dataclasses.replace(
+            over.elements[0],
+            frame=model.Frame(
+                x=model.Animated(75.0), y=model.Animated(20.0),
+                width=model.Animated(40.0), height=model.Animated(25.0),
+            ),
+        )
+        scenario = dataclasses.replace(scenario, tracks=(
+            scenario.tracks[0], dataclasses.replace(over, elements=(boxed,)),
+        ))
+        library = (AssetOption(3, "/m/cta.mp4", ("cta",), 4.0),)
+
+        frame = block(report(scenario, 90.0, assets=library), "cta").frame
+
+        assert (frame.width, frame.height) == (40.0, 25.0)
+        assert frame.moving is False
+
+    def test_a_moving_overlay_is_reported_where_it_is_at_that_moment(self):
+        """A canvas showing a moving element where it starts, at every point
+        of the timeline, shows a frame that exists for one instant."""
+        scenario = with_intro_and_outro()
+        over = scenario.tracks[1]
+        sliding = dataclasses.replace(
+            over.elements[0],
+            start=model.Anchor(mode=model.AnchorMode.START, value=0.0),
+            duration=model.Duration(mode=model.DurationMode.FIXED, value=10.0),
+            frame=model.Frame(x=model.Animated(0.0, keys=(
+                model.Keyframe(at=model.Anchor(mode=model.AnchorMode.START, value=0.0),
+                               value=0.0),
+                model.Keyframe(at=model.Anchor(mode=model.AnchorMode.START, value=10.0),
+                               value=100.0),
+            ))),
+        )
+        scenario = dataclasses.replace(scenario, tracks=(
+            scenario.tracks[0], dataclasses.replace(over, elements=(sliding,)),
+        ))
+        library = (AssetOption(3, "/m/cta.mp4", ("cta",), 4.0),)
+        facts = mock.facts(scenario, 90.0, assets=library)
+
+        at_start = inspector.inspect(scenario, facts, at_sec=0.0)
+        halfway = inspector.inspect(scenario, facts, at_sec=5.0)
+
+        assert block(at_start, "cta").frame.x == 0.0
+        assert block(halfway, "cta").frame.x == 50.0
+        assert block(halfway, "cta").frame.moving is True
+
     def test_a_muted_track_is_reported_as_not_placed(self):
         scenario = with_intro_and_outro()
         scenario = dataclasses.replace(scenario, tracks=(

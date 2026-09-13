@@ -250,9 +250,17 @@ export interface PreviewRequest {
 // did not mean to set, so there is no second copy of the defaults here to
 // drift from the first.
 
+export interface ScenarioKeyframe {
+  /** Anchored rather than timed, like everything else about a scenario. */
+  at: ScenarioAnchor;
+  value: number;
+  /** How the value *leaves* this key: linear | in | out | in_out | step. */
+  easing?: string;
+}
+
 export interface ScenarioAnimated {
   static: number;
-  keys?: unknown[];
+  keys?: ScenarioKeyframe[];
 }
 
 /** A number the editor sets, as the model stores it. */
@@ -382,6 +390,16 @@ export interface InspectRect {
   width: number;
   height: number;
   fit: string;
+  /** One frame of a moving rectangle: sampled at the report's `at_sec`. */
+  moving: boolean;
+}
+
+export interface InspectKey {
+  property: string;
+  at_sec: number;
+  value: number;
+  easing: string;
+  anchor: string;
 }
 
 export interface InspectBlock {
@@ -400,6 +418,7 @@ export interface InspectBlock {
   /** False means it was dropped: it did not fit, or nothing could fill it. */
   placed: boolean;
   note: string;
+  keys: InspectKey[];
 }
 
 export interface InspectGhost {
@@ -438,6 +457,8 @@ export interface ScenarioInspect {
   rules: InspectRule[];
   warnings: InspectWarning[];
   subtitle_count: number;
+  /** The moment the rectangles above are for. */
+  at_sec: number;
   durations: number[];
 }
 
