@@ -506,6 +506,234 @@ class TestScenarios:
         assert body["profile"] == "talking"
 
 
+class TestScenarioEditing:
+    """The endpoints the editor is built on: save one, take it apart, try it.
+
+    `inspect` is the one that matters. It answers "what does this scenario do
+    on a clip of that length" by compiling it, so what the editor draws is
+    what the renderer will do rather than a second opinion about it.
+    """
+
+    def a_scenario(self, name: str = "Мой", **kwargs) -> dict:
+        from montage.scenario import model, store
+        from montage.style import StyleSpec
+
+        spine = model.Track(id="spine", kind=model.TRACK_SPINE, elements=(
+            model.Element(
+                id="intro", slot=model.Slot(kind=model.SLOT_SOURCE),
+                duration=model.Duration(mode=model.DurationMode.FIXED, value=20.0),
+                label="интро",
+            ),
+            model.Element(
+                id="source", slot=model.Slot(kind=model.SLOT_SOURCE),
+                duration=model.Duration(mode=model.DurationMode.ELASTIC, grow=1.0),
+            ),
+        ))
+        return store.to_dict(model.Scenario(
+            name=name, tracks=(spine,), style=StyleSpec.from_settings(), **kwargs
+        ))
+
+    def test_saving_one_and_reading_it_back(self, client):
+        created = client.post(
+            "/api/scenarios",
+            json={"name": "Мой", "description": "для тестов", "data": self.a_scenario()},
+        )
+
+        assert created.status_code == 201
+        body = client.get(f"/api/scenarios/{created.json()['id']}").json()
+        assert body["name"] == "Мой"
+        assert body["builtin"] is False
+        assert [track["id"] for track in body["data"]["tracks"]] == ["spine"]
+
+    def test_a_scenario_that_cannot_be_read_back_is_refused(self, client):
+        """Refusing here costs one request. Storing it costs every render that
+        points at it afterwards."""
+        response = client.post(
+            "/api/scenarios", json={"name": "Битый", "data": {"tracks": ["nope"]}},
+        )
+
+        assert response.status_code == 422
+
+    def test_editing_a_built_in_answers_with_the_copy(self, client):
+        """Not a refusal: the operator asked to change something, and "no"
+        would leave them without what they asked for. The response carries the
+        id that was written, which is not the one in the URL."""
+        talking = next(
+            row for row in client.get("/api/scenarios").json() if row["name"] == "talking"
+        )
+
+        saved = client.put(
+            f"/api/scenarios/{talking['id']}", json={"data": self.a_scenario("talking")},
+        ).json()
+
+        assert saved["id"] != talking["id"]
+        assert saved["builtin"] is False
+        assert client.get(f"/api/scenarios/{talking['id']}").json()["data"] != saved["data"]
+
+    def test_editing_your_own_edits_it(self, client):
+        mine = client.post(
+            "/api/scenarios", json={"name": "Мой", "data": self.a_scenario()}
+        ).json()
+
+        saved = client.put(
+            f"/api/scenarios/{mine['id']}",
+            json={"data": self.a_scenario(), "name": "Переименован", "description": "x"},
+        ).json()
+
+        assert saved["id"] == mine["id"]
+        assert saved["name"] == "Переименован"
+        assert saved["description"] == "x"
+
+    def test_a_built_in_cannot_be_deleted(self, client):
+        talking = next(
+            row for row in client.get("/api/scenarios").json() if row["name"] == "talking"
+        )
+
+        assert client.delete(f"/api/scenarios/{talking['id']}").status_code == 409
+
+    def test_your_own_can(self, client):
+        mine = client.post(
+            "/api/scenarios", json={"name": "Мой", "data": self.a_scenario()}
+        ).json()
+
+        assert client.delete(f"/api/scenarios/{mine['id']}").status_code == 204
+        assert client.get(f"/api/scenarios/{mine['id']}").status_code == 404
+
+    def test_inspecting_one_at_two_lengths_shows_it_behaving_differently(self, client):
+        """The layout switcher, end to end: the elastic middle takes what the
+        fixed intro leaves, and that is a different number on a short clip."""
+        mine = client.post(
+            "/api/scenarios", json={"name": "Мой", "data": self.a_scenario()}
+        ).json()
+
+        short = client.get(f"/api/scenarios/{mine['id']}/inspect?duration_sec=30").json()
+        long = client.get(f"/api/scenarios/{mine['id']}/inspect?duration_sec=180").json()
+
+        def source(body):
+            return next(b for b in body["blocks"] if b["element_id"] == "source")
+
+        assert source(short)["duration_sec"] == 10.0
+        assert source(long)["duration_sec"] == 160.0
+        assert short["durations"] == [30.0, 60.0, 90.0, 120.0, 180.0]
+
+    def test_inspect_reports_what_did_not_fit(self, client):
+        """A fixed 20-second intro on a 10-second clip: the intro is cut in
+        half and the material itself gets nothing. Invisible in a rendered
+        file until somebody watches it; two numbers and a warning here."""
+        mine = client.post(
+            "/api/scenarios", json={"name": "Мой", "data": self.a_scenario()}
+        ).json()
+
+        body = client.get(f"/api/scenarios/{mine['id']}/inspect?duration_sec=10").json()
+
+        blocks = {block["element_id"]: block for block in body["blocks"]}
+        assert blocks["intro"]["duration_sec"] == 10.0   # asked for 20
+        assert blocks["source"]["placed"] is False
+        assert blocks["source"]["note"]
+        assert any(w["code"] == "truncated" for w in body["warnings"])
+
+    def test_inspect_falls_back_to_the_scenarios_own_mock_length(self, client):
+        mine = client.post(
+            "/api/scenarios", json={"name": "Мой", "data": self.a_scenario()}
+        ).json()
+
+        body = client.get(f"/api/scenarios/{mine['id']}/inspect").json()
+
+        assert body["material_sec"] == 90.0
+
+    def test_inspecting_an_unknown_scenario_is_404(self, client):
+        assert client.get("/api/scenarios/999/inspect").status_code == 404
+
+    def test_trying_a_scenario_on_a_real_clip(self, client, db, monkeypatch):
+        """«Примерить»: composed by the code the real render uses, and the
+        scenario that reaches it is the one that was asked for."""
+        from app.api.routers import scenarios as scenarios_router
+        from app.domain.cutting import SliceSpec
+        from app.services import clip_jobs, clips
+        import os
+
+        source = os.path.join(os.environ["APP_VIDEOS_DIR"], "source.mp4")
+        with open(source, "wb") as handle:
+            handle.write(b"\x00" * 4096)
+        job = clip_jobs.create(
+            db, source_ref=source, source_platform="local", start_immediately=False
+        )
+        job.original_path = source
+        db.add(job)
+        db.flush()
+        clip = clips.plan(db, job.id, [SliceSpec(1, 0.0, 60.0, "headline", "words", 3)])[0]
+        db.commit()
+
+        mine = client.post(
+            "/api/scenarios", json={"name": "Мой", "data": self.a_scenario()}
+        ).json()
+
+        seen = {}
+
+        def fake_compose(**kwargs):
+            seen.update(kwargs)
+            return _plan_stub(kwargs["style"], source)
+
+        def fake_preview(composition, output_path, *, spec=None):
+            seen["spec"] = spec
+            with open(output_path, "wb") as handle:
+                handle.write(b"\x00" * 32)
+
+        monkeypatch.setattr(scenarios_router.rendering, "compose_clip", fake_compose)
+        monkeypatch.setattr(scenarios_router.rendering.montage, "preview", fake_preview)
+
+        response = client.post(
+            f"/api/scenarios/{mine['id']}/preview",
+            json={"clip_id": clip.id, "at_sec": 1.0, "duration_sec": 3.0},
+        )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "video/mp4"
+        assert seen["scenario"].name == "Мой"
+        assert seen["spec"].duration_sec == 3.0
+
+    def test_a_draft_is_previewed_without_being_saved(self, client, db, monkeypatch):
+        """What is on screen rather than what was last written down, which is
+        what somebody pressing the button means."""
+        from app.api.routers import scenarios as scenarios_router
+        from app.domain.cutting import SliceSpec
+        from app.services import clip_jobs, clips
+        import os
+
+        source = os.path.join(os.environ["APP_VIDEOS_DIR"], "source.mp4")
+        with open(source, "wb") as handle:
+            handle.write(b"\x00" * 4096)
+        job = clip_jobs.create(
+            db, source_ref=source, source_platform="local", start_immediately=False
+        )
+        job.original_path = source
+        db.add(job)
+        db.flush()
+        clip = clips.plan(db, job.id, [SliceSpec(1, 0.0, 60.0, "headline", "words", 3)])[0]
+        db.commit()
+        mine = client.post(
+            "/api/scenarios", json={"name": "Сохранённый", "data": self.a_scenario()}
+        ).json()
+
+        seen = {}
+        monkeypatch.setattr(
+            scenarios_router.rendering, "compose_clip",
+            lambda **kwargs: (seen.update(kwargs) or _plan_stub(kwargs["style"], source)),
+        )
+        monkeypatch.setattr(
+            scenarios_router.rendering.montage, "preview",
+            lambda composition, output_path, *, spec=None: open(output_path, "wb").write(b"\x00"),
+        )
+
+        client.post(
+            f"/api/scenarios/{mine['id']}/preview",
+            json={"clip_id": clip.id, "data": self.a_scenario("Черновик")},
+        )
+
+        assert seen["scenario"].name == "Черновик"
+        assert client.get(f"/api/scenarios/{mine['id']}").json()["name"] == "Сохранённый"
+
+
 class TestClipEndpoints:
     """Acting on one clip: read what it is made of, render it again, preview it.
 
@@ -594,7 +822,7 @@ class TestClipEndpoints:
             with open(output_path, "wb") as handle:
                 handle.write(b"\x00" * 32)
 
-        monkeypatch.setattr(clips_router.montage, "preview", fake_preview)
+        monkeypatch.setattr(clips_router.rendering.montage, "preview", fake_preview)
         monkeypatch.setattr(
             clips_router.rendering, "compose_clip",
             lambda **kwargs: _plan_stub(kwargs["style"], str(clip.video_path)),
@@ -641,7 +869,7 @@ class TestClipEndpoints:
             with open(output_path, "wb") as handle:
                 handle.write(b"\x00" * 32)
 
-        monkeypatch.setattr(clips_router.montage, "preview", fake_preview)
+        monkeypatch.setattr(clips_router.rendering.montage, "preview", fake_preview)
         monkeypatch.setattr(clips_router.rendering, "compose_clip", fake_compose)
 
         response = client.post(f"/api/clips/{clip.id}/preview", json={"at_sec": 1.0})
@@ -663,7 +891,7 @@ class TestClipEndpoints:
             with open(output_path, "wb") as handle:
                 handle.write(b"\x00" * 32)
 
-        monkeypatch.setattr(clips_router.montage, "preview", fake_preview)
+        monkeypatch.setattr(clips_router.rendering.montage, "preview", fake_preview)
         monkeypatch.setattr(
             clips_router.rendering, "compose_clip",
             lambda **kwargs: _plan_stub(kwargs["style"], str(clip.video_path)),
