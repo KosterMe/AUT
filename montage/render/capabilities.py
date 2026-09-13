@@ -162,6 +162,10 @@ NOISE = "anoisesrc=duration=2:amplitude=0.3"
 # which would have recorded a real defect for the wrong reason.
 PAN_W, PAN_H, PAN_N = 360, 640, 24
 PAN_SRC = f"smptebars=size={PAN_W}x{PAN_H}:rate={PAN_N}:duration=1"
+# A layer for the same canvas, at the same rate. A slower source would update
+# every second frame and the verdict would read "stepped" about the rates
+# rather than about the filter.
+PAN_LAYER = f"smptebars=size=128x128:rate={PAN_N}:duration=1"
 
 ANIMATION: tuple[Check, ...] = (
     Check(
@@ -216,6 +220,60 @@ ANIMATION: tuple[Check, ...] = (
         width=PAN_W,
         height=PAN_H,
         frames=PAN_N,
+    ),
+    Check(
+        key="scale_eval_frame",
+        label="масштаб через scale",
+        construction="scale=w='…t…':eval=frame",
+        graph=(
+            f"[0:v]scale=w='{PAN_W//4}+{PAN_W//2}*t':h=-2:eval=frame,"
+            f"pad={PAN_W}:{PAN_H}:0:0:black"
+        ),
+        sources=(PAN_SRC,),
+        width=PAN_W,
+        height=PAN_H,
+        frames=PAN_N,
+        note="размер слоя меняется на каждом кадре, а не только на старте",
+    ),
+    Check(
+        key="scale_and_move",
+        label="масштаб вместе с позицией",
+        construction="scale=…:eval=frame + overlay=x='…w…'",
+        graph=(
+            "[1:v]scale=w='8+40*t':h=-2:eval=frame[l];"
+            "[0:v][l]overlay=x='4+40*t-w/2':y='32-h/2'"
+        ),
+        sources=(BARS, PATCH),
+        note="overlay видит w/h слоя на текущем кадре, поэтому центрировать можно им же",
+    ),
+    Check(
+        key="rotation_box_frame",
+        label="поворот с коробкой по кадру",
+        construction="rotate=…:ow=rotw(…t…)",
+        graph=(
+            "[1:v]format=rgba,rotate=a='0.6*t':ow=rotw(0.6*t):oh=roth(0.6*t):c=none[l];"
+            "[0:v][l]overlay=x='(W-w)/2':y='(H-h)/2'"
+        ),
+        sources=(BARS, PATCH),
+    ),
+    Check(
+        key="rotation_box_max",
+        label="поворот с коробкой на предельный угол",
+        construction="rotate=a='…t…':ow=rotw(A):oh=roth(A):c=none",
+        graph=(
+            "[1:v]format=rgba,rotate=a='0.6*t':ow=rotw(0.6):oh=roth(0.6):c=none[l];"
+            "[0:v][l]overlay=x='(W-w)/2':y='(H-h)/2'"
+        ),
+        # A detailed layer rather than a flat one, and a canvas big enough for
+        # the first degree of turn to move a pixel: on a 16×16 patch the first
+        # two frames come out identical and the verdict would say "stepped"
+        # about the measurement rather than about ffmpeg.
+        sources=(PAN_SRC, PAN_LAYER),
+        width=PAN_W,
+        height=PAN_H,
+        frames=PAN_N,
+        note="ow/oh считаются один раз на старте, где t ещё нет — коробку берём по "
+             "максимальному углу кривой",
     ),
     Check(
         key="opacity_fade",
@@ -398,6 +456,9 @@ COST: tuple[Check, ...] = (
           "[0:v]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='255*(0.1+0.8*T)'"),
     _cost("cost_scale", "масштаб", "zoompan=z='…on…'",
           f"[0:v]zoompan=z='1+0.4*on/{COST_N}':d=1:s={COST_W}x{COST_H}:fps={COST_N}"),
+    _cost("cost_scale_eval", "масштаб через scale", "scale=w='…t…':eval=frame",
+          f"[0:v]scale=w='{COST_W // 2}+{COST_W // 4}*t':h=-2:eval=frame,"
+          f"pad={COST_W}:{COST_H}:0:0:black"),
     _cost("cost_blur", "размытие", "gblur=sigma=6",
           "[0:v]gblur=sigma=6"),
     _cost("cost_look", "look целиком", "eq,unsharp,vignette,format",

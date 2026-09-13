@@ -34,6 +34,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import logging
+import math
 import os
 import subprocess
 from dataclasses import dataclass
@@ -733,6 +734,11 @@ def _layer_geometry(frame: comp.Frame, canvas: comp.Canvas) -> tuple[str, str]:
     (`-2` lets ffmpeg choose the height, as the picture-in-picture always did)
     and is placed by its top-left corner, which is the one number `overlay`
     takes.
+
+    A frame that moves takes a second road, and only then: a composition
+    without animation has to compile to the string it compiled to before
+    animation existed, or every scenario starts paying for a feature it does
+    not use (§4.3).
     """
     if frame.fills_canvas:
         return (
@@ -741,7 +747,6 @@ def _layer_geometry(frame: comp.Frame, canvas: comp.Canvas) -> tuple[str, str]:
             "0:0",
         )
     left, top, width, height = frame.box(canvas)
-    moving = _moving_position(frame, canvas, width=width, height=height)
     if not height:
         # No height asked for, so the aspect ratio decides it — `-2` keeps the
         # dimension even, which yuv420p requires.
@@ -755,29 +760,113 @@ def _layer_geometry(frame: comp.Frame, canvas: comp.Canvas) -> tuple[str, str]:
         )
     else:
         fit = f"scale={width}:{height}"
-    return fit, moving or f"{left}:{top}"
+
+    if not frame.moves:
+        return fit, f"{left}:{top}"
+    return _moving_geometry(
+        frame, canvas, fit=fit, width=width, height=height, left=left, top=top,
+    )
+
+
+def _moving_geometry(
+    frame: comp.Frame,
+    canvas: comp.Canvas,
+    *,
+    fit: str,
+    width: int,
+    height: int,
+    left: int,
+    top: int,
+) -> tuple[str, str]:
+    """The chain and the position for a frame that moves.
+
+    Three constructions, each one measured on this build rather than read out
+    of the documentation (§7.2):
+
+    * `scale=w='…t…':eval=frame` resizes on every frame. `eval` defaults to
+      `init`, which is the whole difference between a layer that grows and a
+      layer that is simply the wrong size.
+    * `rotate=a='…t…'` turns it — but `ow`/`oh` are evaluated once, at a point
+      where `t` does not exist yet, so the box is cut for the widest angle the
+      curve reaches and the picture turns inside it.
+    * `overlay=x='…':y='…'` places it, and where the box changes size it is
+      placed by `w`/`h` — the layer's *current* dimensions — rather than by
+      numbers worked out in advance, which would be the size it used to be.
+    """
+    motion = frame.motion
+    assert motion is not None  # `frame.moves` is what got us here
+
+    chain = [fit]
+    if motion.width or motion.height:
+        chain = [_moving_scale(motion, canvas, width=width, height=height)]
+    if motion.rotate:
+        chain.append(_moving_rotate(motion))
+
+    return ",".join(chain), _moving_position(
+        motion, canvas, width=width, height=height, left=left, top=top,
+        sized_at_runtime=motion.resizes,
+    )
+
+
+def _moving_scale(
+    motion: comp.Motion, canvas: comp.Canvas, *, width: int, height: int
+) -> str:
+    """`scale` with an expression per side, for the sides that move."""
+    across = (
+        filters.polyline([
+            (at, round(canvas.width * value / 100.0, 3)) for at, value in motion.width
+        ])
+        if motion.width else str(width)
+    )
+    down = (
+        filters.polyline([
+            (at, round(canvas.height * value / 100.0, 3)) for at, value in motion.height
+        ])
+        if motion.height
+        # A layer that left its height to the aspect ratio keeps doing so
+        # while it grows: `-2` is not a size, it is "work it out and keep it
+        # even".
+        else (str(height) if height else "-2")
+    )
+    return f"scale=w='{across}':h='{down}':eval=frame"
+
+
+def _moving_rotate(motion: comp.Motion) -> str:
+    """`rotate` with an angle that moves, in a box cut for the widest one.
+
+    Degrees on the way in, because that is what somebody types; radians on the
+    way out, because that is what ffmpeg reads.
+    """
+    radians = filters.polyline([
+        (at, round(value * math.pi / 180.0, 6)) for at, value in motion.rotate
+    ])
+    widest = round(max(abs(value) for _, value in motion.rotate) * math.pi / 180.0, 6)
+    # `format=rgba` first: the corners the turn leaves empty have to be
+    # transparent, or the layer arrives as a black diamond.
+    return (
+        f"format=rgba,rotate=a='{radians}'"
+        f":ow=rotw({filters.flt(widest)}):oh=roth({filters.flt(widest)}):c=none"
+    )
 
 
 def _moving_position(
-    frame: comp.Frame, canvas: comp.Canvas, *, width: int, height: int
+    motion: comp.Motion,
+    canvas: comp.Canvas,
+    *,
+    width: int,
+    height: int,
+    left: int,
+    top: int,
+    sized_at_runtime: bool,
 ) -> str:
-    """`overlay`'s x and y as expressions in `t`, when the frame moves.
-
-    Empty for a frame that does not, and that is the point: a composition
-    without animation has to compile to the string it compiled to before
-    animation existed, or every scenario starts paying for a feature it does
-    not use (§4.3). So the named form appears only where there is something to
-    name.
+    """`overlay`'s x and y as expressions in `t`.
 
     The curve is in per cent of the canvas, because that is what survives a
-    change of canvas; `overlay` wants pixels of the top-left corner, and the
-    conversion is `Frame.box`'s, applied point by point. The size does not
-    animate yet, so it is taken once.
+    change of canvas; `overlay` wants pixels of the top-left corner. Where the
+    box keeps its size that conversion is arithmetic done here, once; where it
+    does not, it is written as an expression over `w`/`h` and ffmpeg does it
+    per frame.
     """
-    motion = frame.motion
-    if motion is None or not motion.moves:
-        return ""
-
     def horizontal(value: float) -> float:
         return round(canvas.width * value / 100.0 - width / 2.0, 3)
 
@@ -789,16 +878,36 @@ def _moving_position(
             canvas.height * value / 100.0 - (height / 2.0 if height else 0.0), 3
         )
 
-    left, top, _, _ = frame.box(canvas)
-    x = (
-        filters.polyline([(at, horizontal(value)) for at, value in motion.x])
-        if motion.x else str(left)
+    if not sized_at_runtime:
+        x = (
+            filters.polyline([(at, horizontal(value)) for at, value in motion.x])
+            if motion.x else str(left)
+        )
+        y = (
+            filters.polyline([(at, vertical(value)) for at, value in motion.y])
+            if motion.y else str(top)
+        )
+        return f"x='{x}':y='{y}'"
+
+    centre_x = (
+        filters.polyline([(at, value) for at, value in motion.x])
+        if motion.x else filters.flt(100.0 * (left + width / 2.0) / canvas.width)
     )
-    y = (
-        filters.polyline([(at, vertical(value)) for at, value in motion.y])
-        if motion.y else str(top)
+    # Whether `y` is the middle of the box or its top edge — the asymmetry
+    # `box` has, kept rather than quietly fixed while something else is being
+    # added. A height that moves is a height, so it centres.
+    centred = bool(height) or bool(motion.height)
+    centre_y = (
+        filters.polyline([(at, value) for at, value in motion.y])
+        if motion.y
+        else filters.flt(
+            100.0 * (top + (height / 2.0 if height and centred else 0.0)) / canvas.height
+        )
     )
-    return f"x='{x}':y='{y}'"
+    return (
+        f"x='({centre_x})*{canvas.width}/100-w/2'"
+        f":y='({centre_y})*{canvas.height}/100{'-h/2' if centred else ''}'"
+    )
 
 
 def _look_chain(

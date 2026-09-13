@@ -126,21 +126,35 @@ class Motion:
     happens rather than a plan somebody still has to interpret, and it is why
     the renderer needs one expression builder instead of one per easing.
 
-    Position only, for now, and the reason is measured rather than assumed
-    (§7.2): `overlay` takes expressions in `t` and animates on every frame;
-    scale needs `zoompan`, which counts frames rather than seconds; an
-    arbitrary opacity curve is `geq`, which costs ×23; rotation costs ×3.3 and
-    changes the box. Those wait for a pass of their own rather than arriving
-    half-working.
+    Position, size and rotation, and each one is here because the probe said
+    it animates on this build (§7.2): `overlay` takes expressions in `t`;
+    `scale` takes them too with `eval=frame`, and `overlay` can then read the
+    layer's current `w`/`h` to keep it centred; `rotate` takes one for the
+    angle but sizes its box once at the start, so the box is cut for the
+    widest angle the curve reaches.
+
+    Opacity is still missing, and for the same kind of reason the others are
+    here: an arbitrary alpha curve is `geq`, measured at ×23, which is a
+    different conversation from "does it work".
     """
 
     # (second of the output, value in per cent of the canvas)
     x: tuple[tuple[float, float], ...] = ()
     y: tuple[tuple[float, float], ...] = ()
+    width: tuple[tuple[float, float], ...] = ()
+    height: tuple[tuple[float, float], ...] = ()
+    # Degrees, because that is what somebody types. The renderer converts.
+    rotate: tuple[tuple[float, float], ...] = ()
 
     @property
     def moves(self) -> bool:
-        return bool(self.x or self.y)
+        return bool(self.x or self.y or self.width or self.height or self.rotate)
+
+    @property
+    def resizes(self) -> bool:
+        """Whether the box itself changes, which is what `overlay` has to
+        stop assuming when it places the layer."""
+        return bool(self.width or self.height or self.rotate)
 
 
 @dataclass(frozen=True)
@@ -748,7 +762,10 @@ def _shifted(frame: Frame, by: float) -> Frame:
         return frame
     def move(points: tuple[tuple[float, float], ...]) -> tuple[tuple[float, float], ...]:
         return tuple((round(at - by, 3), value) for at, value in points)
-    return replace(frame, motion=Motion(x=move(frame.motion.x), y=move(frame.motion.y)))
+    return replace(frame, motion=Motion(**{
+        name: move(getattr(frame.motion, name))
+        for name in ("x", "y", "width", "height", "rotate")
+    }))
 
 
 def _frame_dict(frame: Frame) -> dict[str, Any]:
@@ -760,8 +777,8 @@ def _frame_dict(frame: Frame) -> dict[str, Any]:
     data = _asdict(frame)
     motion = data.pop("motion", None)
     data["motion"] = None if motion is None else {
-        "x": [[at, value] for at, value in motion.x],
-        "y": [[at, value] for at, value in motion.y],
+        name: [[at, value] for at, value in getattr(motion, name)]
+        for name in ("x", "y", "width", "height", "rotate")
     }
     return data
 
@@ -778,7 +795,10 @@ def _frame_from(data: Any, default: Frame = FULL_FRAME) -> Frame:
 def _motion_from(data: Any) -> "Motion | None":
     if not isinstance(data, Mapping):
         return None
-    motion = Motion(x=_curve_from(data.get("x")), y=_curve_from(data.get("y")))
+    motion = Motion(**{
+        name: _curve_from(data.get(name))
+        for name in ("x", "y", "width", "height", "rotate")
+    })
     return motion if motion.moves else None
 
 

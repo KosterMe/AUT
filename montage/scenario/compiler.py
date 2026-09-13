@@ -694,7 +694,11 @@ def _layers(
             name: curve_module.resolved(
                 value, clip_duration_sec=length, facts=facts, placed=spans, cues=cues,
             )
-            for name, value in (("x", element.frame.x), ("y", element.frame.y))
+            for name, value in (
+                ("x", element.frame.x), ("y", element.frame.y),
+                ("width", element.frame.width), ("height", element.frame.height),
+                ("rotate", element.frame.rotate),
+            )
         }
         frame = _edl_frame(
             element.frame, clip_duration_sec=length,
@@ -741,17 +745,21 @@ def _edl_frame(
     """
     height = frame.height.static
     known = facts or fact_module.ClipFacts(end_sec=clip_duration_sec)
+    animated = (
+        ("x", frame.x), ("y", frame.y), ("width", frame.width),
+        ("height", frame.height), ("rotate", frame.rotate),
+    )
     resolved = keys if keys is not None else {
         name: curve_module.resolved(
             value, clip_duration_sec=clip_duration_sec, facts=known,
             placed=placed, cues=cues,
         )
-        for name, value in (("x", frame.x), ("y", frame.y))
+        for name, value in animated
     }
-    motion = comp.Motion(
-        x=curve_module.polyline(resolved.get("x", ())),
-        y=curve_module.polyline(resolved.get("y", ())),
-    )
+    motion = comp.Motion(**{
+        name: curve_module.polyline(resolved.get(name, ()))
+        for name, _ in animated
+    })
     return comp.Frame(
         x=frame.x.static,
         y=frame.y.static,
@@ -775,23 +783,15 @@ def _warn_unrenderable(element: model.Element, notes: list[CompileWarning]) -> N
     without the movement somebody put in it.
     """
     frame = element.frame
-    unmovable = [
-        name for name, value in (
-            ("размер", frame.width), ("высоту", frame.height),
-            ("поворот", frame.rotate), ("прозрачность", frame.opacity),
-        )
-        if not value.is_static
-    ]
-    if unmovable:
-        # Position animates on this build and the rest does not, cheaply
-        # (§7.2): scale wants `zoompan`, which counts frames rather than
-        # seconds; an arbitrary opacity curve is `geq` at ×23; rotation is
-        # ×3.3 and changes the box. Saying which half was dropped beats one
-        # warning that makes it sound as though nothing moved.
+    if not frame.opacity.is_static:
+        # Position, size and rotation all animate on this build; an arbitrary
+        # opacity curve is `geq`, measured at ×23 (§7.2), which is a different
+        # conversation from "does it work". Saying which one was dropped beats
+        # a warning that sounds as though nothing moved.
         notes.append(CompileWarning(
             "no_animation",
-            "this renderer moves an overlay but does not yet animate its "
-            + ", ".join(unmovable) + "; those keyframes were ignored",
+            "this renderer moves an overlay, resizes it and turns it, but "
+            "cannot yet animate its opacity; those keyframes were ignored",
             element.id,
         ))
     if element.effects:

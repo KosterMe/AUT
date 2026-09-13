@@ -299,6 +299,57 @@ def test_the_expression_is_held_at_both_ends_rather_than_extrapolated():
     assert graph.rstrip().count("1080.000)") >= 1
 
 
+def test_a_layer_that_grows_is_scaled_on_every_frame():
+    """`eval` defaults to `init`, which is the whole difference between a
+    layer that grows and a layer that is simply the wrong size."""
+    graph = one_pass(build(layers=(
+        comp.Layer(
+            BROLL, at_sec=0.0, duration_sec=4.0,
+            frame=comp.Frame(x=50.0, y=50.0, width=40.0,
+                             motion=comp.Motion(width=((0.0, 20.0), (4.0, 80.0)))),
+        ),
+    )))
+
+    assert "scale=w='if(lt(t," in graph
+    assert ":eval=frame" in graph
+    # 20% of 1080 to 80% of it, in pixels.
+    assert "216.000" in graph and "864.000" in graph
+    # And it is placed by what it is *now*, not by a size worked out in
+    # advance. Only horizontally: this layer left its height to the aspect
+    # ratio, and `box` positions such a layer by its top edge — an asymmetry
+    # kept rather than quietly fixed while something else was being added.
+    assert "-w/2" in graph
+    assert "-h/2" not in graph
+
+
+def test_a_layer_that_turns_gets_a_box_cut_for_its_widest_angle():
+    """`ow`/`oh` are evaluated once, where `t` does not exist yet — measured,
+    not assumed: the per-frame form is rejected outright on this build."""
+    graph = one_pass(build(layers=(
+        comp.Layer(
+            BROLL, at_sec=0.0, duration_sec=4.0,
+            frame=comp.Frame(x=50.0, y=50.0, width=40.0, height=25.0,
+                             motion=comp.Motion(rotate=((0.0, -20.0), (4.0, 20.0)))),
+        ),
+    )))
+
+    # Degrees in the scenario, radians in the filter: 20° is 0.349 rad.
+    assert "rotate=a='if(lt(t," in graph
+    assert "ow=rotw(0.349):oh=roth(0.349)" in graph
+    # Transparent corners, or the layer arrives as a black diamond.
+    assert "format=rgba,rotate=" in graph
+    assert ":c=none" in graph
+    # This one has a height, so it is centred on both axes.
+    assert "-w/2" in graph and "-h/2" in graph
+
+
+def test_nothing_of_this_appears_when_the_frame_stands_still():
+    graph = one_pass(build(layers=(corner(at_sec=1.0, duration_sec=2.0),)))
+
+    for construction in ("eval=frame", "rotate=a=", "-w/2"):
+        assert construction not in graph
+
+
 def test_a_moving_layer_is_not_a_layer_that_fills_the_canvas():
     """`fills_canvas` unlocks a scale-and-crop with no positioning at all, and
     a frame passing through the middle of the canvas must not take it."""
