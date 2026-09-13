@@ -130,32 +130,33 @@ def dress(
             composition, assets=library, policy=composition.style.inserts, seed=seed
         )
         if chosen:
-            changes["inserts"] = chosen
+            changes["layers"] = composition.layers + chosen
 
     if music or sfx:
         policy = composition.style.audio
-        # B-roll first, deliberately: an insert appearing is one of the moments
-        # a transition sound belongs on, and it does not exist until now.
+        # B-roll first, deliberately: a layer appearing is one of the moments a
+        # transition sound belongs on, and it does not exist until now.
         staged = dataclasses.replace(composition, **changes) if changes else composition
+        tracks: list[comp.AudioTrack] = []
         if music:
             bed = audio_planner.choose_music(staged, assets=library, policy=policy, seed=seed)
             if bed is not None:
-                changes["music"] = bed
+                tracks.append(bed)
         if sfx:
-            effects = audio_planner.choose_effects(
-                staged, assets=library, policy=policy, seed=seed
+            tracks.extend(
+                audio_planner.choose_effects(staged, assets=library, policy=policy, seed=seed)
             )
-            if effects:
-                changes["effects"] = effects
+        if tracks:
+            changes["audio"] = composition.audio + tuple(tracks)
 
     if not changes:
         return composition
+    dressed = dataclasses.replace(composition, **changes)
     log.info(
-        "clip %s takes %d insert(s), %d effect(s) and %s music from a library of %d",
-        seed, len(changes.get("inserts", ())), len(changes.get("effects", ())),
-        "a" if changes.get("music") else "no", len(library),
+        "clip %s takes %d layer(s) and %d sound(s) from a library of %d",
+        seed, len(dressed.layers), len(dressed.audio), len(library),
     )
-    return dataclasses.replace(composition, **changes)
+    return dressed
 
 
 def render(

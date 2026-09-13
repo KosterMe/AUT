@@ -25,7 +25,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from montage.composition import Composition, Insert
+from montage.composition import Canvas, Composition, Layer, frame_for_kind
 from montage.style import InsertPolicy
 from montage.subtitles import SubtitleCue
 
@@ -81,7 +81,7 @@ def choose_inserts(
     assets: list[AssetOption],
     policy: InsertPolicy | None = None,
     seed: int = 0,
-) -> tuple[Insert, ...]:
+) -> tuple[Layer, ...]:
     """Pick the b-roll for one clip.
 
     Keyword hits come first; if the clip's words match nothing in the library —
@@ -102,7 +102,7 @@ def choose_inserts(
     if not slots and rules.cadence_when_no_match:
         slots = _cadence_slots(composition.duration_sec, visible, rules, seed=seed)
 
-    return _accept(slots, composition.duration_sec, rules)
+    return _accept(slots, composition.duration_sec, rules, composition.canvas)
 
 
 def normalize(word: str) -> str:
@@ -195,12 +195,14 @@ def _cadence_slots(
     return slots
 
 
-def _accept(slots: list[_Slot], duration_sec: float, policy: InsertPolicy) -> tuple[Insert, ...]:
+def _accept(
+    slots: list[_Slot], duration_sec: float, policy: InsertPolicy, canvas: Canvas
+) -> tuple[Layer, ...]:
     """Walk the candidates in time order, keeping the ones the rules allow."""
     latest_start = duration_sec - policy.tail_guard_seconds - policy.min_seconds
     budget = duration_sec * policy.max_share
 
-    accepted: list[Insert] = []
+    accepted: list[Layer] = []
     used_assets: set[int] = set()
     covered = 0.0
     previous_end = 0.0
@@ -228,12 +230,15 @@ def _accept(slots: list[_Slot], duration_sec: float, policy: InsertPolicy) -> tu
             continue
 
         accepted.append(
-            Insert(
-                kind=policy.kind,
+            Layer(
                 source_path=asset.path,
                 at_sec=round(slot.at_sec, 3),
                 duration_sec=round(length, 3),
                 still=asset.still,
+                # The policy still names a preset; the preset is now a
+                # rectangle rather than a branch in the renderer.
+                frame=frame_for_kind(policy.kind, policy, canvas),
+                z=1,
             )
         )
         used_assets.add(asset.asset_id)

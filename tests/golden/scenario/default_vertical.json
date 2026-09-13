@@ -1,13 +1,12 @@
 {
+  "audio": [],
   "canvas": {
     "fps": 30,
     "height": 1920,
     "width": 1080
   },
-  "effects": [],
-  "inserts": [],
-  "music": null,
-  "segments": [
+  "layers": [],
+  "spine": [
     {
       "companion_path": null,
       "companion_start_sec": 0.0,
@@ -156,5 +155,5 @@
     ],
     "title_text": "Заголовок клипа"
   },
-  "version": 2
+  "version": 3
 }

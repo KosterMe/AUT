@@ -549,7 +549,7 @@ def _plan_stub(style, source_path: str):
 
     return rendering.ClipPlan(
         composition=comp.Composition(
-            segments=(comp.Segment(source_path, 0.0, 10.0),), style=style
+            spine=(comp.Segment(source_path, 0.0, 10.0),), style=style
         ),
         headline="headline",
         subtitle_source="stub",

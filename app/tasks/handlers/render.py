@@ -134,7 +134,7 @@ def handle_render(ctx: TaskContext) -> dict:
         "cover_path": cover_path,
         "output_duration": result.output_duration,
         "strategy": result.strategy,
-        "insert_count": len(composition.inserts),
+        "insert_count": len(composition.layers),
         "effect_count": len(composition.effects),
         "music": composition.music.source_path if composition.music else None,
         "layout": sorted(composition.layouts),

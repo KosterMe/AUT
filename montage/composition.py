@@ -43,7 +43,11 @@ from montage.style import (
 )
 from montage.subtitles import SubtitleCue, TimelineSegment
 
-VERSION = 2
+# 3 is the layered shape: a spine, layers with frames, and audio tracks. 1 and 2
+# are the "segments + inserts + music + effects" EDLs, and `from_dict` still
+# reads them — a clip rendered last month has its composition stored, and that
+# record is the only account of what it was made of.
+VERSION = 3
 
 # Shorter than this a segment is not worth a cut — and, more practically, is
 # shorter than the seek accuracy of most sources.
@@ -103,16 +107,83 @@ class Segment:
 
 
 @dataclass(frozen=True)
-class Insert:
-    """Something laid over the assembled video for a stretch of the output.
+class Frame:
+    """Where something sits in the canvas, in per cent rather than pixels.
 
-    Inserts never change timing: the picture underneath keeps running, so
-    subtitles and audio stay aligned whether an insert is there or not. That
-    is also why they are applied after the segments are joined, and why
-    changing them cannot invalidate a cached segment.
+    Per cent because a composition should survive a change of canvas, and
+    because the alternative is what this replaced: a corner computed as
+    `canvas.width - box_width - 48` inside the renderer, which is a layout
+    decision that nobody outside the renderer could see or change.
+
+    `x` and `y` are the centre. A layer whose height follows from its width —
+    a picture-in-picture keeping its aspect ratio — leaves `height` at 0, and
+    the renderer positions it with ffmpeg's own `w`/`h` variables rather than
+    guessing what the scale will produce.
     """
 
-    kind: str
+    x: float = 50.0
+    y: float = 50.0
+    width: float = 100.0
+    # 0 means "whatever the aspect ratio gives", which is not the same as 100.
+    height: float = 0.0
+    fit: str = "cover"
+    opacity: float = 1.0
+    rotate: float = 0.0
+
+    @property
+    def fills_canvas(self) -> bool:
+        """Whether this covers the frame edge to edge, centred and upright.
+
+        The common case by a wide margin, and worth knowing about: it compiles
+        to a scale and a crop rather than to positioning arithmetic.
+        """
+        return (
+            (self.x, self.y) == (50.0, 50.0)
+            and self.width >= 100.0
+            and self.height >= 100.0
+            and self.opacity == 1.0
+            and self.rotate == 0.0
+        )
+
+    def box(self, canvas: "Canvas") -> tuple[int, int, int, int]:
+        """This frame in whole pixels of `canvas`: left, top, width, height.
+
+        Widths are rounded to even numbers because yuv420p subsamples chroma by
+        two and an odd dimension is rejected outright. Height comes back as 0
+        when the frame leaves it to the aspect ratio.
+        """
+        width = max(2, int(canvas.width * self.width / 100.0) // 2 * 2)
+        height = (
+            max(2, int(canvas.height * self.height / 100.0) // 2 * 2)
+            if self.height else 0
+        )
+        left = int(round(canvas.width * self.x / 100.0 - width / 2))
+        top = (
+            int(round(canvas.height * self.y / 100.0 - height / 2))
+            if height else int(round(canvas.height * self.y / 100.0))
+        )
+        return left, top, width, height
+
+
+FULL_FRAME = Frame(width=100.0, height=100.0)
+
+
+@dataclass(frozen=True)
+class Layer:
+    """Something laid over the spine for a stretch of the output.
+
+    The generalisation of what used to be an `Insert` with a `kind`. There is
+    no kind any more: `broll_full` and `broll_pip` were a frame covering the
+    canvas and a frame in the corner, which is two values of `frame` and not
+    two sorts of thing. Adding a third position used to mean adding a third
+    branch to the renderer; now it means writing down a rectangle.
+
+    Layers never change timing: the picture underneath keeps running, so
+    subtitles and audio stay aligned whether a layer is there or not. That is
+    also why they are applied after the spine is joined, and why changing one
+    cannot invalidate a cached fragment.
+    """
+
     source_path: str
     at_sec: float
     duration_sec: float
@@ -120,16 +191,17 @@ class Insert:
     # A still image rather than a video: it has no timeline of its own, so it
     # has to be held on screen for the duration instead of played.
     still: bool = False
+    frame: Frame = field(default_factory=lambda: FULL_FRAME)
+    # Bigger sits on top. Ties keep the order they were emitted in.
+    z: int = 0
 
     def __post_init__(self) -> None:
-        if self.kind not in INSERT_KINDS:
-            raise ValueError(f"unknown insert kind {self.kind!r}; expected one of {INSERT_KINDS}")
         if not self.source_path:
-            raise ValueError("an insert needs a source path")
+            raise ValueError("a layer needs a source path")
         if self.at_sec < 0:
-            raise ValueError("an insert cannot start before the clip does")
+            raise ValueError("a layer cannot start before the clip does")
         if self.duration_sec <= 0:
-            raise ValueError("an insert needs a positive duration")
+            raise ValueError("a layer needs a positive duration")
 
     @property
     def end_sec(self) -> float:
@@ -137,57 +209,52 @@ class Insert:
 
 
 @dataclass(frozen=True)
-class MusicBed:
-    """A track playing under the whole clip, ducked out of the way of speech.
+class AudioTrack:
+    """One sound laid under or over the clip.
 
-    The level is relative, not absolute: the finished mix is normalised to
-    -14 LUFS at the end, so what matters here is how far the music sits below
-    whatever else is playing, and the ducking settles the rest.
+    `MusicBed` and `SoundEffect` were the same structure with different
+    defaults: a bed is a track that loops and ducks under speech, an effect is
+    a short one that does not. Having two of them is why adding a third —
+    a voiceover, say — meant a third code path rather than a third set of
+    values.
+
+    Ducking is a sidechain compressor keyed on the speech. A threshold above
+    any real signal is a compressor that never fires, which is how a track that
+    should stay at its own level says so.
     """
 
     source_path: str
-    # How far below the rest of the mix the bed sits before ducking.
+    at_sec: float = 0.0
+    # 0 runs to the end of the clip, which is what a bed does.
+    duration_sec: float = 0.0
     gain_db: float = -20.0
-    start_sec: float = 0.0
-    fade_in_sec: float = 0.6
-    fade_out_sec: float = 1.2
-    # Sidechain compression: the voice triggers, the music gets out of the way.
-    duck_threshold: float = 0.03
-    duck_ratio: float = 8.0
+    # Where in the track to start, so a bed does not open with the same four
+    # bars on every clip of a job.
+    source_start_sec: float = 0.0
+    loop: bool = False
+    fade_in_sec: float = 0.0
+    fade_out_sec: float = 0.0
+    duck_threshold: float = 1.0
+    duck_ratio: float = 1.0
     duck_attack_ms: float = 20.0
     duck_release_ms: float = 300.0
 
     def __post_init__(self) -> None:
         if not self.source_path:
-            raise ValueError("a music bed needs a source path")
-        if self.start_sec < 0:
-            raise ValueError("a music bed cannot start before the track does")
+            raise ValueError("an audio track needs a source path")
+        if self.at_sec < 0:
+            raise ValueError("an audio track cannot start before the clip does")
+        if self.source_start_sec < 0:
+            raise ValueError("an audio track cannot start before the file does")
         if not 0.0 < self.duck_threshold <= 1.0:
             raise ValueError("duck_threshold is a linear level in (0, 1]")
         if self.duck_ratio < 1.0:
-            raise ValueError("duck_ratio below 1 would boost the music under speech")
+            raise ValueError("duck_ratio below 1 would boost the track under speech")
 
-
-@dataclass(frozen=True)
-class SoundEffect:
-    """A short sound at one moment — a cut, an insert appearing.
-
-    Effects are mixed, never spliced: nothing in the timeline moves to make
-    room for one, so adding or removing them cannot desynchronise subtitles.
-    """
-
-    source_path: str
-    at_sec: float
-    duration_sec: float = 1.0
-    gain_db: float = -8.0
-
-    def __post_init__(self) -> None:
-        if not self.source_path:
-            raise ValueError("a sound effect needs a source path")
-        if self.at_sec < 0:
-            raise ValueError("a sound effect cannot play before the clip starts")
-        if self.duration_sec <= 0:
-            raise ValueError("a sound effect needs a positive duration")
+    @property
+    def ducks(self) -> bool:
+        """Whether this track gets out of the way of speech."""
+        return self.duck_threshold < 1.0 and self.duck_ratio > 1.0
 
 
 @dataclass(frozen=True)
@@ -213,14 +280,19 @@ class SubtitleSpec:
 
 @dataclass(frozen=True)
 class Composition:
-    """A finished clip, described but not yet rendered."""
+    """A finished clip, described but not yet rendered.
 
-    segments: tuple[Segment, ...]
+    Three lists and a spine. The spine decides how long the clip is; layers sit
+    over it in z-order and cannot move it; audio tracks play under it. What
+    used to be `segments + inserts + music + effects` said the same thing in
+    four shapes, two of which differed only in their defaults.
+    """
+
+    spine: tuple[Segment, ...]
     canvas: Canvas = field(default_factory=Canvas)
-    inserts: tuple[Insert, ...] = ()
+    layers: tuple[Layer, ...] = ()
     subtitles: SubtitleSpec | None = None
-    music: MusicBed | None = None
-    effects: tuple[SoundEffect, ...] = ()
+    audio: tuple[AudioTrack, ...] = ()
     # How all of it looks. Resolved once when the clip is planned and carried
     # here, so a render depends on nothing that could have changed underneath
     # it: the same composition renders the same video a month later.
@@ -228,25 +300,25 @@ class Composition:
     version: int = VERSION
 
     def __post_init__(self) -> None:
-        if not self.segments:
+        if not self.spine:
             raise ValueError("a composition needs at least one segment")
         duration = self.duration_sec
-        for insert in self.inserts:
-            if insert.end_sec > duration + 0.001:
+        for layer in self.layers:
+            if layer.end_sec > duration + 0.001:
                 raise ValueError(
-                    f"insert at {insert.at_sec}s runs {insert.end_sec}s past the end of a "
+                    f"layer at {layer.at_sec}s runs {layer.end_sec}s past the end of a "
                     f"{duration}s composition"
                 )
-        for effect in self.effects:
-            if effect.at_sec > duration:
+        for track in self.audio:
+            if track.at_sec > duration:
                 raise ValueError(
-                    f"sound effect at {effect.at_sec}s starts past the end of a "
+                    f"audio track at {track.at_sec}s starts past the end of a "
                     f"{duration}s composition"
                 )
 
     @property
     def duration_sec(self) -> float:
-        return round(sum(segment.duration_sec for segment in self.segments), 3)
+        return round(sum(segment.duration_sec for segment in self.spine), 3)
 
     @property
     def crf(self) -> int:
@@ -255,29 +327,46 @@ class Composition:
 
     @property
     def layouts(self) -> frozenset[str]:
-        return frozenset(segment.layout for segment in self.segments)
+        return frozenset(segment.layout for segment in self.spine)
 
     @property
     def has_own_audio(self) -> bool:
         """Whether this composition adds audio of its own to the sources'."""
-        return self.music is not None or bool(self.effects)
+        return bool(self.audio)
+
+    @property
+    def beds(self) -> tuple[AudioTrack, ...]:
+        """Tracks that run under the clip rather than firing at a moment."""
+        return tuple(track for track in self.audio if track.loop)
+
+    @property
+    def stingers(self) -> tuple[AudioTrack, ...]:
+        """Tracks that fire once, at a moment."""
+        return tuple(track for track in self.audio if not track.loop)
+
+    @property
+    def stack(self) -> tuple[Layer, ...]:
+        """Layers bottom to top: by z, then by when they appear.
+
+        One ordering in one place. The renderer applies them in this order and
+        `overlay` has no z of its own, so the list *is* the stack.
+        """
+        return tuple(sorted(self.layers, key=lambda layer: (layer.z, layer.at_sec)))
 
     @property
     def source_paths(self) -> tuple[str, ...]:
         """Every distinct file this composition reads, in first-use order."""
         seen: list[str] = []
-        for segment in self.segments:
+        for segment in self.spine:
             for path in (segment.source_path, segment.companion_path):
                 if path and path not in seen:
                     seen.append(path)
-        for insert in self.inserts:
-            if insert.source_path not in seen:
-                seen.append(insert.source_path)
-        if self.music is not None and self.music.source_path not in seen:
-            seen.append(self.music.source_path)
-        for effect in self.effects:
-            if effect.source_path not in seen:
-                seen.append(effect.source_path)
+        for layer in self.stack:
+            if layer.source_path not in seen:
+                seen.append(layer.source_path)
+        for track in self.audio:
+            if track.source_path not in seen:
+                seen.append(track.source_path)
         return tuple(seen)
 
     def timeline(self) -> list[TimelineSegment]:
@@ -289,7 +378,7 @@ class Composition:
         """
         timeline: list[TimelineSegment] = []
         cursor = 0.0
-        for segment in self.segments:
+        for segment in self.spine:
             end = cursor + segment.duration_sec
             timeline.append(
                 TimelineSegment(
@@ -313,7 +402,7 @@ def single_source(
     layout: str = LAYOUT_BLUR,
     companion_path: str | None = None,
     companion_start_sec: float = 0.0,
-    inserts: Iterable[Insert] = (),
+    layers: Iterable[Layer] = (),
     subtitles: SubtitleSpec | None = None,
     style: StyleSpec | None = None,
 ) -> Composition:
@@ -364,9 +453,9 @@ def single_source(
 
     resolved_style = style or StyleSpec.from_settings()
     return Composition(
-        segments=tuple(segments),
+        spine=tuple(segments),
         canvas=canvas or canvas_for(resolved_style),
-        inserts=tuple(inserts),
+        layers=tuple(layers),
         subtitles=subtitles,
         style=resolved_style,
     )
@@ -397,25 +486,32 @@ def to_dict(composition: Composition) -> dict[str, Any]:
             "height": composition.canvas.height,
             "fps": composition.canvas.fps,
         },
-        "segments": [_asdict(segment) for segment in composition.segments],
-        "inserts": [_asdict(insert) for insert in composition.inserts],
+        "spine": [_asdict(segment) for segment in composition.spine],
+        "layers": [
+            {**_asdict(layer), "frame": _asdict(layer.frame)}
+            for layer in composition.stack
+        ],
         "subtitles": None if composition.subtitles is None else {
             "cues": [_asdict(cue) for cue in composition.subtitles.cues],
             "title_text": composition.subtitles.title_text,
         },
-        "music": None if composition.music is None else _asdict(composition.music),
-        "effects": [_asdict(effect) for effect in composition.effects],
+        "audio": [_asdict(track) for track in composition.audio],
         "style": composition.style.to_dict(),
     }
 
 
 def from_dict(data: Mapping[str, Any]) -> Composition:
-    """Rebuild a composition stored by `to_dict`.
+    """Rebuild a composition stored by `to_dict`, whichever shape it is in.
 
     Tolerant on the way in: a document written by an older version is missing
     fields that now exist, and the defaults are the right answer for those. A
     document that is structurally wrong still raises — a composition that
     cannot be trusted should not quietly render as something else.
+
+    Versions 1 and 2 are lifted rather than rejected. Every clip rendered
+    before this carries one, and that stored composition is the only record of
+    what the clip was made of; a reader that could not open it would turn every
+    one of them into a video nobody can account for.
     """
     canvas_data = data.get("canvas") or {}
     canvas = Canvas(
@@ -433,18 +529,88 @@ def from_dict(data: Mapping[str, Any]) -> Composition:
             ),
             title_text=subtitles_data.get("title_text"),
         )
-    music_data = data.get("music")
+
+    spine_data = data.get("spine")
+    if spine_data is None:
+        spine_data = data.get("segments") or []
+    style = StyleSpec.from_dict(data.get("style"))
     return Composition(
-        segments=tuple(Segment(**_only(item, Segment)) for item in data.get("segments") or []),
+        spine=tuple(Segment(**_only(item, Segment)) for item in spine_data),
         canvas=canvas,
-        inserts=tuple(Insert(**_only(item, Insert)) for item in data.get("inserts") or []),
+        layers=_layers_from(data, style, canvas),
         subtitles=subtitles,
-        music=MusicBed(**_only(music_data, MusicBed)) if isinstance(music_data, Mapping) else None,
-        effects=tuple(
-            SoundEffect(**_only(item, SoundEffect)) for item in data.get("effects") or []
-        ),
-        style=StyleSpec.from_dict(data.get("style")),
+        audio=_audio_from(data),
+        style=style,
     )
+
+
+def _layers_from(data: Mapping[str, Any], style: StyleSpec, canvas: Canvas) -> tuple[Layer, ...]:
+    """Layers, or the inserts of an older document read as layers.
+
+    The kind an old insert carries is the frame it meant: `broll_full` covered
+    the canvas, `broll_pip` sat in the corner at the size the insert policy
+    gave it. Turning the word back into the rectangle is the whole of the
+    migration, because the word never meant anything else.
+    """
+    if data.get("layers") is not None:
+        out = []
+        for item in data["layers"]:
+            frame_data = item.get("frame") if isinstance(item, Mapping) else None
+            frame = Frame(**_only(frame_data, Frame)) if isinstance(frame_data, Mapping) else FULL_FRAME
+            fields = {k: v for k, v in _only(item, Layer).items() if k != "frame"}
+            out.append(Layer(**fields, frame=frame))
+        return tuple(out)
+
+    return tuple(
+        Layer(
+            **{k: v for k, v in _only(item, Layer).items() if k != "frame"},
+            frame=frame_for_kind(item.get("kind", INSERT_FULL), style.inserts, canvas),
+        )
+        for item in data.get("inserts") or []
+    )
+
+
+def frame_for_kind(kind: str, policy, canvas: Canvas) -> Frame:
+    """The frame an old insert kind stood for.
+
+    Two presets, which is what the two kinds always were. The corner is the one
+    the renderer used to compute inline — `canvas.width - box_width - margin` —
+    written here as per cent of a canvas so it can be moved without editing a
+    filter string. The canvas is needed because the old margin was in pixels
+    and a frame is not; converting it is the one place the two vocabularies
+    have to meet.
+    """
+    if kind != INSERT_PIP:
+        return FULL_FRAME
+    box_width = max(2, int(canvas.width * policy.pip_width_share) // 2 * 2)
+    left = canvas.width - box_width - policy.pip_margin_px
+    return Frame(
+        x=(left + box_width / 2.0) / canvas.width * 100.0,
+        y=policy.pip_top_share * 100.0,
+        width=box_width / canvas.width * 100.0,
+        height=0.0,          # the aspect ratio decides, as `scale=W:-2` did
+        fit="contain",
+    )
+
+
+def _audio_from(data: Mapping[str, Any]) -> tuple[AudioTrack, ...]:
+    """Audio tracks, or an older document's bed and stingers read as tracks."""
+    if data.get("audio") is not None:
+        return tuple(AudioTrack(**_only(item, AudioTrack)) for item in data["audio"])
+
+    tracks: list[AudioTrack] = []
+    bed = data.get("music")
+    if isinstance(bed, Mapping):
+        # A bed's `start_sec` was an offset into the *track*, not into the clip
+        # — it exists so a job's clips do not all open on the same four bars.
+        # The new name says which, because the old one could be read either way.
+        fields = _only(bed, AudioTrack)
+        fields.pop("at_sec", None)
+        fields["source_start_sec"] = float(bed.get("start_sec") or 0.0)
+        tracks.append(AudioTrack(**fields, loop=True))
+    for item in data.get("effects") or []:
+        tracks.append(AudioTrack(**_only(item, AudioTrack)))
+    return tuple(tracks)
 
 
 def _asdict(value: Any) -> dict[str, Any]:
@@ -475,7 +641,7 @@ def excerpt(composition: Composition, *, at_sec: float, duration_sec: float) -> 
         raise ValueError("an excerpt window has to fall inside the composition")
 
     segments: list[Segment] = []
-    for segment, placed in zip(composition.segments, composition.timeline()):
+    for segment, placed in zip(composition.spine, composition.timeline()):
         start = max(placed.output_start_sec, window_start)
         end = min(placed.output_end_sec, window_end)
         if end - start < MIN_SEGMENT_SECONDS:
@@ -497,23 +663,19 @@ def excerpt(composition: Composition, *, at_sec: float, duration_sec: float) -> 
         raise ValueError("the excerpt window falls between segments")
 
     length = round(sum(segment.duration_sec for segment in segments), 3)
-    inserts: list[Insert] = []
-    for insert in composition.inserts:
-        start = max(insert.at_sec, window_start)
-        end = min(insert.end_sec, window_end)
+    layers: list[Layer] = []
+    for layer in composition.stack:
+        start = max(layer.at_sec, window_start)
+        end = min(layer.end_sec, window_end)
         if end - start <= 0.01:
             continue
         at = min(start - window_start, length)
-        inserts.append(
-            Insert(
-                kind=insert.kind,
-                source_path=insert.source_path,
-                at_sec=round(at, 3),
-                duration_sec=round(min(end - start, max(0.01, length - at)), 3),
-                source_start_sec=round(insert.source_start_sec + (start - insert.at_sec), 3),
-                still=insert.still,
-            )
-        )
+        layers.append(replace(
+            layer,
+            at_sec=round(at, 3),
+            duration_sec=round(min(end - start, max(0.01, length - at)), 3),
+            source_start_sec=round(layer.source_start_sec + (start - layer.at_sec), 3),
+        ))
 
     subtitles = composition.subtitles
     if subtitles is not None:
@@ -530,23 +692,24 @@ def excerpt(composition: Composition, *, at_sec: float, duration_sec: float) -> 
             title_text=subtitles.title_text,
         )
 
-    music = composition.music
-    if music is not None:
-        # The bed advances with the clip: a preview of the last ten seconds
-        # should hear the part of the track that plays there.
-        music = replace(music, start_sec=round(music.start_sec + window_start, 3))
+    # A bed advances with the clip — a preview of the last ten seconds should
+    # hear the part of the track that plays there — while a stinger fires at a
+    # moment and moves with the window or falls outside it.
+    audio = tuple(
+        replace(track, source_start_sec=round(track.source_start_sec + window_start, 3))
+        for track in composition.beds
+    ) + tuple(
+        replace(track, at_sec=round(track.at_sec - window_start, 3))
+        for track in composition.stingers
+        if window_start <= track.at_sec <= window_end
+    )
 
     return replace(
         composition,
-        segments=tuple(segments),
-        inserts=tuple(inserts),
+        spine=tuple(segments),
+        layers=tuple(layers),
         subtitles=subtitles,
-        music=music,
-        effects=tuple(
-            replace(effect, at_sec=round(effect.at_sec - window_start, 3))
-            for effect in composition.effects
-            if window_start <= effect.at_sec <= window_end
-        ),
+        audio=audio,
     )
 
 
@@ -584,16 +747,16 @@ __all__ = [
     "INSERT_FULL",
     "INSERT_KINDS",
     "INSERT_PIP",
-    "Insert",
+    "Frame",
     "LAYOUTS",
     "LAYOUT_BLUR",
     "LAYOUT_FILL",
     "LAYOUT_SPLIT",
     "MIN_SEGMENT_SECONDS",
-    "MusicBed",
+    "Layer",
     "PLANNABLE_LAYOUTS",
     "Segment",
-    "SoundEffect",
+    "AudioTrack",
     "StyleSpec",
     "SubtitleSpec",
     "VERSION",

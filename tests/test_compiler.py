@@ -14,6 +14,7 @@ import pytest
 
 from montage.render import compiler
 from montage import composition as comp
+from montage import style as style_module
 
 SOURCE = "/media/source.mp4"
 BROLL = "/media/broll.mp4"
@@ -21,7 +22,7 @@ BROLL = "/media/broll.mp4"
 
 def build(**overrides) -> comp.Composition:
     kwargs = dict(
-        segments=(
+        spine=(
             comp.Segment(SOURCE, 60.0, 70.0),
             comp.Segment(SOURCE, 300.0, 310.0),
         ),
@@ -71,7 +72,7 @@ def test_each_segment_is_seeked_at_its_own_input():
 
 
 def test_a_single_segment_needs_no_concat_at_all():
-    graph = one_pass(build(segments=(comp.Segment(SOURCE, 0.0, 30.0),)))
+    graph = one_pass(build(spine=(comp.Segment(SOURCE, 0.0, 30.0),)))
 
     assert "concat=" not in graph
     # The look pass reads the composed segment straight off, with no join in
@@ -139,7 +140,7 @@ def test_sharpening_is_on_by_default_and_can_be_turned_off(configure):
 
 def test_split_screen_stacks_a_companion_source_underneath():
     composition = build(
-        segments=(
+        spine=(
             comp.Segment(SOURCE, 0.0, 10.0, layout=comp.LAYOUT_SPLIT,
                          companion_path=BROLL, companion_start_sec=4.0),
         )
@@ -160,7 +161,7 @@ def test_split_screen_stacks_a_companion_source_underneath():
 
 
 def test_fill_layout_crops_instead_of_blurring():
-    graph = one_pass(build(segments=(comp.Segment(SOURCE, 0.0, 10.0, layout=comp.LAYOUT_FILL),)))
+    graph = one_pass(build(spine=(comp.Segment(SOURCE, 0.0, 10.0, layout=comp.LAYOUT_FILL),)))
 
     assert "boxblur" not in graph
     assert "crop=1080:1920[v0]" in graph
@@ -172,7 +173,7 @@ def test_fill_layout_crops_instead_of_blurring():
 def test_a_source_without_audio_contributes_silence():
     """Skipping it instead would desynchronise everything after it."""
     composition = build(
-        segments=(comp.Segment(SOURCE, 0.0, 10.0), comp.Segment(BROLL, 0.0, 4.0))
+        spine=(comp.Segment(SOURCE, 0.0, 10.0), comp.Segment(BROLL, 0.0, 4.0))
     )
     graph = one_pass_graph_with_audio_map(composition, {SOURCE: True, BROLL: False})
 
@@ -205,9 +206,9 @@ def test_a_silent_composition_is_encoded_without_an_audio_stream():
 
 def test_inserts_are_laid_over_the_joined_video_in_timeline_order():
     composition = build(
-        inserts=(
-            comp.Insert(comp.INSERT_PIP, BROLL, at_sec=14.0, duration_sec=3.0),
-            comp.Insert(comp.INSERT_FULL, BROLL, at_sec=4.0, duration_sec=2.0),
+        layers=(
+            corner(at_sec=14.0, duration_sec=3.0),
+            full_frame(at_sec=4.0, duration_sec=2.0),
         )
     )
     graph = one_pass(composition)
@@ -225,12 +226,8 @@ def test_inserts_are_laid_over_the_joined_video_in_timeline_order():
 
 
 def test_a_full_frame_insert_covers_the_canvas_and_a_pip_does_not():
-    full = one_pass(build(inserts=(
-        comp.Insert(comp.INSERT_FULL, BROLL, at_sec=1.0, duration_sec=2.0),
-    )))
-    pip = one_pass(build(inserts=(
-        comp.Insert(comp.INSERT_PIP, BROLL, at_sec=1.0, duration_sec=2.0),
-    )))
+    full = one_pass(build(layers=(full_frame(at_sec=1.0, duration_sec=2.0),)))
+    pip = one_pass(build(layers=(corner(at_sec=1.0, duration_sec=2.0),)))
 
     assert "crop=1080:1920,setpts=PTS-STARTPTS" in full
     assert "overlay=0:0" in full
@@ -288,9 +285,7 @@ def test_fragment_identity_follows_the_source_and_the_framing(tmp_path, configur
 
 
 def test_the_final_pass_burns_the_look_over_the_joined_fragments():
-    composition = build(inserts=(
-        comp.Insert(comp.INSERT_FULL, BROLL, at_sec=4.0, duration_sec=2.0),
-    ))
+    composition = build(layers=(full_frame(at_sec=4.0, duration_sec=2.0),))
     args = compiler.final_pass_args(
         composition, "/tmp/joined.mkv", "/out/clip.mp4",
         subtitle_path="/tmp/clip.ass", has_audio=True, encoder="libx264",
@@ -318,7 +313,7 @@ def test_a_large_graph_falls_back_to_two_stages(configure):
     configure(AUTOCLIPS_RENDER_ONE_PASS_MAX_SEGMENTS=2)
 
     small = build()
-    large = build(segments=tuple(
+    large = build(spine=tuple(
         comp.Segment(SOURCE, float(i * 20), float(i * 20 + 10)) for i in range(3)
     ))
 
@@ -327,7 +322,7 @@ def test_a_large_graph_falls_back_to_two_stages(configure):
 
 
 def test_mixed_layouts_go_through_two_stages():
-    mixed = build(segments=(
+    mixed = build(spine=(
         comp.Segment(SOURCE, 0.0, 10.0),
         comp.Segment(SOURCE, 20.0, 30.0, layout=comp.LAYOUT_FILL),
     ))
@@ -337,7 +332,7 @@ def test_mixed_layouts_go_through_two_stages():
 
 def test_a_warm_cache_is_worth_the_extra_encode(tmp_path):
     composition = build()
-    for segment in composition.segments:
+    for segment in composition.spine:
         path = compiler.fragment_path(composition.canvas, segment)
         with open(path, "wb") as handle:
             handle.write(b"0" * 4096)
@@ -350,7 +345,7 @@ def test_the_configured_strategy_overrides_every_rule(configure):
     assert compiler.choose_strategy(build()) == compiler.STRATEGY_TWO_STAGE
 
     configure(AUTOCLIPS_RENDER_STRATEGY="one_pass")
-    mixed = build(segments=(
+    mixed = build(spine=(
         comp.Segment(SOURCE, 0.0, 10.0),
         comp.Segment(SOURCE, 20.0, 30.0, layout=comp.LAYOUT_FILL),
     ))
@@ -411,9 +406,41 @@ MUSIC = "/media/track.mp3"
 WHOOSH = "/media/whoosh.wav"
 
 
+def full_frame(path=None, **kwargs) -> comp.Layer:
+    """A layer covering the canvas — what `broll_full` used to name."""
+    return comp.Layer(source_path=path or BROLL, frame=comp.FULL_FRAME, **kwargs)
+
+
+def corner(path=None, *, policy=None, **kwargs) -> comp.Layer:
+    """A layer in the corner — what `broll_pip` used to name.
+
+    The frame comes from the insert policy, which is where the size and the
+    margin have always lived; the difference is that it is now a rectangle
+    somebody could edit rather than arithmetic inside the renderer.
+    """
+    rules = policy or style_module.InsertPolicy.from_settings()
+    return comp.Layer(
+        source_path=path or BROLL,
+        frame=comp.frame_for_kind(comp.INSERT_PIP, rules, comp.Canvas()),
+        **kwargs,
+    )
+
+
+def bed(path=None, **kwargs) -> comp.AudioTrack:
+    """A music bed: a track that loops under the clip and ducks under speech.
+
+    Ducking is explicit now. `MusicBed` defaulted to it, which meant a track
+    that should keep its level had to be talked out of it; a track says what it
+    does instead.
+    """
+    defaults = dict(loop=True, duck_threshold=0.03, duck_ratio=8.0,
+                    fade_in_sec=0.6, fade_out_sec=1.2)
+    return comp.AudioTrack(source_path=path or MUSIC, **{**defaults, **kwargs})
+
+
 def scored(**extra):
     return build(
-        segments=(comp.Segment(SOURCE, 0.0, 20.0), comp.Segment(SOURCE, 30.0, 40.0)),
+        spine=(comp.Segment(SOURCE, 0.0, 20.0), comp.Segment(SOURCE, 30.0, 40.0)),
         **extra,
     )
 
@@ -429,7 +456,7 @@ class TestSoundtrack:
     def test_the_bed_is_compressed_against_the_voice(self):
         """Ducking, not a fixed low level: a level quiet enough under speech is
         inaudible in a pause."""
-        graph = one_pass(scored(music=comp.MusicBed(MUSIC, gain_db=-18.0, duck_ratio=6.0)))
+        graph = one_pass(scored(audio=(bed(gain_db=-18.0, duck_ratio=6.0),)))
 
         assert "asplit=2[voicemix][voicekey]" in graph
         assert "volume=-18.00dB" in graph
@@ -438,7 +465,7 @@ class TestSoundtrack:
 
     def test_the_bed_loops_to_cover_the_whole_clip(self):
         args = compiler.one_pass_args(
-            scored(music=comp.MusicBed(MUSIC)), "/out/clip.mp4", subtitle_path=None,
+            scored(audio=(bed(),)), "/out/clip.mp4", subtitle_path=None,
             audio_by_source={SOURCE: True}, has_audio=True, encoder="libx264",
         )
 
@@ -452,25 +479,28 @@ class TestSoundtrack:
     def test_the_mix_does_not_divide_the_voice_by_the_number_of_inputs(self):
         """amix normalises by default, which would drop the speech 6 dB for the
         crime of having music under it."""
-        graph = one_pass(scored(music=comp.MusicBed(MUSIC)))
+        graph = one_pass(scored(audio=(bed(),)))
 
         assert "amix=inputs=2:normalize=0" in graph
 
     def test_effects_are_delayed_into_place_rather_than_spliced(self):
-        graph = one_pass(scored(effects=(comp.SoundEffect(WHOOSH, at_sec=19.88),)))
+        graph = one_pass(scored(audio=(comp.AudioTrack(WHOOSH, at_sec=19.88),)))
 
         assert "adelay=19880|19880[sfx0]" in graph
         assert "amix=inputs=2:normalize=0" in graph
 
     def test_a_truncated_effect_is_faded_so_it_cannot_click(self):
-        graph = one_pass(scored(effects=(comp.SoundEffect(WHOOSH, at_sec=5.0, duration_sec=1.0),)))
+        graph = one_pass(scored(audio=(comp.AudioTrack(WHOOSH, at_sec=5.0, duration_sec=1.0),)))
 
         assert "afade=t=out:st=0.950:d=0.05" in graph
 
     def test_music_and_effects_share_one_mix(self):
         graph = one_pass(scored(
-            music=comp.MusicBed(MUSIC),
-            effects=(comp.SoundEffect(WHOOSH, at_sec=5.0), comp.SoundEffect(WHOOSH, at_sec=15.0)),
+            audio=(
+                bed(),
+                comp.AudioTrack(WHOOSH, at_sec=5.0, duration_sec=1.0),
+                comp.AudioTrack(WHOOSH, at_sec=15.0, duration_sec=1.0),
+            ),
         ))
 
         assert "[voicemix][ducked][sfx0][sfx1]amix=inputs=4:normalize=0" in graph
@@ -479,10 +509,11 @@ class TestSoundtrack:
 
     def test_the_soundtrack_belongs_to_the_final_pass(self):
         """A cached fragment has to stay valid when the music changes."""
-        composition = scored(music=comp.MusicBed(MUSIC),
-                             effects=(comp.SoundEffect(WHOOSH, at_sec=5.0),))
+        composition = scored(audio=(
+            bed(), comp.AudioTrack(WHOOSH, at_sec=5.0, duration_sec=1.0),
+        ))
         fragment = " ".join(compiler.fragment_args(
-            composition, composition.segments[0], 0, "/tmp/seg.mkv",
+            composition, composition.spine[0], 0, "/tmp/seg.mkv",
             has_audio=True, keep_audio=True,
         ))
         final = " ".join(compiler.final_pass_args(
@@ -539,7 +570,7 @@ def test_a_pip_insert_takes_its_geometry_from_the_policy():
     composition = styled(inserts={"pip_width_share": 0.6, "pip_margin_px": 20})
     composition = dataclasses.replace(
         composition,
-        inserts=(comp.Insert(comp.INSERT_PIP, BROLL, at_sec=1.0, duration_sec=2.0),),
+        layers=(corner(policy=composition.style.inserts, at_sec=1.0, duration_sec=2.0),),
     )
 
     graph = one_pass(composition)
