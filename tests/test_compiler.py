@@ -396,6 +396,40 @@ def test_a_large_graph_falls_back_to_two_stages(configure):
     assert compiler.choose_strategy(large) == compiler.STRATEGY_TWO_STAGE
 
 
+def test_the_layer_ceiling_counts_everything_laid_over_the_clip(configure):
+    """Trap 10, reviewed rather than discovered. The ceiling counts layers,
+    and a layer is no longer only b-roll: a split screen's bottom half is one
+    too. At the old value of 4 it collided with the b-roll planner's own
+    maximum of 4, so one background was enough to send an ordinary clip down
+    the slower path without saying anything."""
+    configure(AUTOCLIPS_RENDER_ONE_PASS_MAX_INSERTS=2)
+
+    two = build(layers=tuple(
+        full_frame(at_sec=float(i), duration_sec=1.0) for i in range(2)
+    ))
+    three = build(layers=tuple(
+        full_frame(at_sec=float(i), duration_sec=1.0) for i in range(3)
+    ))
+
+    assert compiler.choose_strategy(two) == compiler.STRATEGY_ONE_PASS
+    assert compiler.choose_strategy(three) == compiler.STRATEGY_TWO_STAGE
+
+
+def test_a_clip_at_the_brolls_own_maximum_still_renders_in_one_pass():
+    """The collision itself, pinned: four inserts is what the planner is
+    allowed to produce, and a split screen underneath them makes five layers.
+    Both have to stay on the fast path."""
+    four_inserts = build(layers=tuple(
+        corner(at_sec=float(i * 3), duration_sec=2.0) for i in range(4)
+    ))
+    with_background = build(layers=(
+        comp.Layer(BROLL, at_sec=0.0, duration_sec=10.0, frame=comp.BOTTOM_HALF, z=-1),
+    ) + four_inserts.layers)
+
+    assert compiler.choose_strategy(four_inserts) == compiler.STRATEGY_ONE_PASS
+    assert compiler.choose_strategy(with_background) == compiler.STRATEGY_ONE_PASS
+
+
 def test_mixed_layouts_go_through_two_stages():
     mixed = build(spine=(
         comp.Segment(SOURCE, 0.0, 10.0),
