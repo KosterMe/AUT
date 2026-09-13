@@ -409,6 +409,103 @@ class TestStyles:
         assert response.status_code == 404
 
 
+class TestScenarios:
+    """What a job can be rendered with. Read-only here: the editing half
+    arrives with the editor (§12, этап 4)."""
+
+    def test_the_four_built_ins_are_there_after_startup(self, client):
+        """Seeded by the lifespan, so a fresh install has something to render
+        with before anybody has opened an editor."""
+        body = client.get("/api/scenarios").json()
+
+        assert {row["name"] for row in body} == {"talking", "plain", "split", "film"}
+        assert all(row["builtin"] for row in body)
+
+    def test_one_comes_back_as_an_object_not_a_string(self, client):
+        """The column holds text because that is what a column is. A client
+        that has to parse a string out of the response has been handed the
+        storage format instead of the value."""
+        first = client.get("/api/scenarios").json()[0]
+
+        body = client.get(f"/api/scenarios/{first['id']}").json()
+
+        assert isinstance(body["data"], dict)
+        assert body["data"]["tracks"], "a scenario has tracks"
+
+    def test_an_unknown_one_is_404(self, client):
+        assert client.get("/api/scenarios/999").status_code == 404
+
+    def test_a_job_can_name_the_scenario_and_the_cutter(self, client):
+        """The two halves a profile used to say at once, said separately."""
+        scenario_id = next(
+            row["id"] for row in client.get("/api/scenarios").json() if row["name"] == "film"
+        )
+
+        body = client.post(
+            "/api/jobs",
+            json={
+                "source_ref": "https://youtu.be/abc",
+                "scenario_id": scenario_id,
+                "cutter": "scenes",
+                "start_immediately": False,
+            },
+        ).json()
+
+        assert body["scenario_id"] == scenario_id
+        assert body["cutter"] == "scenes"
+
+    def test_a_missing_scenario_is_a_404_rather_than_a_silent_default(self, client):
+        response = client.post(
+            "/api/jobs",
+            json={
+                "source_ref": "https://youtu.be/abc",
+                "scenario_id": 999,
+                "start_immediately": False,
+            },
+        )
+
+        assert response.status_code == 404
+
+    def test_an_unknown_cutter_is_refused(self, client):
+        response = client.post(
+            "/api/jobs",
+            json={
+                "source_ref": "https://youtu.be/abc",
+                "cutter": "vibes",
+                "start_immediately": False,
+            },
+        )
+
+        assert response.status_code == 422
+
+    def test_a_profile_is_still_accepted_and_still_means_both(self, client):
+        """Deprecated for one release. A client that has not been updated yet
+        gets exactly what it got before: the cutter that profile named, and
+        the built-in montage of the same name at render time."""
+        body = client.post(
+            "/api/jobs",
+            json={
+                "source_ref": "https://youtu.be/abc",
+                "profile": "film",
+                "start_immediately": False,
+            },
+        ).json()
+
+        assert body["profile"] == "film"
+        assert body["cutter"] == "scenes"
+        assert body["scenario_id"] is None
+
+    def test_a_job_with_neither_still_has_a_cutter(self, client):
+        """Nothing has to be chosen for a job to run — the point of the
+        defaults, and the reason an unattended pipeline works at all."""
+        body = client.post(
+            "/api/jobs", json={"source_ref": "https://youtu.be/abc", "start_immediately": False},
+        ).json()
+
+        assert body["cutter"] == "speech"
+        assert body["profile"] == "talking"
+
+
 class TestClipEndpoints:
     """Acting on one clip: read what it is made of, render it again, preview it.
 
@@ -513,6 +610,44 @@ class TestClipEndpoints:
         assert seen["spec"].at_sec == 5.0
         assert seen["spec"].duration_sec == 3.0
         assert seen["style"].framing.zoom == 1.5
+
+    def test_a_preview_uses_the_scenario_the_job_names(self, client, clip, db, monkeypatch):
+        """A preview is worth having because it is composed by the code the
+        real render uses — which includes reading the same scenario. One built
+        from the profile's built-in while the job renders from something else
+        is a preview of a video nobody is going to get.
+        """
+        from app.api.routers import clips as clips_router
+        from app.db.models import ClipJob
+        from app.services import scenarios
+        from montage.scenario import builtin, store
+        from montage.style import StyleSpec
+
+        stored = scenarios.create(
+            db, name="Мой", data=store.to_dict(builtin.plain(StyleSpec.from_settings())),
+        )
+        job = db.get(ClipJob, clip.job_id)
+        job.scenario_id = stored.id
+        db.add(job)
+        db.commit()
+
+        seen = {}
+
+        def fake_compose(**kwargs):
+            seen.update(kwargs)
+            return _plan_stub(kwargs["style"], str(clip.video_path))
+
+        def fake_preview(composition, output_path, *, spec=None):
+            with open(output_path, "wb") as handle:
+                handle.write(b"\x00" * 32)
+
+        monkeypatch.setattr(clips_router.montage, "preview", fake_preview)
+        monkeypatch.setattr(clips_router.rendering, "compose_clip", fake_compose)
+
+        response = client.post(f"/api/clips/{clip.id}/preview", json={"at_sec": 1.0})
+
+        assert response.status_code == 200
+        assert seen["scenario"].name == "Мой"
 
     def test_a_preview_window_past_the_end_is_clamped_not_refused(
         self, client, clip, monkeypatch

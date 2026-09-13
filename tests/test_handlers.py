@@ -6,6 +6,7 @@ that would have caught a job stuck in "slicing" with all its clips rendered.
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 from datetime import timedelta
 
@@ -501,6 +502,47 @@ class TestRenderHandler:
         assert clip.cover_path is not None
         # The job's status follows from its clips, with no separate bookkeeping.
         assert db.get(ClipJob, job_id).status == JobStatus.READY
+
+    def test_a_job_renders_with_the_scenario_it_names(self, db, source_file):
+        """The whole point of storing them, shown as an A/B: two jobs over the
+        same source, one pointing at a stored scenario and one not, come out
+        framed differently — so what the render read is the scenario and not
+        the built-in the profile names.
+
+        The stored one says the picture fills the canvas; the default for a
+        wide source is to contain it over a blurred copy of itself.
+        """
+        from app.services import scenarios
+        from montage.scenario import builtin, model, store
+        from montage.style import StyleSpec
+
+        original = builtin.plain(StyleSpec.from_settings())
+        spine = original.tracks[0]
+        filled = dataclasses.replace(
+            spine.elements[0],
+            frame=dataclasses.replace(spine.elements[0].frame, fit=model.FIT_FILL),
+        )
+        stored = scenarios.create(db, name="Во весь кадр", data=store.to_dict(
+            dataclasses.replace(original, tracks=(
+                dataclasses.replace(spine, elements=(filled,)),
+            ) + original.tracks[1:])
+        ))
+
+        self._planned_clip(db, source_file)
+        assert runner.run_once([TaskKind.RENDER]) is True
+
+        job_id, _ = self._planned_clip(db, source_file)
+        job = db.get(ClipJob, job_id)
+        job.scenario_id = stored.id
+        db.add(job)
+        db.commit()
+        assert runner.run_once([TaskKind.RENDER]) is True
+
+        by_profile, by_scenario = self.rendered_compositions[-2:]
+        assert by_profile.spine[0].backdrop is True
+        assert by_profile.spine[0].frame == comp.CONTAINED
+        assert by_scenario.spine[0].backdrop is False
+        assert by_scenario.spine[0].frame == comp.FULL_FRAME
 
     def test_broll_from_the_library_reaches_the_composition(self, db, source_file):
         """The end of the chain: an uploaded fragment, tagged with a word the

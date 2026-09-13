@@ -1,6 +1,8 @@
 """Clip jobs and the clips they produce."""
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, Query, status
 from sqlmodel import Session
 
@@ -15,6 +17,8 @@ from app.api.schemas.clips import (
     ClipRead,
 )
 from app.services import clip_jobs, clips
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/jobs", tags=["clip jobs"])
 
@@ -31,6 +35,7 @@ def list_jobs(
 @router.post("", response_model=ClipJobRead, status_code=status.HTTP_201_CREATED)
 def create_job(payload: ClipJobCreate, session: Session = Depends(db_session)):
     """Register a source video and, by default, start cutting it right away."""
+    _note_deprecated_profile(payload.profile)
     job = clip_jobs.create(
         session,
         source_ref=payload.source_ref,
@@ -39,6 +44,8 @@ def create_job(payload: ClipJobCreate, session: Session = Depends(db_session)):
         custom_title=payload.custom_title,
         caption_tags=payload.caption_tags,
         profile=payload.profile,
+        scenario_id=payload.scenario_id,
+        cutter=payload.cutter,
         start_immediately=payload.start_immediately,
         min_clip_seconds=payload.min_clip_seconds,
         max_clip_seconds=payload.max_clip_seconds,
@@ -50,6 +57,24 @@ def create_job(payload: ClipJobCreate, session: Session = Depends(db_session)):
     session.commit()
     session.refresh(job)
     return job
+
+
+def _note_deprecated_profile(profile: str | None) -> None:
+    """Say so, once per request, when a caller still names a profile.
+
+    Accepted for one release and no longer the thing it names: a profile used
+    to pick the cutter, the montage and the default look together, and those
+    are now `cutter`, `scenario_id` and `style_id`. Logged rather than
+    refused, because refusing would break every client on the day of the
+    upgrade — and logged rather than passed over, because otherwise nobody
+    finds out who is still sending one before it is removed.
+    """
+    if profile is not None:
+        log.info(
+            "a job was created with profile=%r; it is a deprecated synonym for "
+            "cutter + scenario_id + style_id and will stop being accepted",
+            profile,
+        )
 
 
 def _render_payload(options) -> dict:
@@ -77,6 +102,7 @@ def start_job(
     job_id: int, payload: ClipJobStart = ClipJobStart(), session: Session = Depends(db_session)
 ):
     """Queue (or re-queue) the download → transcribe → plan pass."""
+    _note_deprecated_profile(payload.profile)
     clip_jobs.start(
         session,
         job_id,
@@ -85,6 +111,8 @@ def start_job(
         gap_seconds=payload.gap_seconds,
         max_clips=payload.max_clips,
         profile=payload.profile,
+        scenario_id=payload.scenario_id,
+        cutter=payload.cutter,
         render=_render_payload(payload.render),
         style_id=payload.style_id,
     )

@@ -16,7 +16,11 @@ from app.db import models  # noqa: F401  (registers tables on SQLModel.metadata)
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # `disable_existing_loggers` defaults to True, and it means every logger
+    # that already exists — which, when a migration is run in a process that
+    # has imported the application, is all of them. The upgrade would go on
+    # working and everything else would silently stop saying anything.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 load_dotenv_for_entrypoint()
 settings = get_settings()
