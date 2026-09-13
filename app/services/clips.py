@@ -15,7 +15,7 @@ from sqlmodel import Session, col, select
 from app.core.clock import utc_now
 from app.core.errors import ConflictError, NotFoundError
 from app.db.enums import ClipStatus, TaskKind
-from app.db.models import Clip, Publication
+from app.db.models import Clip, ClipJob, Publication
 from app.db.enums import PublicationStatus
 from app.domain.cutting import SliceSpec
 from app.services import clip_jobs
@@ -41,14 +41,12 @@ def list_for_job(session: Session, job_id: int) -> list[Clip]:
     )
 
 
-def plan(
-    session: Session,
-    job_id: int,
-    specs: list[SliceSpec],
-    *,
-    render_options: dict | None = None,
-) -> list[Clip]:
+def plan(session: Session, job_id: int, specs: list[SliceSpec]) -> list[Clip]:
     """Turn slice boundaries into clip rows and queue a render for each.
+
+    Boundaries are all this takes. How the clips are dressed is on the job,
+    where it was recorded when the job started, so cutting neither knows nor
+    forwards it.
 
     Replanning a job replaces any clips that were never rendered; clips that
     already produced a file are left alone so a re-run does not throw away
@@ -76,7 +74,7 @@ def plan(
         task = queue.enqueue(
             session,
             TaskKind.RENDER,
-            {"clip_id": clip.id, "job_id": job_id, "render": render_options or {}},
+            {"clip_id": clip.id, "job_id": job_id},
             dedupe_key=f"render:clip:{clip.id}",
         )
         clip.task_id = task.id
@@ -174,12 +172,20 @@ def rerender(session: Session, clip_id: int, *, style: dict | None = None) -> Cl
 
 
 def render_options_of(session: Session, clip: Clip) -> dict:
-    """The render options this clip was planned with.
+    """The montage options this clip renders with.
 
-    Read back off its own render task, which is where the source path, the
-    title and the transcript settings live. Losing them would send a re-render
-    looking for a source it has no path to.
+    The job's, because that is where they live. The fallback reads them back
+    off the clip's own render task, which is where they lived before: clips
+    planned by an older worker have them there and nowhere else, and a
+    re-render that found nothing would go looking for a source with no path.
     """
+    job = session.get(ClipJob, clip.job_id)
+    stored = clip_jobs.montage_options(job) if job is not None else {}
+    return stored or _queued_options(session, clip)
+
+
+def _queued_options(session: Session, clip: Clip) -> dict:
+    """Montage options off a render task queued before the job kept its own."""
     from app.db.models import Task
 
     task = session.get(Task, clip.task_id) if clip.task_id else None

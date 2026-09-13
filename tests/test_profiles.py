@@ -1,9 +1,12 @@
-"""Profiles: one decision that fixes four others.
+"""Profiles: one decision that fixes three others.
 
-What is being guarded here is mostly the *combinations*. A profile that cuts on
-scene changes while insisting on a transcript, or a split screen with b-roll
-over it as well, are each individually plausible and together produce a clip
-nobody wants.
+What is being guarded here is mostly the *combinations*. A split screen with
+b-roll over it as well leaves nothing on screen that is the actual video, and
+the two halves of that choice are each individually plausible.
+
+The fourth decision a profile used to fix — whether the source gets
+transcribed — is not here any more. It belongs to the cutter, which is the only
+party that cannot work without it; see `test_cutting.py`.
 """
 from __future__ import annotations
 
@@ -28,16 +31,21 @@ def test_an_unknown_profile_says_what_the_choices_are():
 
 
 @pytest.mark.parametrize("profile", [profiles.TALKING, profiles.PLAIN, profiles.SPLIT])
-def test_speech_profiles_need_a_transcript(profile):
+def test_the_talking_profiles_cut_on_speech(profile):
     assert profile.cutter == cutting.CUTTER_SPEECH
-    assert profile.requires_transcript is True
 
 
-def test_the_film_profile_runs_without_one():
+def test_the_film_profile_cuts_on_the_picture():
     """The whole point: an action scene with no dialogue currently produces no
     clips at all."""
     assert profiles.FILM.cutter == cutting.CUTTER_SCENES
-    assert profiles.FILM.requires_transcript is False
+
+
+def test_no_profile_has_an_opinion_about_transcribing():
+    """A profile is a statement about the material and its dressing. Whether
+    ASR runs is the cutter's own need, and a profile that could force it made
+    the montage side decide what the cutting stage does."""
+    assert not hasattr(profiles.FILM, "requires_transcript")
 
 
 def test_a_split_screen_carries_no_broll():
@@ -64,7 +72,7 @@ def test_a_split_profile_without_a_companion_tag_is_rejected():
     with pytest.raises(ValueError, match="companion tag"):
         profiles.Profile(
             name="broken", cutter=cutting.CUTTER_SPEECH, layout=comp.LAYOUT_SPLIT,
-            requires_transcript=True, remove_silence=False, inserts=False,
+            remove_silence=False, inserts=False,
         )
 
 
@@ -72,7 +80,7 @@ def test_an_unknown_cutter_is_rejected():
     with pytest.raises(ValueError, match="unknown cutter"):
         profiles.Profile(
             name="broken", cutter="vibes", layout=comp.LAYOUT_BLUR,
-            requires_transcript=True, remove_silence=False, inserts=False,
+            remove_silence=False, inserts=False,
         )
 
 

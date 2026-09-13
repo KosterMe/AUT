@@ -106,6 +106,18 @@ class ClipJob(SQLModel, table=True):
     # Raw extractor output (yt-dlp). Read-only reference data, never state.
     source_metadata_json: str = Field(default="{}")
 
+    # How this job's clips are to be dressed: the montage options it was
+    # started with. They live on the job because that is whose intent they are.
+    # They used to be assembled by the cutting stage and copied into every
+    # render task, which made a re-render depend on its old queue row still
+    # being there, and made cutting responsible for relaying decisions it has
+    # no opinion about.
+    render_options_json: str = Field(default="{}")
+    # What the source was transcribed with, when it was. A fact the cutting
+    # stage learned and the montage side needs to find the same cached
+    # transcript again — not an option, and not something to ask ASR twice for.
+    transcript_settings_json: str = Field(default="{}")
+
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 

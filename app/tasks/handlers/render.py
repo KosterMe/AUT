@@ -47,11 +47,13 @@ def _on_failure(ctx: TaskContext, message: str, final: bool) -> None:
 @register_handler(TaskKind.RENDER, on_failure=_on_failure)
 def handle_render(ctx: TaskContext) -> dict:
     clip_id = ctx.require_int("clip_id")
-    options = dict(ctx.get("render") or {})
 
     with ctx.db() as session:
         clip = clips.get(session, clip_id)
         job = clip_jobs.get(session, clip.job_id)
+        # From the job, not from this task: cutting no longer forwards them,
+        # and a re-render queued days later reads the same thing this one does.
+        options = _montage_options(ctx, job)
         # Resolved inside the session because a preset lives in the database,
         # and resolved once because everything below reads from it.
         style = style_for(job, options)
@@ -143,6 +145,26 @@ def handle_render(ctx: TaskContext) -> dict:
         "silence_removed_seconds": result.silence_removed_seconds,
         "qa": result.qa,
     }
+
+
+def _montage_options(ctx: TaskContext, job) -> dict:
+    """How this clip is dressed: the job's options, with this task's on top.
+
+    Three kinds of task arrive here and the same merge serves all of them. One
+    queued by planning carries no options at all and takes the job's. A
+    re-render carries the one thing the caller changed, and it wins over the
+    job without discarding the rest of it. A task queued by a worker from
+    before the job kept its own options carries the lot, and the job has
+    nothing to contribute — so the payload is what is left standing.
+
+    The transcript settings go underneath as a default: they are a fact about
+    the source rather than an option, and they arrived through the payload
+    before only because the cutting stage was the one putting them there.
+    """
+    options = dict(clip_jobs.montage_options(job))
+    options.update(ctx.get("render") or {})
+    options.setdefault("transcript_settings", clip_jobs.transcript_settings(job))
+    return options
 
 
 def style_for(job, options: dict) -> style_module.StyleSpec:

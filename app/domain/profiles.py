@@ -7,6 +7,13 @@ whether silence is cut out. Those four are not independent. Scene cutting with
 karaoke subtitles timed to speech that is not there produces nothing; a split
 screen under a clip that already has b-roll over it produces a mess.
 
+It used to fix a fifth: whether the source got transcribed. That one was the
+odd member of the set, because it is not a statement about the material at all
+— it is what one particular cutter needs in order to run. Having it here meant
+a profile chosen for its subtitles decided what the cutting stage did, and a
+talking profile pointed at the scene cutter transcribed a whole source nothing
+went on to read. It lives with the cutters now: `cutting.needs_transcript`.
+
 Profiles are values, not configuration: they are the vocabulary the API and the
 handlers share, and every one of them can still be overridden field by field
 through `RenderOptions` when a particular video needs it.
@@ -33,9 +40,6 @@ class Profile:
     # "auto" leaves the choice between a blurred backdrop and a plain crop to
     # the source's own shape, which is only known once a file is on disk.
     layout: str
-    # Whether the job fails without a transcript. False means the cutter can
-    # work from the picture alone.
-    requires_transcript: bool
     remove_silence: bool
     inserts: bool
     # A music bed under the clip, and transition sounds on its cuts. Both need
@@ -64,7 +68,6 @@ TALKING = Profile(
     name="talking",
     cutter=CUTTER_SPEECH,
     layout=LAYOUT_AUTO,
-    requires_transcript=True,
     remove_silence=True,
     inserts=True,
     music=True,
@@ -76,7 +79,6 @@ PLAIN = Profile(
     name="plain",
     cutter=CUTTER_SPEECH,
     layout=LAYOUT_AUTO,
-    requires_transcript=True,
     remove_silence=False,
     inserts=False,
     summary="The same cuts, nothing added and nothing taken out. What to use when the "
@@ -87,7 +89,6 @@ SPLIT = Profile(
     name="split",
     cutter=CUTTER_SPEECH,
     layout=LAYOUT_SPLIT,
-    requires_transcript=True,
     remove_silence=True,
     inserts=False,
     music=True,
@@ -101,7 +102,6 @@ FILM = Profile(
     name="film",
     cutter=CUTTER_SCENES,
     layout=LAYOUT_AUTO,
-    requires_transcript=False,
     remove_silence=False,
     inserts=False,
     summary="Films, shows and sport: cut where the picture cuts, ranked by loudness. "
