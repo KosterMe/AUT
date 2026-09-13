@@ -1,14 +1,16 @@
-"""Deciding what one clip contains, for whoever is about to render it.
+"""AUT's half of composing a clip: the words, the headline, the library.
 
 Two callers need exactly the same answer: the render handler, which turns it
 into a file, and the preview endpoint, which turns four seconds of it into
-something to look at. Before this they would have had to agree by copying, and
-a preview that composes a clip even slightly differently from the render is
-worse than no preview — it is a preview of something else.
+something to look at. A preview that composes a clip even slightly differently
+from the render is worse than no preview — it is a preview of something else —
+so the sequence lives here once.
 
-So the sequence lives here once: pick the transcript for the subtitles, plan
-the montage, then lay b-roll, music and effects over it. It ends where ffmpeg
-begins.
+What is left here after the montage service moved out is the part that is
+AUT's by rights: picking the transcript (ASR belongs to the cutter that needs
+it), composing the headline (it has to agree with the caption the clip is
+published under), and reading the library. Those three become facts, and
+`montage.client` takes them from there.
 
 The database is read in one short call at the front (`library_for`) and never
 touched again. Composing a clip can mean transcribing it, which is minutes on
@@ -25,26 +27,21 @@ from sqlmodel import Session
 
 from app.adapters.asr import cache as transcript_cache
 from app.adapters.asr import selection
-from app.adapters.media import compiler
-from app.domain import audio as audio_planner
 from app.domain import captions as caption_builder
-from app.domain import composition as comp
-from app.domain import inserts as insert_planner
-from app.domain import style as style_module
 from app.services import assets
+from montage import client as montage
+from montage import composition as comp
+from montage import style as style_module
+from montage.rules import inserts as insert_planner
 
 log = logging.getLogger(__name__)
 
 Progress = Callable[[str, float], None]
 
 
-@dataclasses.dataclass(frozen=True)
-class Library:
-    """What the b-roll library offers this clip, read in one go."""
-
-    options: list[insert_planner.AssetOption] = dataclasses.field(default_factory=list)
-    # Only for a split screen: the video that fills the bottom half.
-    companion_path: str | None = None
+# The shape the montage service takes its library in. Aliased rather than
+# restated, so there is one definition of what a clip is offered.
+Library = montage.Library
 
 
 @dataclasses.dataclass(frozen=True)
@@ -119,84 +116,24 @@ def compose_clip(
     )
 
     _report(on_progress, "planning_montage", 0.2)
-    composition = compiler.plan_vertical_clip(
-        source_path,
+    plan = montage.compose(montage.ClipRequest(
+        source_path=source_path,
         start_sec=clip.start_sec,
         end_sec=clip.end_sec,
         style=style,
-        companion_path=shelf.companion_path,
-        transcript_segments=subtitle_segments,
-        fallback_subtitle_text=clip.text or "",
+        speech=tuple(subtitle_segments),
+        fallback_text=clip.text or "",
         title_text=headline,
-    )
-    composition = dress(
-        composition,
-        shelf.options,
+        library=shelf,
         seed=clip_seed,
-        broll=style.inserts.enabled,
-        music=style.audio.music and style.audio.enabled,
-        sfx=style.audio.sfx and style.audio.enabled,
-    )
+    ))
 
     return ClipPlan(
-        composition=composition,
+        composition=plan.composition,
         headline=headline,
         subtitle_source=str(subtitle_meta.get("source") or ""),
         companion_path=shelf.companion_path,
     )
-
-
-def dress(
-    composition: comp.Composition,
-    library: list[insert_planner.AssetOption],
-    *,
-    seed: int,
-    broll: bool,
-    music: bool,
-    sfx: bool,
-) -> comp.Composition:
-    """Lay b-roll, a music bed and transition sounds over a planned clip.
-
-    All three read the same library and are seeded by the clip rather than by
-    chance, so re-rendering produces the same edit — otherwise the fragment
-    cache would be inspecting a composition it had never seen before every
-    single time.
-    """
-    if not library or not (broll or music or sfx):
-        return composition
-
-    changes: dict = {}
-    if broll:
-        chosen = insert_planner.choose_inserts(
-            composition, assets=library, policy=composition.style.inserts, seed=seed
-        )
-        if chosen:
-            changes["inserts"] = chosen
-
-    if music or sfx:
-        policy = composition.style.audio
-        # B-roll first, deliberately: an insert appearing is one of the moments
-        # a transition sound belongs on, and it does not exist until now.
-        staged = dataclasses.replace(composition, **changes) if changes else composition
-        if music:
-            bed = audio_planner.choose_music(staged, assets=library, policy=policy, seed=seed)
-            if bed is not None:
-                changes["music"] = bed
-        if sfx:
-            effects = audio_planner.choose_effects(
-                staged, assets=library, policy=policy, seed=seed
-            )
-            if effects:
-                changes["effects"] = effects
-
-    if not changes:
-        return composition
-    log.info(
-        "clip %s takes %d insert(s), %d effect(s) and %s music from a library of %d",
-        seed, len(changes.get("inserts", ())), len(changes.get("effects", ())),
-        "a" if changes.get("music") else "no", len(library),
-    )
-    return dataclasses.replace(composition, **changes)
 
 
 def library_paths(composition: comp.Composition, companion_path: str | None) -> list[str]:

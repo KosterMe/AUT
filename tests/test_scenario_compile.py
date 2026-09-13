@@ -16,11 +16,11 @@ from pathlib import Path
 
 import pytest
 
-from app.domain import composition as comp
-from app.domain import scenario as sc
-from app.domain import subtitles as subtitle_builder
-from app.domain.inserts import AssetOption
-from app.domain.style import StyleSpec
+from montage import composition as comp
+from montage import scenario as sc
+from montage import subtitles as subtitle_builder
+from montage.rules.inserts import AssetOption
+from montage.style import StyleSpec
 
 GOLDEN = Path(__file__).parent / "golden" / "scenario"
 

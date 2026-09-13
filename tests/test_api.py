@@ -486,7 +486,7 @@ class TestClipEndpoints:
         assert style["delivery"]["width"] == 1080  # the rest is filled in
 
     def test_a_preview_renders_the_window_asked_for(self, client, clip, monkeypatch):
-        from app.adapters.media import compiler
+        from montage.render import compiler
         from app.api.routers import clips as clips_router
 
         seen = {}
@@ -497,7 +497,7 @@ class TestClipEndpoints:
             with open(output_path, "wb") as handle:
                 handle.write(b"\x00" * 32)
 
-        monkeypatch.setattr(clips_router.compiler, "render_preview", fake_preview)
+        monkeypatch.setattr(clips_router.montage, "preview", fake_preview)
         monkeypatch.setattr(
             clips_router.rendering, "compose_clip",
             lambda **kwargs: _plan_stub(kwargs["style"], str(clip.video_path)),
@@ -528,7 +528,7 @@ class TestClipEndpoints:
             with open(output_path, "wb") as handle:
                 handle.write(b"\x00" * 32)
 
-        monkeypatch.setattr(clips_router.compiler, "render_preview", fake_preview)
+        monkeypatch.setattr(clips_router.montage, "preview", fake_preview)
         monkeypatch.setattr(
             clips_router.rendering, "compose_clip",
             lambda **kwargs: _plan_stub(kwargs["style"], str(clip.video_path)),
@@ -544,7 +544,7 @@ class TestClipEndpoints:
 
 def _plan_stub(style, source_path: str):
     """A composed clip, without the transcript and library work behind it."""
-    from app.domain import composition as comp
+    from montage import composition as comp
     from app.services import rendering
 
     return rendering.ClipPlan(

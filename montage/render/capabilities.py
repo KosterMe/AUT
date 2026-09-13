@@ -41,8 +41,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from app.adapters.media import filters
-from app.adapters.media.ffmpeg import ffmpeg_exe
+from montage.render import filters
+from montage.render.probe import ffmpeg_exe
 
 log = logging.getLogger(__name__)
 

@@ -154,7 +154,7 @@ def test_transcribing_a_silent_video_says_so(tmp_path, monkeypatch):
 
     path = tmp_path / "job-7.f399.mp4"
     path.write_bytes(b"\x00" * 64)
-    monkeypatch.setattr(service.ffmpeg, "ffprobe_has_audio", lambda p: False)
+    monkeypatch.setattr(service.montage, "has_audio", lambda p: False)
 
     def unreachable(*a, **k):
         raise AssertionError("must not reach the decoder")
@@ -170,7 +170,7 @@ def test_transcribing_a_normal_video_is_not_blocked(tmp_path, monkeypatch):
 
     path = tmp_path / "job-4.mp4"
     path.write_bytes(b"\x00" * 64)
-    monkeypatch.setattr(service.ffmpeg, "ffprobe_has_audio", lambda p: True)
+    monkeypatch.setattr(service.montage, "has_audio", lambda p: True)
     monkeypatch.setattr(service.whisper, "transcribe_media_chunked", lambda *a, **k: ["ok"])
 
     assert service.transcribe(str(path)) == ["ok"]

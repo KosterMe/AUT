@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from yt_dlp.utils import DownloadError
 
-from app.adapters.media.ffmpeg import _parse_silencedetect
+from montage.render.probe import _parse_silencedetect
 from app.adapters.youtube import downloader
 from app.adapters.youtube.downloader import (
     _cached_metadata,

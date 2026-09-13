@@ -5,8 +5,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from app.core.config import get_settings
-from app.domain.style import SubtitleStyle
+from montage.config import get_settings
+from montage.style import SubtitleStyle
 
 # Word-level ("karaoke") subtitles: each cue shows exactly one word and appears
 # exactly at that word's start time. Nothing is ever glued together — a short

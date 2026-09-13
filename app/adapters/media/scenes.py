@@ -17,7 +17,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 
-from app.adapters.media.ffmpeg import ffmpeg_exe, ffprobe_has_audio
+from montage import client as montage
 from app.core.config import get_settings
 
 log = logging.getLogger(__name__)
@@ -57,13 +57,13 @@ def analyse(
     and the cutter above falls back to fixed-length pieces. Losing the scene
     signal should cost worse cut points, not the job.
     """
-    ffmpeg = ffmpeg_exe()
+    ffmpeg = montage.renderer_available()
     if not ffmpeg:
         return SceneAnalysis(ok=False, detail="ffmpeg is not installed or not on PATH")
 
     settings = get_settings().scenes
     limit = float(threshold if threshold is not None else settings.threshold)
-    has_audio = ffprobe_has_audio(video_path)
+    has_audio = montage.has_audio(video_path)
 
     args = [ffmpeg, "-hide_banner", "-nostats", "-loglevel", "warning", "-i", video_path]
     graph = [f"[0:v]select='gt(scene,{limit:.3f})',metadata=print:file=-[v]"]

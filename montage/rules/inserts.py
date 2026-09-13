@@ -25,9 +25,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from app.domain.composition import Composition, Insert
-from app.domain.style import InsertPolicy
-from app.domain.subtitles import SubtitleCue
+from montage.composition import Composition, Insert
+from montage.style import InsertPolicy
+from montage.subtitles import SubtitleCue
 
 # Shortest tag that is matched by stem rather than exactly. Below this a tag is
 # usually an acronym or a brand ("bmw", "ai"), where a prefix match would fire

@@ -11,8 +11,8 @@ from __future__ import annotations
 import pytest
 
 from app.domain import profiles
-from app.domain import style as style_module
-from app.domain.style import StyleSpec
+from montage import style as style_module
+from montage.style import StyleSpec
 
 
 def test_defaults_are_complete_without_anything_being_asked_for():

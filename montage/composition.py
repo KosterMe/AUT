@@ -29,7 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields as dataclass_fields, replace
 from typing import Any, Iterable, Mapping
 
-from app.domain.style import (
+from montage.style import (
     INSERT_FULL,
     INSERT_KINDS,
     INSERT_PIP,
@@ -41,7 +41,7 @@ from app.domain.style import (
     PLANNABLE_LAYOUTS,
     StyleSpec,
 )
-from app.domain.subtitles import SubtitleCue, TimelineSegment
+from montage.subtitles import SubtitleCue, TimelineSegment
 
 VERSION = 2
 

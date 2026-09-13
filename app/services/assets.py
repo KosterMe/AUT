@@ -22,12 +22,14 @@ from typing import BinaryIO
 from sqlmodel import Session, col, select
 
 from app.adapters.media import ffmpeg as media
+from montage import client as montage
 from app.core.clock import utc_now
 from app.core.errors import NotFoundError, ValidationError
 from app.core.config import get_settings
 from app.db.enums import AssetKind
 from app.db.models import MediaAsset
-from app.domain import inserts, style
+from montage import style
+from montage.rules import inserts
 
 log = logging.getLogger(__name__)
 
@@ -185,7 +187,7 @@ def register(
     if existing is not None:
         return set_tags(session, existing.id, _merge_tags(existing.tags, tags))
 
-    probe = media.probe_media(path)
+    probe = montage.analyse(path)
     asset = MediaAsset(
         kind=kind or kind_for(path),
         path=path,

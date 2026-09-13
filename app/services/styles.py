@@ -21,7 +21,7 @@ from app.core.clock import utc_now
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.db.models import StylePreset
 from app.domain import profiles
-from app.domain import style as style_module
+from montage import style as style_module
 
 log = logging.getLogger(__name__)
 

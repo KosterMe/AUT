@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.domain import composition as comp
+from montage import composition as comp
 from app.domain import cutting, profiles
 
 

@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import pytest
 
-from app.domain import audio
-from app.domain import composition as comp
-from app.domain.inserts import AssetOption
+from montage.rules import audio
+from montage import composition as comp
+from montage.rules.inserts import AssetOption
 
 
 def asset(asset_id: int, *tags: str, duration: float = 120.0, still: bool = False, rank: int = 0):

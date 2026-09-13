@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import pytest
 
-from app.domain import scenario as sc
-from app.domain.scenario import anchors, layout
-from app.domain.subtitles import SubtitleCue
+from montage import scenario as sc
+from montage.scenario import anchors, layout
+from montage.subtitles import SubtitleCue
 
 
 def piece(name, *, optional=False, priority=0, **duration) -> sc.Element:

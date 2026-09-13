@@ -12,9 +12,9 @@ import dataclasses
 
 import pytest
 
-from app.domain import scenario as sc
-from app.domain.inserts import AssetOption
-from app.domain.style import StyleSpec
+from montage import scenario as sc
+from montage.rules.inserts import AssetOption
+from montage.style import StyleSpec
 
 
 def style(**groups) -> StyleSpec:

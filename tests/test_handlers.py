@@ -402,7 +402,9 @@ class TestRenderHandler:
     @pytest.fixture(autouse=True)
     def _fakes(self, monkeypatch, tmp_path, source_file):
         from app.adapters.asr import cache, selection
-        from app.adapters.media import compiler, ffmpeg
+        from app.adapters.media import ffmpeg
+        from montage.render import compiler
+        from montage.render import probe as media_probe
 
         rendered = tmp_path / "rendered.mp4"
         rendered.write_bytes(b"\x00" * 512)
@@ -430,7 +432,7 @@ class TestRenderHandler:
             lambda *a, **k: (transcript, {"source": "fake"}),
         )
         monkeypatch.setattr(ffmpeg, "clip_output_path", lambda *a, **k: str(rendered))
-        monkeypatch.setattr(ffmpeg, "cover_path_for", lambda path: str(cover))
+        monkeypatch.setattr(media_probe, "cover_path_for", lambda path: str(cover))
         # Only the encode is faked. Planning runs for real, so what these tests
         # exercise is the composition the handler actually hands to ffmpeg.
         self.rendered_compositions = []
@@ -446,7 +448,7 @@ class TestRenderHandler:
             )
 
         monkeypatch.setattr(compiler, "render", fake_render)
-        monkeypatch.setattr(ffmpeg, "render_clip_cover", lambda **k: str(cover))
+        monkeypatch.setattr(media_probe, "render_clip_cover", lambda **k: str(cover))
         self.rendered = str(rendered)
 
     def _planned_clip(self, db, source_file, render_options=None) -> tuple[int, int]:
@@ -614,7 +616,7 @@ class TestRenderHandler:
         assert self.rendered_compositions[-1].music is None
 
     def test_a_failed_render_marks_only_that_clip(self, db, source_file, monkeypatch):
-        from app.adapters.media import compiler
+        from montage.render import compiler
 
         def explode(*a, **k):
             raise RuntimeError("ffmpeg exited with code 1")
@@ -1154,6 +1156,6 @@ class TestRenderedStyle(TestRenderHandler):
         assert stored["segments"]
         assert stored["style"]["delivery"]["width"] == 1080
         # And it loads back into the very thing that produced it.
-        from app.domain import composition as comp
+        from montage import composition as comp
 
         assert comp.from_dict(stored) == self.rendered_compositions[-1]
