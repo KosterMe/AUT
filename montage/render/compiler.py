@@ -222,41 +222,50 @@ def choose_strategy(composition: comp.Composition) -> str:
         return STRATEGY_TWO_STAGE
     if len(composition.layers) > settings.one_pass_max_inserts:
         return STRATEGY_TWO_STAGE
-    if len(composition.layouts) > 1:
+    if len(composition.framings) > 1:
         return STRATEGY_TWO_STAGE
     if _cached_share(composition) >= 0.5:
         return STRATEGY_TWO_STAGE
     return STRATEGY_ONE_PASS
 
 
-def choose_layout(
+def frame_for_source(
     source_path: str,
     canvas: comp.Canvas,
     *,
     requested: str = LAYOUT_AUTO,
     tolerance: float = 0.15,
-) -> str:
-    """How this source should fill the canvas.
+) -> tuple[comp.Frame, bool]:
+    """How this source should fill the canvas: a rectangle and a backdrop.
 
-    Only `auto` is decided here; a profile that asked for a specific layout
+    Only `auto` is decided here; a style that asked for a particular framing
     gets it. The decision is about shape and nothing else: a source that is
     already about as tall and narrow as the canvas is cropped to fill it,
     because giving a vertical video a blurred backdrop made of itself is a
     frame of wasted screen. Anything wider keeps the backdrop.
+
+    The named layouts are still the vocabulary a style speaks — they leave when
+    profiles become scenarios (§9.2) — but nothing past this point knows them.
     """
     if requested and requested != LAYOUT_AUTO:
-        return requested
+        return comp.frame_for_layout(requested), requested == comp.LAYOUT_BLUR
 
     probe = probe_media(source_path)
     width, height = probe.get("width"), probe.get("height")
     if not width or not height:
-        return comp.LAYOUT_BLUR
+        # Cropping to a shape nobody measured is the worse guess.
+        return comp.CONTAINED, True
 
     source_aspect = float(width) / float(height)
     canvas_aspect = canvas.width / canvas.height
     if source_aspect <= canvas_aspect * (1.0 + tolerance):
-        return comp.LAYOUT_FILL
-    return comp.LAYOUT_BLUR
+        return comp.FULL_FRAME, False
+    return comp.CONTAINED, True
+
+
+def _unsplit(layout: str) -> str:
+    """A split screen that lost its bottom half falls back to deciding on shape."""
+    return LAYOUT_AUTO if layout == comp.LAYOUT_SPLIT else layout
 
 
 def plan_vertical_clip(
@@ -293,21 +302,32 @@ def plan_vertical_clip(
             input_path, start_sec=start_sec, end_sec=end_sec, pacing=look.pacing
         )
 
-    resolved_layout = choose_layout(
-        input_path, canvas,
-        requested=look.framing.layout, tolerance=look.framing.fill_tolerance,
-    )
-    if resolved_layout == comp.LAYOUT_SPLIT and not companion_path:
+    wants_split = look.framing.layout == comp.LAYOUT_SPLIT
+    if wants_split and not companion_path:
         # Asked for a split screen with nothing to put in the bottom half. The
         # clip is still worth making, so it falls back rather than failing.
         log.warning("no companion source for a split screen; falling back to a blurred backdrop")
-        resolved_layout = comp.LAYOUT_BLUR
+        wants_split = False
 
+    frame, backdrop = frame_for_source(
+        input_path, canvas,
+        requested=comp.LAYOUT_SPLIT if wants_split else _unsplit(look.framing.layout),
+        tolerance=look.framing.fill_tolerance,
+    )
     draft = comp.single_source(
         input_path, start_sec=start_sec, end_sec=end_sec, keep_segments=keep_segments,
-        canvas=canvas, style=look, layout=resolved_layout,
-        companion_path=companion_path if resolved_layout == comp.LAYOUT_SPLIT else None,
+        canvas=canvas, style=look, frame=frame, backdrop=backdrop,
     )
+    if wants_split and companion_path:
+        # One layer across the clip rather than a second source on every
+        # segment: the bottom half runs continuously and always did.
+        draft = dataclasses.replace(draft, layers=draft.layers + (comp.Layer(
+            source_path=companion_path,
+            at_sec=0.0,
+            duration_sec=draft.duration_sec,
+            frame=comp.BOTTOM_HALF,
+            z=-1,
+        ),))
     cues: list[subtitles.SubtitleCue] = []
     if look.subtitles.enabled:
         cues = subtitles.make_subtitle_cues(
@@ -316,11 +336,9 @@ def plan_vertical_clip(
             fallback_text=fallback_subtitle_text,
             style=look.subtitles,
         )
-    return comp.Composition(
-        spine=draft.spine,
-        canvas=canvas,
+    return dataclasses.replace(
+        draft,
         subtitles=comp.SubtitleSpec(cues=tuple(cues), title_text=title_text),
-        style=look,
     )
 
 
@@ -371,15 +389,9 @@ def one_pass_args(
     for index, segment in enumerate(composition.spine):
         video_input = _add_input(inputs, segment.source_path,
                                  start=segment.source_start_sec, duration=segment.duration_sec)
-        companion_input = None
-        if segment.layout == comp.LAYOUT_SPLIT and segment.companion_path:
-            companion_input = _add_input(inputs, segment.companion_path,
-                                         start=segment.companion_start_sec,
-                                         duration=segment.duration_sec, loop=True)
         chain, video_label = _segment_video_chain(
             index, composition.canvas, segment,
             video_in=f"[{video_input}:v]",
-            companion_in=None if companion_input is None else f"[{companion_input}:v]",
             framing=composition.style.framing,
         )
         parts.extend(chain)
@@ -537,16 +549,10 @@ def fragment_args(
     inputs: list[str] = []
     video_input = _add_input(inputs, segment.source_path,
                              start=segment.source_start_sec, duration=segment.duration_sec)
-    companion_input = None
-    if segment.layout == comp.LAYOUT_SPLIT and segment.companion_path:
-        companion_input = _add_input(inputs, segment.companion_path,
-                                     start=segment.companion_start_sec,
-                                     duration=segment.duration_sec, loop=True)
 
     parts, video_label = _segment_video_chain(
         index, composition.canvas, segment,
         video_in=f"[{video_input}:v]",
-        companion_in=None if companion_input is None else f"[{companion_input}:v]",
         framing=composition.style.framing,
     )
     parts.append(f"[{video_label}]format=yuv420p,setsar=1[v]")
@@ -597,45 +603,56 @@ def _segment_video_chain(
     segment: comp.Segment,
     *,
     video_in: str,
-    companion_in: str | None,
     framing: style_module.FramingStyle | None = None,
 ) -> tuple[list[str], str]:
-    """Compose one segment into the canvas. Returns (chain parts, out label)."""
+    """Compose one segment into the canvas. Returns (chain parts, out label).
+
+    Three branches became one rectangle and one flag. What used to be `fill`
+    is a frame covering the canvas; `blur` is a frame contained inside it with
+    a blurred copy of itself behind; `split` is a frame filling half of it,
+    with the other half left for a layer. Combinations nobody could ask for
+    before — a source letterboxed on black, a source in the upper third —
+    follow from the same two fields rather than from a fourth branch.
+    """
     prefix = f"s{index}"
     out = f"v{index}"
-    frame = framing or style_module.FramingStyle.from_settings()
+    look = framing or style_module.FramingStyle.from_settings()
     normalise = f"fps={canvas.fps},setpts=PTS-STARTPTS"
+    left, top, width, height = segment.frame.box(canvas)
+    height = height or canvas.height
 
-    if segment.layout == comp.LAYOUT_FILL:
+    if segment.backdrop:
+        # The backdrop is made from this segment and nothing else, which is
+        # why it lives here rather than as a layer: there is no other source
+        # to take it from. Shrinking before the blur costs the divisor squared
+        # less for the same look, since a heavy blur discards the detail the
+        # downscale removed anyway.
+        parts = [
+            f"{video_in}{normalise},split=2[{prefix}bgsrc][{prefix}fgsrc]",
+            filters.background(canvas.width, canvas.height, src=f"[{prefix}bgsrc]",
+                               out=f"{prefix}bg", divisor=look.blur_divisor,
+                               radius=look.blur_radius),
+            filters.foreground(canvas.width, canvas.height, src=f"[{prefix}fgsrc]",
+                               out=f"{prefix}fg", zoom=look.zoom),
+            f"[{prefix}bg][{prefix}fg]overlay=(W-w)/2:(H-h)/2[{out}]",
+        ]
+        return parts, out
+
+    if (left, top, width, height) == (0, 0, canvas.width, canvas.height):
         return (
             [filters.fill(canvas.width, canvas.height, src=f"{video_in}{normalise},", out=out)],
             out,
         )
 
-    if segment.layout == comp.LAYOUT_SPLIT:
-        if not companion_in:
-            raise ValueError("a split-screen segment needs a companion input")
-        half = canvas.half_height
-        return (
-            [
-                filters.fill(canvas.width, half,
-                             src=f"{video_in}{normalise},", out=f"{prefix}top"),
-                filters.fill(canvas.width, half,
-                             src=f"{companion_in}{normalise},", out=f"{prefix}bottom"),
-                f"[{prefix}top][{prefix}bottom]vstack=inputs=2[{out}]",
-            ],
-            out,
-        )
-
+    # A frame smaller than the canvas: fill the box, then place it. What the
+    # box does not cover stays black, and a layer is free to sit there — which
+    # is exactly what the bottom half of a split screen now is.
     return (
         [
-            f"{video_in}{normalise},split=2[{prefix}bgsrc][{prefix}fgsrc]",
-            filters.background(canvas.width, canvas.height, src=f"[{prefix}bgsrc]",
-                               out=f"{prefix}bg", divisor=frame.blur_divisor,
-                               radius=frame.blur_radius),
-            filters.foreground(canvas.width, canvas.height, src=f"[{prefix}fgsrc]",
-                               out=f"{prefix}fg", zoom=frame.zoom),
-            f"[{prefix}bg][{prefix}fg]overlay=(W-w)/2:(H-h)/2[{out}]",
+            f"{video_in}{normalise},"
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},"
+            f"pad={canvas.width}:{canvas.height}:{left}:{top}:black[{out}]"
         ],
         out,
     )
@@ -738,7 +755,19 @@ def _layer_geometry(frame: comp.Frame, canvas: comp.Canvas) -> tuple[str, str]:
             "0:0",
         )
     left, top, width, height = frame.box(canvas)
-    fit = f"scale={width}:{height}" if height else f"scale={width}:-2"
+    if not height:
+        # No height asked for, so the aspect ratio decides it — `-2` keeps the
+        # dimension even, which yuv420p requires.
+        fit = f"scale={width}:-2"
+    elif frame.fit == "cover":
+        # A box with both dimensions and something that has to fill it: scale
+        # past and crop, rather than stretch a wide source into a tall hole.
+        fit = (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height}"
+        )
+    else:
+        fit = f"scale={width}:{height}"
     return fit, f"{left}:{top}"
 
 
@@ -877,11 +906,9 @@ def fragment_path(
         for part in (
             comp.VERSION,
             canvas.width, canvas.height, canvas.fps,
-            segment.layout,
+            segment.frame, segment.backdrop,
             _source_identity(segment.source_path),
             f"{segment.source_start_sec:.3f}", f"{segment.source_end_sec:.3f}",
-            _source_identity(segment.companion_path) if segment.companion_path else "",
-            f"{segment.companion_start_sec:.3f}",
             frame.zoom, frame.blur_divisor, frame.blur_radius,
             settings.fragment_encoder, settings.fragment_crf,
         )
