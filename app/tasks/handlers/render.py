@@ -67,6 +67,7 @@ def handle_render(ctx: TaskContext) -> dict:
             source_path=options.get("source_path") or job.original_path or "",
             source_title=options.get("source_title") or job.display_title,
             thumbnail_path=options.get("thumbnail_path") or job.thumbnail_path,
+            scenario=job.profile,
         )
         library = rendering.library_for(session, style=style, seed=clip_id)
         clips.mark_rendering(session, clip_id)
@@ -92,6 +93,7 @@ def handle_render(ctx: TaskContext) -> dict:
 
     plan = rendering.compose_clip(
         clip=spec, job=spec, options=options, style=style,
+        scenario_name=spec.scenario,
         library=library, seed=clip_id, on_progress=ctx.progress,
     )
     composition = plan.composition
@@ -217,7 +219,7 @@ class _RenderSpec:
 
     __slots__ = (
         "clip_id", "index", "start_sec", "end_sec", "title", "text",
-        "source_path", "source_title", "thumbnail_path",
+        "source_path", "source_title", "thumbnail_path", "scenario",
     )
 
     def __init__(self, **fields):

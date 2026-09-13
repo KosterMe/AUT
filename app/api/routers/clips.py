@@ -103,6 +103,7 @@ def preview_clip(
     library = rendering.library_for(session, style=style, seed=clip_id)
     plan = rendering.compose_clip(
         clip=clip, job=job, options=options, style=style,
+        scenario_name=job.profile,
         library=library, seed=clip_id, allow_transcription=False,
     )
 
