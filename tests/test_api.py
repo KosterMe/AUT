@@ -641,6 +641,34 @@ class TestScenarioEditing:
 
         assert body["material_sec"] == 90.0
 
+    def test_a_draft_is_inspected_without_being_saved(self, client):
+        """What the editor asks on every edit. Saving first would make an
+        editor a thing that writes to the database on every keystroke, and an
+        unsaved draft is exactly the state somebody needs to see laid out
+        before deciding whether to keep it."""
+        response = client.post(
+            "/api/scenarios/inspect",
+            json={"data": self.a_scenario("Черновик"), "duration_sec": 60},
+        )
+
+        body = response.json()
+        assert response.status_code == 200
+        assert body["scenario_id"] == 0
+        assert body["name"] == "Черновик"
+        assert next(
+            b for b in body["blocks"] if b["element_id"] == "source"
+        )["duration_sec"] == 40.0
+        assert client.get("/api/scenarios").json() == [
+            row for row in client.get("/api/scenarios").json() if row["builtin"]
+        ], "nothing was stored"
+
+    def test_a_draft_that_cannot_be_read_is_refused(self, client):
+        response = client.post(
+            "/api/scenarios/inspect", json={"data": {"tracks": ["nope"]}},
+        )
+
+        assert response.status_code == 422
+
     def test_inspecting_an_unknown_scenario_is_404(self, client):
         assert client.get("/api/scenarios/999/inspect").status_code == 404
 

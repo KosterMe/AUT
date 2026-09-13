@@ -239,3 +239,210 @@ export interface PreviewRequest {
   style_id?: number | null;
   style?: StyleGroups;
 }
+
+// --- scenarios ---------------------------------------------------------------
+//
+// A scenario is a montage written before the video exists. These mirror
+// montage/scenario/store.py, and they are deliberately loose in one direction:
+// almost every field is optional, because the server's decoder fills in the
+// model's own defaults for anything left out. That is what makes it safe for
+// the editor to write a partial element — it never has to state a default it
+// did not mean to set, so there is no second copy of the defaults here to
+// drift from the first.
+
+export interface ScenarioAnimated {
+  static: number;
+  keys?: unknown[];
+}
+
+/** A number the editor sets, as the model stores it. */
+export type Numeric = ScenarioAnimated | number;
+
+export type SlotKind =
+  | "source"
+  | "source_at"
+  | "library"
+  | "upload"
+  | "color"
+  | "gradient"
+  | "text"
+  | "blur_of";
+
+export type AnchorMode = "start" | "end" | "fraction" | "after" | "before" | "event";
+
+export type DurationMode = "fixed" | "elastic" | "rest" | "until" | "natural";
+
+export type TrackKind = "spine" | "video" | "audio" | "overlay";
+
+export interface ScenarioSlot {
+  kind: SlotKind;
+  tag?: string;
+  pick?: string;
+  upload_id?: number | null;
+  color?: string;
+  template?: string;
+  ref?: string;
+  event?: unknown;
+}
+
+export interface ScenarioAnchor {
+  mode: AnchorMode;
+  value?: number;
+  ref?: string | null;
+  offset_sec?: number;
+  event?: unknown;
+}
+
+export interface ScenarioDuration {
+  mode: DurationMode;
+  value?: number;
+  grow?: number;
+  min_sec?: number;
+  max_sec?: number;
+  until?: unknown;
+}
+
+export interface ScenarioFrame {
+  /** Percent of the canvas, and x/y are the centre rather than the corner. */
+  x?: Numeric;
+  y?: Numeric;
+  width?: Numeric;
+  height?: Numeric;
+  rotate?: Numeric;
+  opacity?: Numeric;
+  fit?: string;
+  align?: string;
+  radius?: number;
+  crop?: unknown;
+  blend?: string;
+}
+
+export interface ScenarioElement {
+  id: string;
+  slot?: ScenarioSlot;
+  start?: ScenarioAnchor;
+  duration?: ScenarioDuration;
+  frame?: ScenarioFrame;
+  effects?: unknown[];
+  audio?: Record<string, unknown>;
+  transition_in?: unknown;
+  transition_out?: unknown;
+  label?: string;
+  optional?: boolean;
+  priority?: number;
+  /** Present only on rules. It is what makes an element one. */
+  rule?: string;
+  limit?: number;
+  min_gap_sec?: number;
+  guard_head_sec?: number;
+  guard_tail_sec?: number;
+  max_share?: number;
+  params?: Record<string, unknown>;
+  template?: ScenarioElement | null;
+}
+
+export interface ScenarioTrack {
+  id: string;
+  kind: TrackKind;
+  z?: number;
+  muted?: boolean;
+  locked?: boolean;
+  elements: ScenarioElement[];
+}
+
+export interface ScenarioData {
+  version?: number;
+  name?: string;
+  canvas?: { width: number; height: number; fps: number };
+  mock?: {
+    duration_sec: number;
+    width: number;
+    height: number;
+    cuts: number[];
+    sample_clip_id: number | null;
+  };
+  style?: StyleGroups;
+  tracks: ScenarioTrack[];
+}
+
+export interface Scenario {
+  id: number;
+  name: string;
+  description: string;
+  /** Ships with the service: it cannot be deleted, and an edit makes a copy. */
+  builtin: boolean;
+  data: ScenarioData;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface InspectRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  fit: string;
+}
+
+export interface InspectBlock {
+  element_id: string;
+  track_id: string;
+  track_kind: TrackKind;
+  label: string;
+  slot_kind: SlotKind;
+  slot_tag: string;
+  at_sec: number;
+  duration_sec: number;
+  anchor: AnchorMode;
+  frame: InspectRect;
+  z: number;
+  optional: boolean;
+  /** False means it was dropped: it did not fit, or nothing could fill it. */
+  placed: boolean;
+  note: string;
+}
+
+export interface InspectGhost {
+  kind: "layer" | "audio";
+  at_sec: number;
+  duration_sec: number;
+  source_path: string;
+}
+
+export interface InspectRule {
+  element_id: string;
+  rule: string;
+  track_id: string;
+  label: string;
+  limit: number;
+  ghosts: InspectGhost[];
+}
+
+export interface InspectWarning {
+  code: string;
+  message: string;
+  element_id: string;
+}
+
+export interface ScenarioInspect {
+  scenario_id: number;
+  name: string;
+  /** What the clip offered, what the scenario laid out, what will be rendered. */
+  material_sec: number;
+  timeline_sec: number;
+  duration_sec: number;
+  canvas_width: number;
+  canvas_height: number;
+  layout: string;
+  blocks: InspectBlock[];
+  rules: InspectRule[];
+  warnings: InspectWarning[];
+  subtitle_count: number;
+  durations: number[];
+}
+
+export interface ScenarioPayload {
+  name?: string;
+  description?: string | null;
+  data: ScenarioData;
+}

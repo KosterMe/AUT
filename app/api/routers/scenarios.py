@@ -28,6 +28,7 @@ from app.api.schemas.scenarios import (
     InspectWarning,
     ScenarioCreate,
     ScenarioInspect,
+    ScenarioInspectRequest,
     ScenarioPreviewRequest,
     ScenarioRead,
     ScenarioUpdate,
@@ -52,6 +53,20 @@ def list_scenarios(session: Session = Depends(db_session)):
 @router.get("/{scenario_id}", response_model=ScenarioRead)
 def get_scenario(scenario_id: int, session: Session = Depends(db_session)):
     return _read(scenarios.get(session, scenario_id))
+
+
+@router.post("/inspect", response_model=ScenarioInspect)
+def inspect_draft(payload: ScenarioInspectRequest, session: Session = Depends(db_session)):
+    """The same as `GET /{id}/inspect`, for a scenario that is not saved yet.
+
+    Declared before the routes with an id in them so `/inspect` is not read as
+    one.
+    """
+    scenario = _read_draft(payload.data)
+    report = inspector.inspect(scenario, mock.facts(
+        scenario, payload.duration_sec, assets=tuple(assets.options_for_planner(session)),
+    ))
+    return _inspect(0, scenario.name, report)
 
 
 @router.post("", response_model=ScenarioRead, status_code=status.HTTP_201_CREATED)
@@ -109,7 +124,7 @@ def inspect_scenario(
     report = inspector.inspect(scenario, mock.facts(
         scenario, duration_sec, assets=tuple(assets.options_for_planner(session)),
     ))
-    return _inspect(row, report)
+    return _inspect(row.id, row.name, report)
 
 
 @router.post("/{scenario_id}/preview")
@@ -154,8 +169,13 @@ def _draft(session: Session, scenario_id: int, payload: ScenarioPreviewRequest):
     """What to preview: the draft on screen, or the row if none was sent."""
     if payload.data is None:
         return scenarios.stored(session, scenario_id)
+    return _read_draft(payload.data)
+
+
+def _read_draft(data: dict):
+    """A scenario straight off the screen, refused if it means nothing."""
     try:
-        return store.from_dict(payload.data)
+        return store.from_dict(data)
     except store.MalformedScenario as exc:
         raise ValidationError(f"that scenario cannot be read: {exc}") from exc
 
@@ -178,10 +198,10 @@ def _read(row: Scenario) -> ScenarioRead:
     )
 
 
-def _inspect(row: Scenario, report: inspector.Report) -> ScenarioInspect:
+def _inspect(scenario_id: int, name: str, report: inspector.Report) -> ScenarioInspect:
     return ScenarioInspect(
-        scenario_id=row.id,
-        name=row.name,
+        scenario_id=scenario_id,
+        name=name,
         material_sec=report.material_sec,
         timeline_sec=report.timeline_sec,
         duration_sec=report.duration_sec,

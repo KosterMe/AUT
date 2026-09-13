@@ -9,6 +9,10 @@ import type {
   MediaAsset,
   PreviewRequest,
   Publication,
+  Scenario,
+  ScenarioData,
+  ScenarioInspect,
+  ScenarioPayload,
   StyleDefaults,
   StyleGroups,
   StylePayload,
@@ -167,6 +171,40 @@ export const Clips = {
    */
   preview: async (clipId: number, body: PreviewRequest = {}) => {
     const response = await api.post(`/clips/${clipId}/preview`, body, {
+      responseType: "blob",
+    });
+    return URL.createObjectURL(response.data as Blob);
+  },
+};
+
+export const Scenarios = {
+  list: () => api.get<Scenario[]>("/scenarios").then((r) => r.data),
+  get: (id: number) => api.get<Scenario>(`/scenarios/${id}`).then((r) => r.data),
+  create: (body: ScenarioPayload) =>
+    api.post<Scenario>("/scenarios", body).then((r) => r.data),
+  /**
+   * Saving a built-in answers with a copy of it, under a new id. The caller
+   * has to follow that id rather than keep writing to the one it addressed —
+   * otherwise the next save makes a second copy.
+   */
+  update: (id: number, body: ScenarioPayload) =>
+    api.put<Scenario>(`/scenarios/${id}`, body).then((r) => r.data),
+  remove: (id: number) => api.delete(`/scenarios/${id}`),
+  /**
+   * What this scenario does on a clip of that length. The draft is sent
+   * rather than the id: the editor asks on every edit, and what it needs laid
+   * out is what is on screen, not what was last written down.
+   */
+  inspect: (data: ScenarioData, duration_sec?: number) =>
+    api
+      .post<ScenarioInspect>("/scenarios/inspect", { data, duration_sec })
+      .then((r) => r.data),
+  /** «Примерить»: the draft on one real clip, small and fast. */
+  preview: async (
+    id: number,
+    body: { clip_id: number; data?: ScenarioData; at_sec?: number; duration_sec?: number },
+  ) => {
+    const response = await api.post(`/scenarios/${id}/preview`, body, {
       responseType: "blob",
     });
     return URL.createObjectURL(response.data as Blob);

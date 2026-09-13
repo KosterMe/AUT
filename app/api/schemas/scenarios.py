@@ -66,6 +66,19 @@ class ScenarioPreviewRequest(BaseModel):
     scale: float = Field(default=0.5, ge=0.2, le=1.0)
 
 
+class ScenarioInspectRequest(BaseModel):
+    """Take apart what is on screen, which is not what was last saved.
+
+    The editor asks this on every edit. It could save first and inspect the
+    row, but then an editor would be a thing that writes to the database on
+    every keystroke — and an unsaved draft is exactly the state somebody needs
+    to see laid out before deciding whether to keep it.
+    """
+
+    data: dict[str, Any]
+    duration_sec: Optional[float] = Field(default=None, ge=1.0, le=1800.0)
+
+
 class InspectRect(BaseModel):
     x: float
     y: float
