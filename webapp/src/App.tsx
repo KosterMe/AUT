@@ -5,6 +5,7 @@ import JobsPage from "./pages/Jobs";
 import LibraryPage from "./pages/Library";
 import JobDetailPage from "./pages/JobDetail";
 import PublicationsPage from "./pages/Publications";
+import ScenariosPage from "./pages/Scenarios";
 import QueuePage from "./pages/Queue";
 import StylesPage from "./pages/Styles";
 
@@ -17,6 +18,7 @@ export default function App() {
         <Route path="/jobs/:jobId" element={<JobDetailPage />} />
         <Route path="/library" element={<LibraryPage />} />
         <Route path="/looks" element={<StylesPage />} />
+        <Route path="/montages" element={<ScenariosPage />} />
         <Route path="/publications" element={<PublicationsPage />} />
         <Route path="/accounts" element={<AccountsPage />} />
         <Route path="/queue" element={<QueuePage />} />
