@@ -277,13 +277,20 @@ def renderer_available() -> str | None:
 
 
 def preview(
+    composition: comp.Composition,
     output_path: str,
     *,
-    spec: compiler.PreviewSpec,
-    style: style_module.StyleSpec | None = None,
-) -> str:
-    """A few seconds rendered small, to look at a style while choosing it."""
-    return compiler.render_preview(output_path, spec=spec, style=style)
+    spec: compiler.PreviewSpec | None = None,
+) -> compiler.ClipRenderResult:
+    """A few seconds of a composition rendered small, to look at while choosing.
+
+    The window comes out of the composition rather than out of the file: what
+    makes a preview cheap is that ffmpeg only ever decodes the seconds being
+    looked at (§8.3). There is no style argument — the composition carries the
+    style it was composed with, and a second one here would be a way to
+    preview something that is not what will be rendered.
+    """
+    return compiler.render_preview(composition, output_path, spec=spec)
 
 
 PreviewSpec = compiler.PreviewSpec
