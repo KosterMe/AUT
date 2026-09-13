@@ -12,8 +12,8 @@ import os
 
 import pytest
 
-from app.adapters.media import compiler
-from app.domain import composition as comp
+from montage.render import compiler
+from montage import composition as comp
 
 SOURCE = "/media/source.mp4"
 BROLL = "/media/broll.mp4"
@@ -498,7 +498,7 @@ class TestSoundtrack:
 
 
 def styled(**overrides) -> comp.Composition:
-    from app.domain.style import StyleSpec
+    from montage.style import StyleSpec
 
     return build(style=StyleSpec.from_settings().merged(overrides))
 
@@ -551,7 +551,7 @@ def test_a_pip_insert_takes_its_geometry_from_the_policy():
 def test_the_fragment_key_follows_the_style_it_was_composed_with():
     """A fragment is already composed into the canvas, so reframing has to
     invalidate it — and now the framing is on the clip, not in the process."""
-    from app.domain.style import FramingStyle
+    from montage.style import FramingStyle
 
     segment = comp.Segment(SOURCE, 0.0, 10.0)
     default = compiler.fragment_path(comp.Canvas(), segment)

@@ -17,9 +17,9 @@ Pure logic, as with every other planner: values in, values out.
 """
 from __future__ import annotations
 
-from app.domain.composition import Composition, MusicBed, SoundEffect
-from app.domain.inserts import AssetOption
-from app.domain.style import MUSIC_TAG, SFX_TAG, AudioPolicy, tag_aliases
+from montage.composition import Composition, MusicBed, SoundEffect
+from montage.rules.inserts import AssetOption
+from montage.style import MUSIC_TAG, SFX_TAG, AudioPolicy, tag_aliases
 
 
 def choose_music(

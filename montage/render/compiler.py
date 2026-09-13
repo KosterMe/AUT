@@ -40,19 +40,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from app.adapters.media import encoders
-from app.adapters.media import filters
-from app.adapters.media.ffmpeg import (
+from montage.render import encoders
+from montage.render import filters
+from montage.render.probe import (
     ffmpeg_exe,
     ffprobe_has_audio,
     media_root,
     probe_media,
     probe_render_output,
 )
-from app.core.config import get_settings
-from app.domain import composition as comp
-from app.domain import style as style_module
-from app.domain import subtitles
+from montage.config import get_settings
+from montage import composition as comp
+from montage import style as style_module
+from montage import subtitles
 
 log = logging.getLogger(__name__)
 
@@ -282,7 +282,7 @@ def plan_vertical_clip(
     and from nothing else, which is what makes the resulting composition a
     complete description of the clip rather than half of one.
     """
-    from app.adapters.media.ffmpeg import montage_keep_segments
+    from montage.render.probe import montage_keep_segments
 
     look = style or style_module.StyleSpec.from_settings()
     canvas = comp.canvas_for(look)

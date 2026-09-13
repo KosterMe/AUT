@@ -6,7 +6,7 @@ regress, so they are pinned here.
 """
 from __future__ import annotations
 
-from app.domain import subtitles
+from montage import subtitles
 
 
 
@@ -306,7 +306,7 @@ def test_the_casing_policy_applies_to_a_clip_with_no_word_timings():
 
 
 def test_the_style_decides_the_casing_on_both_paths():
-    from app.domain.style import SubtitleStyle
+    from montage.style import SubtitleStyle
 
     timeline = [subtitles.TimelineSegment(0.0, 10.0, 0.0, 10.0)]
     style = SubtitleStyle(uppercase=True)

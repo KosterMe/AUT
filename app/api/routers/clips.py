@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, status
 from fastapi.responses import FileResponse
 from sqlmodel import Session
 
-from app.adapters.media import compiler
+from montage import client as montage
 from app.adapters.media import ffmpeg as media
 from app.api.deps import db_session
 from app.api.schemas.clips import ClipPreviewRequest, ClipRead, ClipRenderRequest
@@ -114,10 +114,10 @@ def preview_clip(
 
     output_path = media.preview_output_path(clip_id)
     try:
-        compiler.render_preview(
+        montage.preview(
             plan.composition,
             output_path,
-            spec=compiler.PreviewSpec(
+            spec=montage.PreviewSpec(
                 at_sec=at_sec,
                 duration_sec=min(payload.duration_sec, length),
                 scale=payload.scale,

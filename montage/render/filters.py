@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.core.config import get_settings
+from montage.config import get_settings
 
 
 def path(value: str) -> str:

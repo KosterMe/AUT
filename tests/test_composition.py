@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import pytest
 
-from app.domain import composition as comp
-from app.domain.subtitles import SubtitleCue
+from montage import composition as comp
+from montage.subtitles import SubtitleCue
 
 
 def test_single_source_without_keep_segments_is_one_continuous_cut():

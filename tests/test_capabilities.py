@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.adapters.media import capabilities as caps
+from montage.render import capabilities as caps
 
 # Real complaints, addresses and all.
 GBLUR_STDERR = (

@@ -16,7 +16,7 @@ from app.api.deps import db_session
 from app.api.schemas.styles import StyleCreate, StyleDefaults, StyleRead, StyleUpdate
 from app.db.models import StylePreset
 from app.domain import profiles
-from app.domain import style as style_module
+from montage import style as style_module
 from app.services import styles
 
 router = APIRouter(prefix="/api/styles", tags=["styles"])

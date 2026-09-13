@@ -16,9 +16,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.domain.scenario import facts as fact_module
-from app.domain.scenario import model
-from app.domain.subtitles import SubtitleCue
+from montage.scenario import facts as fact_module
+from montage.scenario import model
+from montage.subtitles import SubtitleCue
 
 
 class CycleError(ValueError):

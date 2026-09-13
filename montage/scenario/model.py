@@ -28,8 +28,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping
 
-from app.domain.composition import Canvas
-from app.domain.style import StyleSpec
+from montage.composition import Canvas
+from montage.style import StyleSpec
 
 VERSION = 1
 

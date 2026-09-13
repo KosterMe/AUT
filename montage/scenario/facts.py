@@ -34,9 +34,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Iterator, Protocol
 
-from app.domain.inserts import AssetOption
-from app.domain.scenario import model
-from app.domain.subtitles import SubtitleCue
+from montage.rules.inserts import AssetOption
+from montage.scenario import model
+from montage.subtitles import SubtitleCue
 
 
 class FactKind(str, Enum):

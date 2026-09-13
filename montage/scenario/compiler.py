@@ -37,12 +37,12 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 
-from app.domain import audio as audio_planner
-from app.domain import composition as comp
-from app.domain import inserts as insert_planner
-from app.domain import subtitles as subtitle_builder
-from app.domain.scenario import anchors, facts as fact_module, layout as spine_layout, model
-from app.domain.style import (
+from montage.rules import audio as audio_planner
+from montage import composition as comp
+from montage.rules import inserts as insert_planner
+from montage import subtitles as subtitle_builder
+from montage.scenario import anchors, facts as fact_module, layout as spine_layout, model
+from montage.style import (
     INSERT_FULL,
     INSERT_PIP,
     LAYOUT_AUTO,

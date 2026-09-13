@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import dataclasses
 
-from app.domain.scenario import model
-from app.domain.style import StyleSpec
+from montage.scenario import model
+from montage.style import StyleSpec
 
 
 def default(style=None) -> model.Scenario:

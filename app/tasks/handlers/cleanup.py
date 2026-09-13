@@ -29,7 +29,7 @@ from datetime import timedelta
 
 from sqlmodel import col, select
 
-from app.adapters.media import compiler
+from montage import client as montage
 from app.adapters.media.ffmpeg import media_root
 from app.core.clock import utc_now
 from app.core.config import get_settings
@@ -177,12 +177,12 @@ def trim_fragment_cache(limit_gb: float) -> tuple[int, int]:
 
     Returns (files removed, bytes freed).
     """
-    directory = compiler.fragment_cache_dir()
+    directory, suffix = montage.fragment_cache()
     entries: list[tuple[float, int, str]] = []
     total = 0
     with os.scandir(directory) as listing:
         for entry in listing:
-            if not entry.is_file() or not entry.name.endswith(compiler.FRAGMENT_SUFFIX):
+            if not entry.is_file() or not entry.name.endswith(suffix):
                 continue
             try:
                 stat = entry.stat()

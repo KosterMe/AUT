@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import pytest
 
-from app.domain import composition as comp
-from app.domain import inserts
-from app.domain.subtitles import SubtitleCue
+from montage import composition as comp
+from montage.rules import inserts
+from montage.subtitles import SubtitleCue
 
 CLIP = "/media/source.mp4"
 

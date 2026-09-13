@@ -14,14 +14,14 @@ from __future__ import annotations
 import logging
 import os
 
-from app.adapters.media import compiler
 from app.adapters.media import ffmpeg as media
+from montage import client as montage
 from app.core.errors import PermanentError
 from app.db.enums import TaskKind
 from app.domain import captions as caption_builder
-from app.domain import composition as comp
+from montage import composition as comp
 from app.domain import profiles
-from app.domain import style as style_module
+from montage import style as style_module
 from app.services import assets, clip_jobs, clips, rendering
 from app.tasks.context import TaskContext
 from app.tasks.registry import register_handler
@@ -97,7 +97,7 @@ def handle_render(ctx: TaskContext) -> dict:
     composition = plan.composition
 
     ctx.progress("rendering_video", 0.25)
-    result = compiler.render(
+    result = montage.render(
         composition,
         output_path,
         strategy=options.get("strategy"),
@@ -105,9 +105,9 @@ def handle_render(ctx: TaskContext) -> dict:
     )
 
     ctx.progress("rendering_cover", 0.85)
-    cover_path = media.render_clip_cover(
+    cover_path = montage.cover(
         source_path=spec.source_path,
-        output_path=media.cover_path_for(result.output_path),
+        output_path=montage.cover_path_for(result.output_path),
         start_sec=spec.start_sec,
         title_text=caption_builder.display_title(spec.source_title, spec.title),
         part_text=f"часть {spec.index}",

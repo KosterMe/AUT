@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from app.domain.scenario import model
+from montage.scenario import model
 
 # Below this an element is not worth a segment — it is shorter than the seek
 # accuracy of most sources, and `composition.Segment` refuses it outright.

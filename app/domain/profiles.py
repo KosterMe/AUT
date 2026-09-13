@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.domain.cutting import CUTTER_SCENES, CUTTER_SPEECH, CUTTERS
-from app.domain.style import (
+from montage.style import (
     BACKGROUND_TAG,
     LAYOUT_AUTO,
     LAYOUT_SPLIT,

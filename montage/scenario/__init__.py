@@ -6,10 +6,10 @@ ship with the service, the default one first.
 """
 from __future__ import annotations
 
-from app.domain.scenario.anchors import CycleError, Span, order, resolve
-from app.domain.scenario.builtin import default
-from app.domain.scenario.compiler import CompileWarning, compile
-from app.domain.scenario.facts import (
+from montage.scenario.anchors import CycleError, Span, order, resolve
+from montage.scenario.builtin import default
+from montage.scenario.compiler import CompileWarning, compile
+from montage.scenario.facts import (
     CachingProvider,
     ClipFacts,
     FactKind,
@@ -17,9 +17,9 @@ from app.domain.scenario.facts import (
     describes,
     required_facts,
 )
-from app.domain.scenario.layout import Placement, SpineLayout, lay_out
-from app.domain.scenario.model import *  # noqa: F401,F403  (the vocabulary itself)
-from app.domain.scenario.model import Scenario
+from montage.scenario.layout import Placement, SpineLayout, lay_out
+from montage.scenario.model import *  # noqa: F401,F403  (the vocabulary itself)
+from montage.scenario.model import Scenario
 
 __all__ = [
     "CachingProvider",

@@ -80,7 +80,7 @@ def test_empty_output_is_an_empty_analysis_not_a_failure():
 
 def test_a_missing_ffmpeg_reports_why_instead_of_raising(monkeypatch):
     """Losing the scene signal should cost worse cut points, not the job."""
-    monkeypatch.setattr(scenes, "ffmpeg_exe", lambda: None)
+    monkeypatch.setattr(scenes.montage, "renderer_available", lambda: None)
 
     analysis = scenes.analyse("/media/film.mkv")
 
@@ -89,8 +89,8 @@ def test_a_missing_ffmpeg_reports_why_instead_of_raising(monkeypatch):
 
 
 def test_a_failed_probe_reports_why_instead_of_raising(monkeypatch):
-    monkeypatch.setattr(scenes, "ffmpeg_exe", lambda: "ffmpeg")
-    monkeypatch.setattr(scenes, "ffprobe_has_audio", lambda path: False)
+    monkeypatch.setattr(scenes.montage, "renderer_available", lambda: "ffmpeg")
+    monkeypatch.setattr(scenes.montage, "has_audio", lambda path: False)
 
     class Failed:
         returncode = 1
@@ -106,8 +106,8 @@ def test_a_failed_probe_reports_why_instead_of_raising(monkeypatch):
 
 
 def test_a_source_without_audio_is_analysed_for_scenes_alone(monkeypatch):
-    monkeypatch.setattr(scenes, "ffmpeg_exe", lambda: "ffmpeg")
-    monkeypatch.setattr(scenes, "ffprobe_has_audio", lambda path: False)
+    monkeypatch.setattr(scenes.montage, "renderer_available", lambda: "ffmpeg")
+    monkeypatch.setattr(scenes.montage, "has_audio", lambda path: False)
     seen: dict[str, list[str]] = {}
 
     class Done:
@@ -128,8 +128,8 @@ def test_a_source_without_audio_is_analysed_for_scenes_alone(monkeypatch):
 
 
 def test_the_threshold_reaches_the_filter(monkeypatch):
-    monkeypatch.setattr(scenes, "ffmpeg_exe", lambda: "ffmpeg")
-    monkeypatch.setattr(scenes, "ffprobe_has_audio", lambda path: True)
+    monkeypatch.setattr(scenes.montage, "renderer_available", lambda: "ffmpeg")
+    monkeypatch.setattr(scenes.montage, "has_audio", lambda path: True)
     seen: dict[str, list[str]] = {}
 
     class Done:
