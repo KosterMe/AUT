@@ -185,6 +185,21 @@ class TestTheFitDecidesTheFrame:
         assert got.spine[0].frame == comp.FULL_FRAME and not got.spine[0].backdrop
 
 
+def with_rule(*rules: sc.RuleElement) -> sc.Scenario:
+    """A plain spine plus these rules, and nothing else in the way."""
+    source = sc.Element(
+        id="source", duration=sc.Duration(mode=sc.DurationMode.ELASTIC),
+    )
+    return sc.Scenario(
+        name="rules",
+        tracks=(
+            sc.Track(id="spine", kind=sc.TRACK_SPINE, elements=(source,)),
+            sc.Track(id="over", kind=sc.TRACK_OVERLAY, z=1, elements=rules),
+        ),
+        style=style(),
+    )
+
+
 def talking() -> sc.Scenario:
     """The b-roll-and-music scenario, as §9.2 describes `talking`.
 
@@ -424,15 +439,157 @@ class TestRulesExpandAgainstTheClip:
         assert got.stingers
         assert all(effect.source_path == "/media/library/whoosh.wav" for effect in got.stingers)
 
-    def test_a_rule_nobody_has_implemented_says_so(self):
-        scenario = talking()
-        cadence = sc.RuleElement(id="cadence", rule=sc.RULE_CADENCE)
-        scenario = dataclasses.replace(
-            scenario,
-            tracks=scenario.tracks[:2] + (
-                dataclasses.replace(scenario.tracks[2], elements=(cadence,)),
-            ) + scenario.tracks[3:],
+    def test_cadence_places_its_template_on_a_beat(self):
+        """A logo every thirty seconds is a thing people ask for, and writing
+        it as four elements with four anchors is how a scenario stops
+        surviving a clip of a different length."""
+        logo = sc.Element(
+            id="logo", slot=sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"),
+            duration=sc.Duration(mode=sc.DurationMode.FIXED, value=2.0),
         )
+        rule = sc.RuleElement(
+            id="beat", rule=sc.RULE_CADENCE, template=logo, params={"every_sec": 20.0},
+            guard_head_sec=5.0, guard_tail_sec=5.0, min_gap_sec=1.0, limit=10,
+        )
+
+        got, _ = sc.compile(with_rule(rule), facts())
+
+        assert [layer.at_sec for layer in got.layers] == [5.0, 25.0, 45.0, 65.0]
+        assert all(layer.duration_sec == 2.0 for layer in got.layers)
+
+    def test_cadence_stops_at_the_limit_it_was_given(self):
+        logo = sc.Element(
+            id="logo", slot=sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"),
+            duration=sc.Duration(mode=sc.DurationMode.FIXED, value=2.0),
+        )
+        rule = sc.RuleElement(
+            id="beat", rule=sc.RULE_CADENCE, template=logo, params={"every_sec": 10.0},
+            limit=2, min_gap_sec=1.0,
+        )
+
+        got, _ = sc.compile(with_rule(rule), facts())
+
+        assert len(got.layers) == 2
+
+    def test_a_rule_never_takes_more_of_the_clip_than_its_share(self):
+        """The limit the README earned, applied to a rule that carries it
+        itself rather than to a policy object beside it."""
+        long_one = sc.Element(
+            id="long", slot=sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"),
+            duration=sc.Duration(mode=sc.DurationMode.FIXED, value=20.0),
+        )
+        rule = sc.RuleElement(
+            id="beat", rule=sc.RULE_CADENCE, template=long_one,
+            params={"every_sec": 5.0}, limit=20, min_gap_sec=1.0, max_share=0.25,
+        )
+
+        got, _ = sc.compile(with_rule(rule), facts())
+        covered = sum(layer.duration_sec for layer in got.layers)
+
+        assert covered <= got.duration_sec * 0.25 + 0.001
+        assert got.layers, "a quarter of the clip is still some of it"
+
+    def test_a_template_that_is_a_sound_makes_sounds_not_pictures(self):
+        """The same distinction an element makes anywhere else: a thing with
+        `audio.enabled` is a sound. A rule does not need a second vocabulary
+        for it."""
+        sting = sc.Element(
+            id="sting", slot=sc.Slot(kind=sc.SLOT_LIBRARY, tag="sfx"),
+            duration=sc.Duration(mode=sc.DurationMode.FIXED, value=1.0),
+            audio=sc.ElementAudio(enabled=True),
+        )
+        rule = sc.RuleElement(
+            id="beat", rule=sc.RULE_CADENCE, template=sting,
+            params={"every_sec": 30.0}, min_gap_sec=1.0,
+        )
+
+        got, _ = sc.compile(with_rule(rule), facts())
+
+        assert not got.layers
+        # Three beats on this clip, and the same sound each time: one sting
+        # repeating is what a sting is, so the library is not asked to have
+        # three of them.
+        assert [track.at_sec for track in got.audio] == [2.5, 32.5, 62.5]
+        assert {track.source_path for track in got.audio} == {"/media/library/whoosh.wav"}
+
+    def test_on_loudest_goes_where_the_clip_is_loudest(self):
+        peak = sc.Element(
+            id="peak", slot=sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"),
+            duration=sc.Duration(mode=sc.DurationMode.FIXED, value=2.0),
+        )
+        rule = sc.RuleElement(
+            id="loud", rule=sc.RULE_ON_LOUDEST, template=peak, limit=2,
+            min_gap_sec=1.0, guard_head_sec=0.0, guard_tail_sec=0.0,
+        )
+        # Quiet everywhere except two moments, and the louder of them first.
+        curve = tuple((float(second), -40.0) for second in range(0, 90))
+        curve = curve[:20] + ((20.0, -5.0),) + curve[21:70] + ((70.0, -12.0),) + curve[71:]
+
+        got, _ = sc.compile(with_rule(rule), facts(loudness=curve))
+
+        # 20 and 70 in clip time. Two pauses were cut before the second one
+        # (30–32 and 60–62), so it lands four seconds earlier in the output —
+        # which is the whole reason the mapping exists.
+        assert [layer.at_sec for layer in got.layers] == [20.0, 66.0]
+
+    def test_on_loudest_ignores_a_moment_that_was_cut_out(self):
+        """A peak inside a removed pause is not in the clip at all, and
+        placing something at it would land after the moment it was chosen
+        for."""
+        peak = sc.Element(
+            id="peak", slot=sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"),
+            duration=sc.Duration(mode=sc.DurationMode.FIXED, value=2.0),
+        )
+        rule = sc.RuleElement(
+            id="loud", rule=sc.RULE_ON_LOUDEST, template=peak, limit=1,
+            guard_head_sec=0.0, guard_tail_sec=0.0,
+        )
+        # The loudest reading sits in the 30–32 pause that silence removal cut.
+        curve = ((31.0, -1.0), (50.0, -20.0), (10.0, -60.0))
+
+        got, _ = sc.compile(with_rule(rule), facts(loudness=curve))
+
+        assert [layer.at_sec for layer in got.layers] == [48.0]
+
+    def test_on_loudest_without_a_curve_does_nothing(self):
+        """And says nothing either: the scenario asked for the fact, and
+        whether it was measured is the caller's business."""
+        peak = sc.Element(
+            id="peak", slot=sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"),
+            duration=sc.Duration(mode=sc.DurationMode.FIXED, value=2.0),
+        )
+        rule = sc.RuleElement(id="loud", rule=sc.RULE_ON_LOUDEST, template=peak)
+
+        got, notes = sc.compile(with_rule(rule), facts(loudness=()))
+
+        assert not got.layers
+        assert not [note for note in notes if note.code == "rule_without_template"]
+
+    def test_a_scenario_with_on_loudest_asks_for_the_curve(self):
+        """Which is what makes the fact get measured at all — it is derived
+        from the scenario, never configured beside it (§6.1)."""
+        peak = sc.Element(id="peak", slot=sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"))
+        rule = sc.RuleElement(id="loud", rule=sc.RULE_ON_LOUDEST, template=peak)
+
+        assert sc.FactKind.LOUDNESS in sc.required_facts(with_rule(rule))
+
+    def test_a_rule_with_nothing_to_place_says_so(self):
+        """A rule is an element that says how to make several, so what it
+        makes is an element — its template. Without one there is nothing to
+        place, and doing nothing quietly is how an operator spends an evening
+        wondering why the automation never fires."""
+        scenario = with_rule(sc.RuleElement(id="cadence", rule=sc.RULE_CADENCE))
+
+        _, notes = sc.compile(scenario, facts())
+
+        assert any(n.code == "rule_without_template" for n in notes)
+
+    def test_a_rule_nobody_has_implemented_says_so(self, monkeypatch):
+        """The branch that catches the next rule: added to the model, and the
+        compiler half forgotten. It has to be visible rather than silent, so
+        the test adds one the same way that mistake would."""
+        monkeypatch.setattr(sc.model, "RULES", sc.model.RULES + ("телепатия",))
+        scenario = with_rule(sc.RuleElement(id="psychic", rule="телепатия"))
 
         _, notes = sc.compile(scenario, facts())
 

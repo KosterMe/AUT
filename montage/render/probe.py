@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -284,6 +285,84 @@ def _parse_silencedetect(stderr: str, *, duration: float) -> list[tuple[float, f
         if duration > start:
             silences.append((start, duration))
     return silences
+
+
+# One RMS reading per second, as ffmpeg's metadata printer names it.
+LOUDNESS_KEY = "lavfi.astats.Overall.RMS_level"
+_METADATA_BLOCK = re.compile(r"^frame:\d+\s+pts:\d+\s+pts_time:(?P<time>[0-9.]+)")
+_METADATA_VALUE = re.compile(r"^(?P<key>[\w.]+)=(?P<value>.+)$")
+
+
+def loudness_curve(
+    video_path: str, *, start_sec: float, end_sec: float
+) -> list[tuple[float, float]]:
+    """How loud the clip is, second by second, in clip time.
+
+    One pass over the clip — seconds, not milliseconds (§6.1's table), which
+    is why no scenario pays for it unless something in it actually asks.
+
+    In *clip* time, counted from `start_sec`: the caller maps it into output
+    time, because whether a pause was cut out is the compiler's business and
+    not ffmpeg's. A source without an audio track measures as nothing at all,
+    which is the truth about it rather than an error.
+    """
+    ffmpeg = ffmpeg_exe()
+    if not ffmpeg or not ffprobe_has_audio(video_path):
+        return []
+
+    duration = max(0.1, end_sec - start_sec)
+    try:
+        proc = subprocess.run(
+            [
+                ffmpeg, "-hide_banner", "-nostats", "-loglevel", "warning",
+                "-ss", f"{start_sec:.3f}", "-t", f"{duration:.3f}", "-i", video_path,
+                "-map", "0:a:0",
+                # One measurement per second: `asetnsamples` fixes the window,
+                # which astats' own `reset` counts in decoder frames rather
+                # than in time.
+                "-af",
+                "aformat=sample_rates=48000,asetnsamples=n=48000:p=0,"
+                f"astats=metadata=1:reset=1,ametadata=print:key={LOUDNESS_KEY}:file=-",
+                "-f", "null", "-",
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=get_settings().render.silence_scan_timeout_seconds,
+        )
+    except subprocess.SubprocessError:
+        return []
+    if proc.returncode != 0:
+        return []
+    return parse_loudness(proc.stdout)
+
+
+def parse_loudness(output: str) -> list[tuple[float, float]]:
+    """Read ffmpeg's metadata printer.
+
+    It emits a header line naming the frame's time, then one line per metadata
+    key on it, so a value is attributed to whichever block it follows.
+    """
+    curve: list[tuple[float, float]] = []
+    at: float | None = None
+    for line in output.splitlines():
+        line = line.strip()
+        block = _METADATA_BLOCK.match(line)
+        if block:
+            at = _as_float(block.group("time"))
+            continue
+        value = _METADATA_VALUE.match(line)
+        if not value or at is None or value.group("key") != LOUDNESS_KEY:
+            continue
+        level = _as_float(value.group("value"))
+        # A digitally silent window reports -inf, which parses as a float and
+        # would sail through any "did it parse" check. It is real information
+        # — the quietest thing there is — so it is kept, as a number something
+        # can be compared against.
+        if level is None or not math.isfinite(level):
+            level = -120.0
+        curve.append((round(at, 3), level))
+    return curve
 
 
 def render_clip_cover(
