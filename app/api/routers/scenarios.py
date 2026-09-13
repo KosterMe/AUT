@@ -23,6 +23,7 @@ from app.api.deps import db_session
 from app.api.schemas.scenarios import (
     InspectBlock,
     InspectGhost,
+    InspectKey,
     InspectRect,
     InspectRule,
     InspectWarning,
@@ -63,9 +64,14 @@ def inspect_draft(payload: ScenarioInspectRequest, session: Session = Depends(db
     one.
     """
     scenario = _read_draft(payload.data)
-    report = inspector.inspect(scenario, mock.facts(
-        scenario, payload.duration_sec, assets=tuple(assets.options_for_planner(session)),
-    ))
+    report = inspector.inspect(
+        scenario,
+        mock.facts(
+            scenario, payload.duration_sec,
+            assets=tuple(assets.options_for_planner(session)),
+        ),
+        at_sec=payload.at_sec,
+    )
     return _inspect(0, scenario.name, report)
 
 
@@ -111,6 +117,7 @@ def delete_scenario(scenario_id: int, session: Session = Depends(db_session)):
 def inspect_scenario(
     scenario_id: int,
     duration_sec: float | None = Query(default=None, ge=1.0, le=1800.0),
+    at_sec: float = Query(default=0.0, ge=0.0),
     session: Session = Depends(db_session),
 ):
     """This scenario on a clip of that length, taken apart.
@@ -121,9 +128,11 @@ def inspect_scenario(
     """
     row = scenarios.get(session, scenario_id)
     scenario = scenarios.stored(session, scenario_id)
-    report = inspector.inspect(scenario, mock.facts(
-        scenario, duration_sec, assets=tuple(assets.options_for_planner(session)),
-    ))
+    report = inspector.inspect(
+        scenario,
+        mock.facts(scenario, duration_sec, assets=tuple(assets.options_for_planner(session))),
+        at_sec=at_sec,
+    )
     return _inspect(row.id, row.name, report)
 
 
@@ -222,12 +231,19 @@ def _inspect(scenario_id: int, name: str, report: inspector.Report) -> ScenarioI
                 frame=InspectRect(
                     x=block.frame.x, y=block.frame.y,
                     width=block.frame.width, height=block.frame.height,
-                    fit=block.frame.fit,
+                    fit=block.frame.fit, moving=block.frame.moving,
                 ),
                 z=block.z,
                 optional=block.optional,
                 placed=block.placed,
                 note=block.note,
+                keys=[
+                    InspectKey(
+                        property=key.property, at_sec=key.at_sec, value=key.value,
+                        easing=key.easing, anchor=key.anchor,
+                    )
+                    for key in block.keys
+                ],
             )
             for block in report.blocks
         ],
@@ -255,5 +271,6 @@ def _inspect(scenario_id: int, name: str, report: inspector.Report) -> ScenarioI
             for warning in report.warnings
         ],
         subtitle_count=report.subtitle_count,
+        at_sec=report.at_sec,
         durations=list(mock.DURATIONS),
     )

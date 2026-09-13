@@ -1,8 +1,20 @@
 import { useRef } from "react";
 import clsx from "clsx";
 import { AlertTriangle } from "lucide-react";
-import type { InspectBlock, InspectRule, ScenarioData, ScenarioInspect } from "../api/types";
-import { ANCHOR_GLYPHS, SLOT_COLORS, TRACK_LABELS } from "../pages/scenarioModel";
+import type {
+  InspectBlock,
+  InspectKey,
+  InspectRule,
+  ScenarioData,
+  ScenarioInspect,
+} from "../api/types";
+import {
+  ANCHOR_GLYPHS,
+  PROPERTY_LABELS,
+  SLOT_COLORS,
+  TRACK_LABELS,
+  type Animatable,
+} from "../pages/scenarioModel";
 
 /**
  * The timeline, drawn from one compile of the draft.
@@ -22,6 +34,8 @@ export default function ScenarioTimeline({
   onScrub,
   selected,
   onSelect,
+  onMoveKey,
+  onMoveKeyEnd,
 }: {
   data: ScenarioData;
   report: ScenarioInspect;
@@ -29,9 +43,13 @@ export default function ScenarioTimeline({
   onScrub: (at: number) => void;
   selected: string | null;
   onSelect: (id: string) => void;
+  /** Dragging a diamond: the key's new second, as the lane measures it. */
+  onMoveKey?: (property: Animatable, index: number, atSec: number) => void;
+  onMoveKeyEnd?: () => void;
 }) {
   const lane = useRef<HTMLDivElement>(null);
   const length = Math.max(1, report.timeline_sec);
+  const chosen = report.blocks.find((block) => block.element_id === selected);
 
   const blocksByTrack = new Map<string, InspectBlock[]>();
   report.blocks.forEach((block) => {
@@ -154,6 +172,15 @@ export default function ScenarioTimeline({
         </div>
       </div>
 
+      {chosen && chosen.keys.length > 0 && (
+        <KeyLanes
+          block={chosen}
+          length={length}
+          onMoveKey={onMoveKey}
+          onMoveKeyEnd={onMoveKeyEnd}
+        />
+      )}
+
       <div className="flex gap-4 pl-28 pt-1 text-[11px] text-slate-500">
         <span>материал {report.material_sec.toFixed(0)} с</span>
         <span>сценарий {report.timeline_sec.toFixed(1)} с</span>
@@ -229,4 +256,118 @@ function ticks(length: number): number[] {
   const out: number[] = [];
   for (let at = 0; at <= length + 0.001; at += step) out.push(Math.round(at));
   return out;
+}
+
+
+/**
+ * The animation track: one lane per property that moves, with a diamond at
+ * every key (§8.2).
+ *
+ * The seconds are the compiler's, not the editor's — a key written as "half a
+ * second before the end" is drawn where that lands on *this* mock length, so
+ * switching the layout switcher moves the diamond, which is the whole point of
+ * anchoring keys instead of timing them.
+ */
+function KeyLanes({
+  block,
+  length,
+  onMoveKey,
+  onMoveKeyEnd,
+}: {
+  block: InspectBlock;
+  length: number;
+  onMoveKey?: (property: Animatable, index: number, atSec: number) => void;
+  onMoveKeyEnd?: () => void;
+}) {
+  const byProperty = new Map<string, InspectKey[]>();
+  block.keys.forEach((key) => {
+    byProperty.set(key.property, [...(byProperty.get(key.property) ?? []), key]);
+  });
+
+  return (
+    <div className="mt-1 border-t border-dashed border-slate-200 pt-1">
+      {[...byProperty.entries()].map(([property, keys]) => (
+        <div key={property} className="flex items-stretch">
+          <div className="w-28 shrink-0 py-1 pr-2 text-right">
+            <span className="text-[11px] text-brand-700">
+              {PROPERTY_LABELS[property as Animatable] ?? property}
+            </span>
+          </div>
+          <Lane
+            keys={keys}
+            length={length}
+            onMove={
+              onMoveKey && ((index, at) => onMoveKey(property as Animatable, index, at))
+            }
+            onMoveEnd={onMoveKeyEnd}
+          />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Lane({
+  keys,
+  length,
+  onMove,
+  onMoveEnd,
+}: {
+  keys: InspectKey[];
+  length: number;
+  onMove?: (index: number, atSec: number) => void;
+  onMoveEnd?: () => void;
+}) {
+  const lane = useRef<HTMLDivElement>(null);
+
+  function drag(event: React.PointerEvent, index: number, key: InspectKey) {
+    if (!onMove) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const bounds = lane.current?.getBoundingClientRect();
+    if (!bounds) return;
+    // An end-anchored key has no absolute second to set: what moves is how
+    // far before the end it sits, which is a negative number.
+    const toValue = (clientX: number) => {
+      const at = ((clientX - bounds.left) / bounds.width) * length;
+      const clamped = Math.max(0, Math.min(length, at));
+      return key.anchor === "end" ? clamped - length : clamped;
+    };
+
+    function move(moveEvent: PointerEvent) {
+      onMove!(index, Math.round(toValue(moveEvent.clientX) * 10) / 10);
+    }
+    function stop() {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      onMoveEnd?.();
+    }
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop);
+  }
+
+  return (
+    <div ref={lane} className="relative h-6 flex-1 border-b border-slate-100">
+      {keys.map((key, index) => (
+        <span
+          key={index}
+          onPointerDown={(event) => drag(event, index, key)}
+          className="absolute top-1.5 h-3 w-3 -translate-x-1/2 rotate-45 cursor-ew-resize
+                     border border-brand-600 bg-white"
+          style={{ left: `${(key.at_sec / length) * 100}%` }}
+          title={`${key.at_sec.toFixed(1)} с · ${key.value.toFixed(0)}% · ${key.easing}` +
+            (key.anchor === "end" ? " · прижат к концу" : "")}
+        />
+      ))}
+      {keys.length > 1 && (
+        <span
+          className="absolute top-3 h-px bg-brand-200"
+          style={{
+            left: `${(keys[0].at_sec / length) * 100}%`,
+            width: `${((keys[keys.length - 1].at_sec - keys[0].at_sec) / length) * 100}%`,
+          }}
+        />
+      )}
+    </div>
+  );
 }

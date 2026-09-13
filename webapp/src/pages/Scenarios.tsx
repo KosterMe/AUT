@@ -24,15 +24,24 @@ import ScenarioCanvas, { type Rect } from "../components/ScenarioCanvas";
 import ScenarioProperties from "../components/ScenarioProperties";
 import ScenarioTimeline from "../components/ScenarioTimeline";
 import {
+  MOTION_PRESETS,
   PALETTE,
   addElement,
   emptyScenario,
   findElement,
+  moveKey,
   newElement,
+  putKey,
   removeElement,
+  removeKey,
   setFrame,
+  setKeyEasing,
+  setKeyValue,
+  setKeys,
+  staticOf,
   trackFor,
   updateElement,
+  type Animatable,
 } from "./scenarioModel";
 
 /**
@@ -197,7 +206,14 @@ function Editor({
   // Asked of the compiler, on the draft, at the chosen length. Debounced so a
   // held-down arrow key is one question rather than thirty.
   const asked = useDebounced(draft, 200);
-  const { data: report, error: compileError, isFetching } = useScenarioInspect(asked, duration);
+  // The playhead is part of the question once anything moves: "where is this"
+  // has no answer without "when".
+  const askedAt = useDebounced(at, 120);
+  const {
+    data: report,
+    error: compileError,
+    isFetching,
+  } = useScenarioInspect(asked, duration, askedAt);
 
   const save = useInvalidatingMutation(
     async () => {
@@ -223,6 +239,42 @@ function Editor({
 
   function moveSelected(id: string, rect: Rect) {
     apply(setFrame(draft, id, rect), `frame:${id}`);
+  }
+
+  function animate(action: "preset" | "add" | "clear", property: Animatable, name?: string) {
+    if (!element) return;
+    if (action === "preset") {
+      const preset = MOTION_PRESETS.find((item) => item.name === name);
+      if (preset) apply(preset.apply(draft, element.id));
+      return;
+    }
+    if (action === "clear") {
+      apply(setKeys(draft, element.id, property, []));
+      return;
+    }
+    // A new key takes the value the element has right now at the playhead,
+    // so pressing it twice at two moments is already a movement.
+    const current = report?.blocks.find((item) => item.element_id === element.id);
+    const value = current ? current.frame[property] : staticOf(element, property);
+    apply(putKey(draft, element.id, property, at, value));
+  }
+
+  function editKey(
+    property: Animatable,
+    index: number,
+    patch: { value?: number; easing?: string; remove?: boolean },
+  ) {
+    if (!element) return;
+    if (patch.remove) {
+      apply(removeKey(draft, element.id, property, index));
+    } else if (patch.easing !== undefined) {
+      apply(setKeyEasing(draft, element.id, property, index, patch.easing));
+    } else if (patch.value !== undefined) {
+      apply(
+        setKeyValue(draft, element.id, property, index, patch.value),
+        `key:${element.id}:${property}:${index}`,
+      );
+    }
   }
 
   return (
@@ -356,6 +408,9 @@ function Editor({
               data={draft}
               element={element}
               block={block}
+              at={at}
+              onAnimate={animate}
+              onKeyChange={editKey}
               onChange={(patch) => apply(updateElement(draft, element.id, patch), `field:${element.id}`)}
               onRemove={() => {
                 apply(removeElement(draft, element.id));
@@ -408,6 +463,14 @@ function Editor({
               onScrub={setAt}
               selected={selected}
               onSelect={(id) => setSelected(id || null)}
+              onMoveKey={(property, index, atSec) =>
+                element &&
+                apply(
+                  moveKey(draft, element.id, property, index, atSec),
+                  `key:${element.id}:${property}:${index}`,
+                )
+              }
+              onMoveKeyEnd={endGesture}
             />
             {report.warnings.length > 0 && (
               <ul className="space-y-1 text-xs text-amber-700">

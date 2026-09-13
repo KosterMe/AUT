@@ -10,6 +10,7 @@ Nothing here runs a process or reads a file — only configuration.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Sequence
 
 from montage.config import get_settings
 
@@ -25,6 +26,43 @@ def path(value: str) -> str:
 
 def flt(value: float) -> str:
     return f"{float(value):.3f}"
+
+
+def polyline(points: "Sequence[tuple[float, float]]") -> str:
+    """A piecewise-linear function of `t`, as an ffmpeg expression.
+
+    This is the one construction §7.2 measured as actually animating: an
+    expression in `t` handed to `overlay`, evaluated on every frame. The curve
+    arrives already sampled — easing applied, keyframes resolved — so there is
+    one builder here rather than one per easing.
+
+    Held at both ends, and a stretch ends the moment the next one starts:
+    `lt(t, …)` means the instant of a jump belongs to the value after it,
+    which is the rule `curve.value_at` follows so the editor draws the frame
+    that will be rendered.
+    """
+    usable = [(float(at), float(value)) for at, value in points]
+    if not usable:
+        return ""
+    if len(usable) == 1:
+        return flt(usable[0][1])
+
+    expression = flt(usable[-1][1])
+    # Built from the end backwards, so each stretch wraps the ones after it.
+    for (start, from_value), (end, to_value) in reversed(list(zip(usable, usable[1:]))):
+        span = end - start
+        if span <= 0:
+            # Two points on the same second: a jump, and the `lt` of the
+            # stretch before it already decides which side of it we are on.
+            continue
+        slope = (to_value - from_value) / span
+        moving = (
+            f"{flt(from_value)}+({flt(slope)})*(t-{flt(start)})"
+            if slope else flt(from_value)
+        )
+        expression = f"if(lt(t,{flt(end)}),{moving},{expression})"
+    first = usable[0][0]
+    return f"if(lt(t,{flt(first)}),{flt(usable[0][1])},{expression})"
 
 
 def fonts_dir() -> str | None:

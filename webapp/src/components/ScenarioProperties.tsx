@@ -4,18 +4,24 @@ import type {
   AnchorMode,
   DurationMode,
   InspectBlock,
+  InspectKey,
   ScenarioData,
   ScenarioElement,
   SlotKind,
 } from "../api/types";
 import {
   ANCHOR_LABELS,
+  ANIMATABLE,
   DURATION_LABELS,
+  MOTION_PRESETS,
+  PROPERTY_LABELS,
   SLOT_LABELS,
   elementsOf,
   isRule,
+  keysOf,
   numberOf,
   trackOf,
+  type Animatable,
 } from "../pages/scenarioModel";
 
 /**
@@ -31,14 +37,26 @@ export default function ScenarioProperties({
   data,
   element,
   block,
+  at,
   onChange,
   onRemove,
+  onAnimate,
+  onKeyChange,
 }: {
   data: ScenarioData;
   element: ScenarioElement;
   block?: InspectBlock;
+  /** Where the playhead is, which is where a new key goes. */
+  at?: number;
   onChange: (patch: Partial<ScenarioElement>) => void;
   onRemove: () => void;
+  /** Apply a preset, or add and clear keys, by name. */
+  onAnimate?: (action: "preset" | "add" | "clear", property: Animatable, name?: string) => void;
+  onKeyChange?: (
+    property: Animatable,
+    index: number,
+    patch: { value?: number; easing?: string; remove?: boolean },
+  ) => void;
 }) {
   const track = trackOf(data, element.id);
   const spine = track?.kind === "spine";
@@ -78,6 +96,15 @@ export default function ScenarioProperties({
           <StartFields data={data} element={element} onChange={onChange} />
           <DurationFields element={element} onChange={onChange} />
           <FrameFields element={element} spine={spine} onChange={onChange} />
+          {!spine && (
+            <MotionFields
+              element={element}
+              block={block}
+              at={at ?? 0}
+              onAnimate={onAnimate}
+              onKeyChange={onKeyChange}
+            />
+          )}
           <label className="flex items-center gap-2 text-sm text-slate-600">
             <input
               type="checkbox"
@@ -289,7 +316,15 @@ function DurationFields({
         <select
           className="input"
           value={duration.mode}
-          onChange={(event) => set({ mode: event.target.value as DurationMode })}
+          onChange={(event) => {
+            // The mode's own field goes with it. Without this the panel shows
+            // an empty box while the server fills in the model's default, and
+            // the number on screen is not the number that renders.
+            const mode = event.target.value as DurationMode;
+            if (mode === "fixed") set({ mode, value: duration.value ?? 3 });
+            else if (mode === "elastic") set({ mode, grow: duration.grow ?? 1 });
+            else set({ mode });
+          }}
         >
           {(Object.keys(DURATION_LABELS) as DurationMode[]).map((mode) => (
             <option key={mode} value={mode}>
@@ -623,5 +658,154 @@ function Field({
       {children}
       {hint && <p className="mt-1 text-[11px] leading-snug text-slate-400">{hint}</p>}
     </div>
+  );
+}
+
+
+/**
+ * Движение: пресеты, ключи и что с ними можно сделать.
+ *
+ * Пресет — это не отдельная сущность, а набор ключей (§4.3), поэтому после
+ * «Въезда слева» элемент остаётся тем же элементом с двумя ключами, которые
+ * можно двигать.
+ *
+ * Двигаются пока только координаты, и причина измерена, а не выдумана (§7.2):
+ * `overlay` берёт выражения по `t` и анимирует каждый кадр, масштабу нужен
+ * `zoompan`, произвольная прозрачность — это `geq` за ×23, поворот — ×3.3.
+ */
+function MotionFields({
+  element,
+  block,
+  at,
+  onAnimate,
+  onKeyChange,
+}: {
+  element: ScenarioElement;
+  block?: InspectBlock;
+  at: number;
+  onAnimate?: (action: "preset" | "add" | "clear", property: Animatable, name?: string) => void;
+  onKeyChange?: (
+    property: Animatable,
+    index: number,
+    patch: { value?: number; easing?: string; remove?: boolean },
+  ) => void;
+}) {
+  const moving = ANIMATABLE.filter((property) => keysOf(element, property).length > 0);
+
+  return (
+    <div className="space-y-2 rounded-md border border-brand-100 bg-brand-50/40 p-2">
+      <p className="text-[11px] font-medium text-brand-800">Движение</p>
+
+      <div className="flex flex-wrap gap-1">
+        {MOTION_PRESETS.map((preset) => (
+          <button
+            key={preset.name}
+            className="chip border border-brand-200 bg-white hover:bg-brand-50"
+            title={preset.hint}
+            onClick={() => onAnimate?.("preset", "x", preset.name)}
+          >
+            {preset.name}
+          </button>
+        ))}
+      </div>
+
+      <div className="flex flex-wrap gap-1">
+        {ANIMATABLE.map((property) => (
+          <button
+            key={property}
+            className="chip border border-slate-200 bg-white hover:bg-slate-50"
+            onClick={() => onAnimate?.("add", property)}
+            title={`Поставить ключ на ${at.toFixed(1)} с`}
+          >
+            + ключ {PROPERTY_LABELS[property]}
+          </button>
+        ))}
+        {moving.map((property) => (
+          <button
+            key={`clear-${property}`}
+            className="chip border border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+            onClick={() => onAnimate?.("clear", property)}
+          >
+            убрать {PROPERTY_LABELS[property]}
+          </button>
+        ))}
+      </div>
+
+      {block && block.keys.length > 0 ? (
+        <ul className="space-y-1">
+          {block.keys.map((key, index) => (
+            <KeyRow
+              key={`${key.property}-${index}`}
+              item={key}
+              index={indexWithin(block.keys, index)}
+              onChange={onKeyChange}
+            />
+          ))}
+        </ul>
+      ) : (
+        <p className="text-[11px] leading-snug text-slate-500">
+          Ключей нет — элемент стоит на месте. Ключ ставится на текущем положении
+          бегунка, а пресет ставит сразу два.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** The key's index within its own property, which is what the model edits. */
+function indexWithin(keys: InspectKey[], position: number): number {
+  const property = keys[position].property;
+  return keys.slice(0, position).filter((key) => key.property === property).length;
+}
+
+function KeyRow({
+  item,
+  index,
+  onChange,
+}: {
+  item: InspectKey;
+  index: number;
+  onChange?: (
+    property: Animatable,
+    index: number,
+    patch: { value?: number; easing?: string; remove?: boolean },
+  ) => void;
+}) {
+  const property = item.property as Animatable;
+
+  return (
+    <li className="flex items-center gap-1 text-[11px]">
+      <span className="w-20 shrink-0 text-slate-500">
+        {PROPERTY_LABELS[property] ?? property} {item.at_sec.toFixed(1)}с
+        {item.anchor === "end" && <span title="прижат к концу"> ⇥</span>}
+      </span>
+      <input
+        type="number"
+        step="1"
+        className="input h-7 w-16 px-1 py-0"
+        value={item.value}
+        onChange={(event) =>
+          onChange?.(property, index, { value: Number(event.target.value) })
+        }
+      />
+      <select
+        className="input h-7 w-24 px-1 py-0"
+        value={item.easing}
+        onChange={(event) => onChange?.(property, index, { easing: event.target.value })}
+      >
+        <option value="linear">ровно</option>
+        <option value="in">разгон</option>
+        <option value="out">торможение</option>
+        <option value="in_out">плавно</option>
+        <option value="step">скачком</option>
+      </select>
+      <button
+        className="text-slate-400 hover:text-red-600"
+        onClick={() => onChange?.(property, index, { remove: true })}
+        title="Убрать ключ"
+      >
+        ×
+      </button>
+    </li>
   );
 }

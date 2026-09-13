@@ -45,7 +45,11 @@ export default function ScenarioCanvas({
     .sort((a, b) => a.z - b.z);
 
   function rectOf(block: InspectBlock): Rect {
-    if (block.track_kind === "spine") {
+    // The spine is a layout rather than a rectangle (trap 32), and a moving
+    // element only exists at a moment — both come from the compile. The draft
+    // is consulted for anything still, and only so that dragging follows the
+    // mouse instead of the network.
+    if (block.track_kind === "spine" || block.frame.moving) {
       return {
         x: block.frame.x,
         y: block.frame.y,
@@ -67,7 +71,10 @@ export default function ScenarioCanvas({
     block: InspectBlock,
     handle: Handle,
   ) {
-    if (block.track_kind === "spine") return;
+    // A moving element is not dragged: its position at this moment is one
+    // frame of a curve, and dropping it somewhere would have to mean editing
+    // the curve — which is what the keyframe lane is for.
+    if (block.track_kind === "spine" || block.frame.moving) return;
     event.preventDefault();
     event.stopPropagation();
     onSelect(block.element_id);
@@ -112,6 +119,7 @@ export default function ScenarioCanvas({
           const rect = rectOf(block);
           const isSelected = block.element_id === selected;
           const spine = block.track_kind === "spine";
+          const fixed = spine || block.frame.moving;
           return (
             <div
               key={block.element_id}
@@ -119,7 +127,7 @@ export default function ScenarioCanvas({
               className={clsx(
                 "absolute flex items-center justify-center text-[10px] font-medium text-white/90",
                 SLOT_COLORS[block.slot_kind] ?? "bg-slate-500",
-                spine ? "cursor-not-allowed opacity-80" : "cursor-move",
+                fixed ? "cursor-not-allowed opacity-80" : "cursor-move",
                 isSelected ? "ring-2 ring-white" : "ring-1 ring-white/30",
               )}
               style={{
@@ -129,10 +137,16 @@ export default function ScenarioCanvas({
                 height: `${rect.height}%`,
                 opacity: spine ? 0.85 : 0.9,
               }}
-              title={spine ? "Позвоночник рисуется раскладкой, а не прямоугольником" : block.label}
+              title={
+                spine
+                  ? "Позвоночник рисуется раскладкой, а не прямоугольником"
+                  : block.frame.moving
+                    ? `${block.label}: это один кадр движения — правится ключами`
+                    : block.label
+              }
             >
               <span className="truncate px-1">{block.label}</span>
-              {isSelected && !spine && (
+              {isSelected && !fixed && (
                 <>
                   {(["nw", "ne", "sw", "se"] as Handle[]).map((handle) => (
                     <span

@@ -12,6 +12,7 @@
       "frame": {
         "fit": "cover",
         "height": 100.0,
+        "motion": null,
         "opacity": 1.0,
         "rotate": 0.0,
         "width": 100.0,
@@ -27,6 +28,7 @@
       "frame": {
         "fit": "cover",
         "height": 100.0,
+        "motion": null,
         "opacity": 1.0,
         "rotate": 0.0,
         "width": 100.0,
@@ -42,6 +44,7 @@
       "frame": {
         "fit": "cover",
         "height": 100.0,
+        "motion": null,
         "opacity": 1.0,
         "rotate": 0.0,
         "width": 100.0,

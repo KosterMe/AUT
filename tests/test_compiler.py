@@ -235,6 +235,65 @@ def test_a_full_frame_insert_covers_the_canvas_and_a_pip_does_not():
     assert "overlay=536:180" in pip
 
 
+# --- animation ---------------------------------------------------------------
+
+
+def sliding(**kwargs) -> comp.Layer:
+    """A quarter-canvas layer crossing the frame from off the left edge."""
+    return comp.Layer(
+        source_path=BROLL,
+        frame=comp.Frame(
+            x=50.0, y=20.0, width=40.0,
+            motion=comp.Motion(x=((0.0, -20.0), (2.0, 120.0))),
+        ),
+        **kwargs,
+    )
+
+
+def test_a_still_layer_still_compiles_to_the_position_it_always_did():
+    """The floor under all of this (§4.3): a composition with no animation has
+    to produce the string it produced before animation existed, or every
+    scenario starts paying for a feature it does not use."""
+    graph = one_pass(build(layers=(corner(at_sec=1.0, duration_sec=2.0),)))
+
+    assert "overlay=536:180" in graph
+    assert "x='" not in graph
+
+
+def test_a_moving_layer_becomes_an_expression_in_t():
+    """The one construction §7.2 measured as actually animating: `overlay`
+    with expressions, evaluated on every frame."""
+    graph = one_pass(build(layers=(sliding(at_sec=0.0, duration_sec=3.0),)))
+
+    assert "overlay=x='if(lt(t," in graph
+    # Per cent of the canvas converted to pixels of the top-left corner, which
+    # is the only thing overlay takes: −20% of 1080 is −216, minus half of the
+    # 432-pixel box.
+    assert "-432.000" in graph
+    assert "y='384'" in graph, "y does not move, so it stays a number"
+
+
+def test_the_expression_is_held_at_both_ends_rather_than_extrapolated():
+    """A curve that kept going past its last key would put the layer
+    somewhere nobody asked for, seconds after the movement was over."""
+    graph = one_pass(build(layers=(sliding(at_sec=0.0, duration_sec=6.0),)))
+
+    # Before the first point and after the last one, the value is a constant.
+    assert "if(lt(t,0.000),-432.000," in graph
+    assert graph.rstrip().count("1080.000)") >= 1
+
+
+def test_a_moving_layer_is_not_a_layer_that_fills_the_canvas():
+    """`fills_canvas` unlocks a scale-and-crop with no positioning at all, and
+    a frame passing through the middle of the canvas must not take it."""
+    still = comp.Frame(width=100.0, height=100.0)
+    moving = dataclasses.replace(
+        still, motion=comp.Motion(x=((0.0, 50.0), (1.0, 60.0))),
+    )
+
+    assert still.fills_canvas and not moving.fills_canvas
+
+
 # --- fragments and the cache ------------------------------------------------
 
 

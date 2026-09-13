@@ -116,6 +116,34 @@ class Segment:
 
 
 @dataclass(frozen=True)
+class Motion:
+    """How a frame's numbers change while it is on screen.
+
+    A polyline per property, in **output seconds**, with the easing already
+    applied by `scenario.curve`: a spring and a hand-drawn wiggle reach the
+    renderer as the same kind of thing — points, with the value moving
+    linearly between them. That is what keeps this a description of what
+    happens rather than a plan somebody still has to interpret, and it is why
+    the renderer needs one expression builder instead of one per easing.
+
+    Position only, for now, and the reason is measured rather than assumed
+    (§7.2): `overlay` takes expressions in `t` and animates on every frame;
+    scale needs `zoompan`, which counts frames rather than seconds; an
+    arbitrary opacity curve is `geq`, which costs ×23; rotation costs ×3.3 and
+    changes the box. Those wait for a pass of their own rather than arriving
+    half-working.
+    """
+
+    # (second of the output, value in per cent of the canvas)
+    x: tuple[tuple[float, float], ...] = ()
+    y: tuple[tuple[float, float], ...] = ()
+
+    @property
+    def moves(self) -> bool:
+        return bool(self.x or self.y)
+
+
+@dataclass(frozen=True)
 class Frame:
     """Where something sits in the canvas, in per cent rather than pixels.
 
@@ -138,6 +166,14 @@ class Frame:
     fit: str = "cover"
     opacity: float = 1.0
     rotate: float = 0.0
+    # None means it does not move, which is the common case and has to stay
+    # the cheap one: a composition with no animation must compile to the same
+    # filter string it compiled to before animation existed (§4.3).
+    motion: "Motion | None" = None
+
+    @property
+    def moves(self) -> bool:
+        return self.motion is not None and self.motion.moves
 
     @property
     def fills_canvas(self) -> bool:
@@ -152,6 +188,10 @@ class Frame:
             and self.height >= 100.0
             and self.opacity == 1.0
             and self.rotate == 0.0
+            # A moving frame is not a frame that fills the canvas, even while
+            # it is passing through the middle of it: the shortcut this
+            # unlocks is a scale and a crop with no positioning at all.
+            and not self.moves
         )
 
     def box(self, canvas: "Canvas") -> tuple[int, int, int, int]:
@@ -504,11 +544,11 @@ def to_dict(composition: Composition) -> dict[str, Any]:
             "fps": composition.canvas.fps,
         },
         "spine": [
-            {**_asdict(segment), "frame": _asdict(segment.frame)}
+            {**_asdict(segment), "frame": _frame_dict(segment.frame)}
             for segment in composition.spine
         ],
         "layers": [
-            {**_asdict(layer), "frame": _asdict(layer.frame)}
+            {**_asdict(layer), "frame": _frame_dict(layer.frame)}
             for layer in composition.stack
         ],
         "subtitles": None if composition.subtitles is None else {
@@ -578,10 +618,7 @@ def _spine_from(
         return tuple(
             Segment(
                 **{k: v for k, v in _only(row, Segment).items() if k != "frame"},
-                frame=(
-                    Frame(**_only(row["frame"], Frame))
-                    if isinstance(row.get("frame"), Mapping) else FULL_FRAME
-                ),
+                frame=_frame_from(row.get("frame")),
             )
             for row in rows
         ), ()
@@ -644,7 +681,7 @@ def _layers_from(data: Mapping[str, Any], style: StyleSpec, canvas: Canvas) -> t
         out = []
         for item in data["layers"]:
             frame_data = item.get("frame") if isinstance(item, Mapping) else None
-            frame = Frame(**_only(frame_data, Frame)) if isinstance(frame_data, Mapping) else FULL_FRAME
+            frame = _frame_from(frame_data)
             fields = {k: v for k, v in _only(item, Layer).items() if k != "frame"}
             out.append(Layer(**fields, frame=frame))
         return tuple(out)
@@ -705,6 +742,56 @@ def _asdict(value: Any) -> dict[str, Any]:
     return {f.name: getattr(value, f.name) for f in dataclass_fields(value)}
 
 
+def _shifted(frame: Frame, by: float) -> Frame:
+    """The same rectangle with its curves moved onto another clock."""
+    if frame.motion is None or not by:
+        return frame
+    def move(points: tuple[tuple[float, float], ...]) -> tuple[tuple[float, float], ...]:
+        return tuple((round(at - by, 3), value) for at, value in points)
+    return replace(frame, motion=Motion(x=move(frame.motion.x), y=move(frame.motion.y)))
+
+
+def _frame_dict(frame: Frame) -> dict[str, Any]:
+    """A frame as data, motion included.
+
+    Written out by hand rather than by `asdict` because the curve is tuples of
+    tuples, and JSON has one kind of sequence.
+    """
+    data = _asdict(frame)
+    motion = data.pop("motion", None)
+    data["motion"] = None if motion is None else {
+        "x": [[at, value] for at, value in motion.x],
+        "y": [[at, value] for at, value in motion.y],
+    }
+    return data
+
+
+def _frame_from(data: Any, default: Frame = FULL_FRAME) -> Frame:
+    """A frame read back. A document written before motion existed has none."""
+    if not isinstance(data, Mapping):
+        return default
+    fields = _only(data, Frame)
+    motion = fields.pop("motion", None)
+    return Frame(**fields, motion=_motion_from(motion))
+
+
+def _motion_from(data: Any) -> "Motion | None":
+    if not isinstance(data, Mapping):
+        return None
+    motion = Motion(x=_curve_from(data.get("x")), y=_curve_from(data.get("y")))
+    return motion if motion.moves else None
+
+
+def _curve_from(data: Any) -> tuple[tuple[float, float], ...]:
+    if not isinstance(data, (list, tuple)):
+        return ()
+    return tuple(
+        (float(point[0]), float(point[1]))
+        for point in data
+        if isinstance(point, (list, tuple)) and len(point) == 2
+    )
+
+
 def _only(data: Mapping[str, Any], kind: type) -> dict[str, Any]:
     """The keys `kind` actually has, so an extra one cannot raise TypeError."""
     known = {f.name for f in dataclass_fields(kind)}
@@ -760,6 +847,11 @@ def excerpt(composition: Composition, *, at_sec: float, duration_sec: float) -> 
             at_sec=round(at, 3),
             duration_sec=round(min(end - start, max(0.01, length - at)), 3),
             source_start_sec=round(layer.source_start_sec + (start - layer.at_sec), 3),
+            # A curve is written against the composition's clock, and an
+            # excerpt starts its own at zero. Without this a preview of a
+            # moving layer shows it parked at the value it starts from, which
+            # is the one thing a preview of an animation must not do.
+            frame=_shifted(layer.frame, window_start),
         ))
 
     subtitles = composition.subtitles

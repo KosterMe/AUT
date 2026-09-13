@@ -41,7 +41,13 @@ from montage.rules import audio as audio_planner
 from montage import composition as comp
 from montage.rules import inserts as insert_planner
 from montage import subtitles as subtitle_builder
-from montage.scenario import anchors, facts as fact_module, layout as spine_layout, model
+from montage.scenario import (
+    anchors,
+    curve as curve_module,
+    facts as fact_module,
+    layout as spine_layout,
+    model,
+)
 from montage.style import (
     LAYOUT_AUTO,
     LAYOUT_BLUR,
@@ -104,6 +110,18 @@ class Plan:
     # The layout the frame resolved to, in v1's vocabulary (§3.1).
     layout: str
     produced: tuple[Produced, ...] = ()
+    # Element id → the rectangle it was actually given, motion and all. What
+    # the editor draws: the EDL has forgotten which element each layer came
+    # from, and working the geometry out a second time beside the compiler is
+    # how a canvas comes to show a frame the renderer will not produce.
+    frames: dict[str, comp.Frame] = dataclasses.field(default_factory=dict)
+    # Element id → property → its keys, resolved to seconds. The editor draws
+    # and drags these; they are resolved here because they were resolved here
+    # anyway, and doing it twice is how a diamond ends up at a second the
+    # renderer does not use.
+    keys: dict[str, dict[str, tuple[tuple[float, float, str], ...]]] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 def compile(
@@ -161,16 +179,21 @@ def plan(scenario: model.Scenario, facts: fact_module.ClipFacts) -> Plan:
     # and a cue is what puts it there.
     cues = _cues(scenario, draft, facts)
     spans = _spans(scenario, laid, facts, cues, notes)
+    frames: dict[str, comp.Frame] = {}
+    keys: dict[str, dict[str, tuple[tuple[float, float, str], ...]]] = {}
     draft = dataclasses.replace(
         draft,
         layers=_bottom_half(companion, draft) + _layers(
-            scenario, spans, facts, notes, used
+            scenario, spans, facts, notes, used,
+            clip_duration_sec=draft.duration_sec, cues=cues, frames=frames, keys=keys,
         ),
         audio=_audio(scenario, spans, facts, notes, used),
         subtitles=_subtitle_spec(scenario, cues, facts),
     )
     produced: list[Produced] = []
     return Plan(
+        frames=frames,
+        keys=keys,
         composition=_apply_rules(scenario, draft, facts, notes, produced, used),
         warnings=tuple(notes),
         spans=spans,
@@ -586,6 +609,11 @@ def _layers(
     facts: fact_module.ClipFacts,
     notes: list[CompileWarning],
     used: set[str],
+    *,
+    clip_duration_sec: float = 0.0,
+    cues: tuple = (),
+    frames: dict[str, comp.Frame] | None = None,
+    keys: dict[str, dict[str, tuple[tuple[float, float, str], ...]]] | None = None,
 ) -> tuple[comp.Layer, ...]:
     """Picture laid over the assembled video.
 
@@ -605,28 +633,69 @@ def _layers(
         if not path:
             continue
         _warn_unrenderable(element, notes)
+        length = clip_duration_sec or _clip_duration(spans)
+        resolved_keys = {
+            name: curve_module.resolved(
+                value, clip_duration_sec=length, facts=facts, placed=spans, cues=cues,
+            )
+            for name, value in (("x", element.frame.x), ("y", element.frame.y))
+        }
+        frame = _edl_frame(
+            element.frame, clip_duration_sec=length,
+            facts=facts, placed=spans, cues=cues, keys=resolved_keys,
+        )
+        if frames is not None:
+            frames[element.id] = frame
+        if keys is not None and any(resolved_keys.values()):
+            keys[element.id] = {
+                name: value for name, value in resolved_keys.items() if value
+            }
         made.append(comp.Layer(
             source_path=path,
             at_sec=span.start_sec,
             duration_sec=span.duration_sec,
             source_start_sec=source_start,
             still=still,
-            frame=_edl_frame(element.frame),
+            frame=frame,
             z=z,
         ))
     return tuple(made)
 
 
-def _edl_frame(frame: model.Frame) -> comp.Frame:
-    """The scenario's frame as the EDL's: the static values it resolved to.
+def _edl_frame(
+    frame: model.Frame,
+    *,
+    clip_duration_sec: float = 0.0,
+    facts: fact_module.ClipFacts | None = None,
+    placed: dict[str, anchors.Span] | None = None,
+    cues: tuple = (),
+    keys: dict[str, tuple[tuple[float, float, str], ...]] | None = None,
+) -> comp.Frame:
+    """The scenario's frame as the EDL's: what it came out as for this clip.
 
-    Two `Frame`s on purpose. The scenario's carries `Animated` values because
-    a scenario is written before the clip exists; the EDL's is what they came
-    out as for *this* clip, and an EDL that still held a curve would be a plan
-    rather than a description. Keyframes are dropped here with a warning
-    raised beside it — animating them is stage 6.
+    Two `Frame`s on purpose. The scenario's carries `Animated` values, because
+    a scenario is written before the clip exists; the EDL's is what those are
+    worth once there is a clip — a number, or a polyline of numbers against
+    the output's own clock. Anchored keyframes are resolved here for the same
+    reason anchors are: an EDL that still held "half a second before the end"
+    would be a plan rather than a description.
+
+    Position moves; the rest is still flattened, and `_warn_unrenderable` says
+    so. That split is measured, not assumed — see `Motion` and §7.2.
     """
     height = frame.height.static
+    known = facts or fact_module.ClipFacts(end_sec=clip_duration_sec)
+    resolved = keys if keys is not None else {
+        name: curve_module.resolved(
+            value, clip_duration_sec=clip_duration_sec, facts=known,
+            placed=placed, cues=cues,
+        )
+        for name, value in (("x", frame.x), ("y", frame.y))
+    }
+    motion = comp.Motion(
+        x=curve_module.polyline(resolved.get("x", ())),
+        y=curve_module.polyline(resolved.get("y", ())),
+    )
     return comp.Frame(
         x=frame.x.static,
         y=frame.y.static,
@@ -637,6 +706,7 @@ def _edl_frame(frame: model.Frame) -> comp.Frame:
         fit=frame.fit if frame.fit != model.FIT_AUTO else "cover",
         opacity=frame.opacity.static,
         rotate=frame.rotate.static,
+        motion=motion if motion.moves else None,
     )
 
 
@@ -648,11 +718,24 @@ def _warn_unrenderable(element: model.Element, notes: list[CompileWarning]) -> N
     would be the expensive kind of bug — a montage that renders successfully
     without the movement somebody put in it.
     """
-    if not element.frame.is_static:
+    frame = element.frame
+    unmovable = [
+        name for name, value in (
+            ("размер", frame.width), ("высоту", frame.height),
+            ("поворот", frame.rotate), ("прозрачность", frame.opacity),
+        )
+        if not value.is_static
+    ]
+    if unmovable:
+        # Position animates on this build and the rest does not, cheaply
+        # (§7.2): scale wants `zoompan`, which counts frames rather than
+        # seconds; an arbitrary opacity curve is `geq` at ×23; rotation is
+        # ×3.3 and changes the box. Saying which half was dropped beats one
+        # warning that makes it sound as though nothing moved.
         notes.append(CompileWarning(
             "no_animation",
-            "this renderer places an overlay but cannot move it yet; the "
-            "keyframes were ignored",
+            "this renderer moves an overlay but does not yet animate its "
+            + ", ".join(unmovable) + "; those keyframes were ignored",
             element.id,
         ))
     if element.effects:
