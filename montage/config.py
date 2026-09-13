@@ -129,11 +129,24 @@ class RenderSettings(BaseSettings):
     strategy: RenderStrategy = Field(default="auto", validation_alias="AUTOCLIPS_RENDER_STRATEGY")
     # Above these, "auto" stops building one graph. Not a performance limit —
     # a filter graph nobody can read is a filter graph nobody can debug.
+    #
+    # The layer ceiling was reviewed once layers stopped being inserts (trap
+    # 10). It counts *everything laid over the clip*, background included, so
+    # at its old value of 4 it collided with the b-roll planner's own maximum
+    # of 4: one split screen's bottom half was enough to send a perfectly
+    # ordinary clip down the slower path without saying so. Measured on this
+    # tree: each layer adds ~190 characters and two filters to the graph, and
+    # a moving one ~84 more. Eight layers is ~3 KB and 29 filters — long, but
+    # eight repetitions of the same two lines, which is what "readable" means
+    # here.
     one_pass_max_segments: int = Field(
         default=8, ge=1, validation_alias="AUTOCLIPS_RENDER_ONE_PASS_MAX_SEGMENTS"
     )
-    one_pass_max_inserts: int = Field(
-        default=4, ge=0, validation_alias="AUTOCLIPS_RENDER_ONE_PASS_MAX_INSERTS"
+    # The environment variable keeps its name. It was written down in
+    # somebody's `.env` when a layer was called an insert, and a setting that
+    # means something new under an old name is worse than an old name.
+    one_pass_max_layers: int = Field(
+        default=8, ge=0, validation_alias="AUTOCLIPS_RENDER_ONE_PASS_MAX_INSERTS"
     )
 
     # Reuse of rendered segments between two-stage renders. Disable to measure

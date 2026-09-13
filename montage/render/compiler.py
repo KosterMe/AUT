@@ -220,7 +220,7 @@ def choose_strategy(composition: comp.Composition) -> str:
 
     if len(composition.spine) > settings.one_pass_max_segments:
         return STRATEGY_TWO_STAGE
-    if len(composition.layers) > settings.one_pass_max_inserts:
+    if len(composition.layers) > settings.one_pass_max_layers:
         return STRATEGY_TWO_STAGE
     if len(composition.framings) > 1:
         return STRATEGY_TWO_STAGE
@@ -281,10 +281,17 @@ def plan_vertical_clip(
 ) -> comp.Composition:
     """Describe one slice of one file, without rendering anything.
 
-    Separate from `render_vertical_clip` because what goes *over* a clip is
-    decided from what is already in it: b-roll is placed against the subtitle
-    cues, and those only exist once silence removal has settled where the
-    segments are. So the caller plans, adds inserts, and only then renders.
+    **Nothing calls this any more.** The live path is `compile(scenario,
+    facts)`, and this is what it replaced: one function that probed the file
+    and decided everything about the clip from a style. It stays because the
+    migration test's claim is about it — that the four built-in scenarios
+    produce the same EDL the pipeline produced before them — and a claim whose
+    other side has been deleted is a claim nobody can check (§9.2).
+
+    What it shows, and the reason it was a dead end: the probes are wired in.
+    Silence removal happens here, the frame is chosen here, and a caller who
+    wanted a montage without paying for a `silencedetect` pass had nowhere to
+    say so. `required_facts` exists because of this function.
 
     The style arrives resolved. Every decision this function makes — where the
     cuts go, how the frame is filled, what the type looks like — reads from it
@@ -339,27 +346,6 @@ def plan_vertical_clip(
     return dataclasses.replace(
         draft,
         subtitles=comp.SubtitleSpec(cues=tuple(cues), title_text=title_text),
-    )
-
-
-def render_vertical_clip(
-    input_path: str,
-    output_path: str,
-    *,
-    start_sec: float,
-    end_sec: float,
-    strategy: str | None = None,
-    **plan_options: Any,
-) -> ClipRenderResult:
-    """Plan and render one slice of one file, with no inserts over it."""
-    composition = plan_vertical_clip(
-        input_path, start_sec=start_sec, end_sec=end_sec, **plan_options
-    )
-    return render(
-        composition,
-        output_path,
-        strategy=strategy,
-        source_duration_sec=max(0.0, end_sec - start_sec),
     )
 
 
