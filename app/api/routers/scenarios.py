@@ -101,6 +101,7 @@ def update_scenario(
         data=payload.data,
         name=payload.name or "",
         description=payload.description,
+        expected_version=payload.version,
     )
     session.commit()
     session.refresh(row)
@@ -199,6 +200,7 @@ def _read(row: Scenario) -> ScenarioRead:
     return ScenarioRead(
         id=row.id,
         name=row.name,
+        version=row.version,
         description=row.description,
         builtin=row.builtin,
         data=loads_dict(row.data_json),

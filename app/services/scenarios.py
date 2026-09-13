@@ -58,6 +58,10 @@ def seed(session: Session) -> list[ScenarioRow]:
             log.warning("scenario %r is not a built-in; leaving it alone", name)
             rows.append(row)
             continue
+        if row.data_json != data:
+            # Only when the code actually changed: seeding at every start must
+            # not make it look as though somebody has been editing.
+            row.version += 1
         row.data_json = data
         row.description = DESCRIPTIONS.get(name, row.description)
         row.updated_at = utc_now()
@@ -169,14 +173,27 @@ def update(
     data: dict,
     name: str = "",
     description: str | None = None,
+    expected_version: int | None = None,
 ) -> ScenarioRow:
     """Save an edit — or, for a built-in, save a copy of it.
 
     Copying rather than refusing: the operator asked to change something and
     the answer "no" would leave them with no way to have what they asked for.
     A new row named after the original is what they meant.
+
+    `expected_version` is the version the client opened. A save against an
+    older one is refused, because the alternative is that the slower of two
+    tabs wins and the other one never finds out it lost. Omitted means "I did
+    not look" — accepted, because a script that writes a scenario has nothing
+    to have opened.
     """
     row = get(session, scenario_id)
+    if expected_version is not None and expected_version != row.version:
+        raise ConflictError(
+            f"{row.name!r} has been saved since you opened it "
+            f"(version {row.version}, you have {expected_version}). "
+            "Reload it, or save yours under another name."
+        )
     checked = _checked(data)
 
     if row.builtin:
@@ -195,6 +212,7 @@ def update(
     # drifting apart means the thing an operator renamed still calls itself
     # something else everywhere it is logged or compiled.
     row.data_json = dumps(_named(checked, row.name))
+    row.version += 1
     row.updated_at = utc_now()
     session.add(row)
     session.flush()

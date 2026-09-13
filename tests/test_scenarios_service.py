@@ -148,6 +148,55 @@ class TestOneNameNotTwo:
         assert scenarios.compiled(db, copy.id, style()).name == copy.name
 
 
+class TestASaveKnowsWhatItWasMadeAgainst:
+    """Two tabs on one montage is an ordinary afternoon. Without this the
+    slower one wins and the other never learns it lost."""
+
+    def test_saving_bumps_the_version(self, db):
+        mine = scenarios.create(db, name="Мой", data=a_scenario())
+        assert mine.version == 1
+
+        scenarios.update(db, mine.id, data=a_scenario("изменён"))
+
+        assert scenarios.get(db, mine.id).version == 2
+
+    def test_a_save_against_an_older_version_is_refused(self, db):
+        mine = scenarios.create(db, name="Мой", data=a_scenario())
+        scenarios.update(db, mine.id, data=a_scenario("первая правка"))
+
+        with pytest.raises(ConflictError, match="saved since you opened it"):
+            scenarios.update(
+                db, mine.id, data=a_scenario("вторая вкладка"), expected_version=1,
+            )
+
+    def test_a_save_against_the_current_version_goes_through(self, db):
+        mine = scenarios.create(db, name="Мой", data=a_scenario())
+
+        saved = scenarios.update(
+            db, mine.id, data=a_scenario("правка"), expected_version=1,
+        )
+
+        assert saved.version == 2
+
+    def test_not_saying_which_version_is_allowed(self, db):
+        """A script writing a scenario has nothing to have opened, and
+        refusing it would be a rule with no one to protect."""
+        mine = scenarios.create(db, name="Мой", data=a_scenario())
+
+        assert scenarios.update(db, mine.id, data=a_scenario("скриптом")).version == 2
+
+    def test_seeding_does_not_look_like_editing(self, db):
+        """The built-ins are rewritten at every start. If that bumped the
+        version, every open editor would be told it is stale every time the
+        service restarts."""
+        scenarios.seed(db)
+        first = scenarios.by_name(db, "talking").version
+
+        scenarios.seed(db)
+
+        assert scenarios.by_name(db, "talking").version == first
+
+
 class TestWhatIsRefusedOnTheWayIn:
     def test_a_scenario_that_cannot_be_read_back(self, db):
         """Refusing here costs one request. Storing it costs every render that

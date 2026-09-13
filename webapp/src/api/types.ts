@@ -376,6 +376,8 @@ export interface ScenarioData {
 export interface Scenario {
   id: number;
   name: string;
+  /** Which save this is. Send it back with an edit; a stale one is refused. */
+  version: number;
   description: string;
   /** Ships with the service: it cannot be deleted, and an edit makes a copy. */
   builtin: boolean;
@@ -466,4 +468,6 @@ export interface ScenarioPayload {
   name?: string;
   description?: string | null;
   data: ScenarioData;
+  /** The version this edit was made against. */
+  version?: number;
 }
