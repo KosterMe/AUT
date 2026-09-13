@@ -257,6 +257,11 @@ class Scenario(SQLModel, table=True):
 
     # The scenario itself: tracks, elements, style, canvas, mock.
     data_json: str = Field(default="{}")
+    # Bumped on every save. A client sends the version it opened, and a save
+    # against an older one is refused rather than applied: two tabs on one
+    # montage is an ordinary afternoon, and the loser of that race would
+    # otherwise never learn that their work was overwritten.
+    version: int = Field(default=1)
 
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)

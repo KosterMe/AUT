@@ -584,6 +584,28 @@ class TestScenarioEditing:
         assert saved["name"] == "Переименован"
         assert saved["description"] == "x"
 
+    def test_a_stale_save_is_refused_rather_than_winning(self, client):
+        """Two tabs on one montage: the second one to press save must be told
+        that it is second, not quietly overwrite the first."""
+        mine = client.post(
+            "/api/scenarios", json={"name": "Мой", "data": self.a_scenario()}
+        ).json()
+        assert mine["version"] == 1
+
+        first = client.put(
+            f"/api/scenarios/{mine['id']}",
+            json={"data": self.a_scenario("первая"), "version": 1},
+        )
+        second = client.put(
+            f"/api/scenarios/{mine['id']}",
+            json={"data": self.a_scenario("вторая"), "version": 1},
+        )
+
+        assert first.status_code == 200
+        assert first.json()["version"] == 2
+        assert second.status_code == 409
+        assert "saved since you opened it" in second.json()["detail"]
+
     def test_a_built_in_cannot_be_deleted(self, client):
         talking = next(
             row for row in client.get("/api/scenarios").json() if row["name"] == "talking"

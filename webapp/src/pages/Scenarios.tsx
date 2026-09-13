@@ -218,7 +218,11 @@ function Editor({
   const save = useInvalidatingMutation(
     async () => {
       const body = { name, description, data: { ...draft, name } };
-      return scenario ? Scenarios.update(scenario.id, body) : Scenarios.create(body);
+      return scenario
+        // The version this editor opened. Sending it is what turns "the other
+        // tab wins silently" into a refusal somebody can act on.
+        ? Scenarios.update(scenario.id, { ...body, version: scenario.version })
+        : Scenarios.create(body);
     },
     [keys.scenarios],
   );

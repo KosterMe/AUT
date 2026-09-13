@@ -23,6 +23,9 @@ from app.api.schemas.common import UtcTimestamps
 class ScenarioRead(UtcTimestamps):
     id: int
     name: str
+    # Which save this is. Send it back with an edit and a stale one is
+    # refused instead of quietly winning.
+    version: int = 1
     description: str = ""
     # Ships with the service: it cannot be deleted, and an edit makes a copy.
     builtin: bool = False
@@ -50,6 +53,9 @@ class ScenarioUpdate(BaseModel):
     data: dict[str, Any]
     name: Optional[str] = Field(default=None, max_length=64)
     description: Optional[str] = Field(default=None, max_length=500)
+    # The version this edit was made against. Omitted means "I did not look",
+    # which a script writing a scenario has every right to say.
+    version: Optional[int] = None
 
 
 class ScenarioPreviewRequest(BaseModel):
