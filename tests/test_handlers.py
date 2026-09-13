@@ -252,6 +252,100 @@ class TestDownloadHandler:
         # Cut where the picture cuts, not at a round number of seconds.
         assert clips[0].end_sec == 95.0
 
+    def test_a_profile_cannot_make_the_scene_cutter_transcribe(self, db, monkeypatch):
+        """The coupling this replaced.
+
+        `requires_transcript` was the montage side's field, and it gated ASR at
+        the cutting stage: a talking profile pointed at the scene cutter used to
+        transcribe a whole source that its cutter never read a word of. Whether
+        the subtitles later want a transcript is a separate question, asked by
+        whoever burns them.
+        """
+        from app.adapters.media import scenes
+        from app.services import transcripts
+
+        def explode(*a, **k):
+            raise AssertionError("the scene cutter must not transcribe")
+
+        monkeypatch.setattr(transcripts, "load_or_build", explode)
+        monkeypatch.setattr(
+            scenes, "analyse",
+            lambda path, **k: scenes.SceneAnalysis(
+                scene_changes=tuple(float(at) for at in range(95, 600, 95)),
+                loudness=tuple((float(s), -20.0) for s in range(600)),
+            ),
+        )
+        job = clip_jobs.create(
+            db, source_ref="https://youtu.be/abc", profile="talking",
+            start_immediately=False,
+        )
+        clip_jobs.start(db, job.id, render={"cutter": "scenes"})
+        db.commit()
+
+        assert runner.run_once([TaskKind.DOWNLOAD]) is True
+
+        db.expire_all()
+        assert db.get(ClipJob, job.id).status == JobStatus.RENDERING
+        assert db.query(Clip).count() > 1
+
+    def test_the_job_remembers_what_its_source_was_transcribed_with(self, db, monkeypatch):
+        """A fact the cutting stage learned, kept so the montage side finds the
+        same cached transcript instead of paying ASR a second time."""
+        from app.services import transcripts
+
+        monkeypatch.setattr(
+            transcripts, "load_or_build",
+            lambda *a, **k: transcripts.TranscriptResult(
+                transcript(), "fake", {"model": "small", "language": "ru"}
+            ),
+        )
+        job = clip_jobs.create(db, source_ref="https://youtu.be/abc", start_immediately=True)
+        db.commit()
+
+        assert runner.run_once([TaskKind.DOWNLOAD]) is True
+
+        db.expire_all()
+        refreshed = db.get(ClipJob, job.id)
+        assert clip_jobs.transcript_settings(refreshed) == {
+            "model": "small", "language": "ru",
+        }
+
+    def test_a_job_that_was_never_transcribed_says_so_rather_than_guessing(
+        self, db, monkeypatch
+    ):
+        from app.adapters.media import scenes
+        from app.services import transcripts
+
+        monkeypatch.setattr(transcripts, "load_or_build", lambda *a, **k: None)
+        monkeypatch.setattr(
+            scenes, "analyse",
+            lambda path, **k: scenes.SceneAnalysis(
+                scene_changes=tuple(float(at) for at in range(95, 600, 95)),
+                loudness=tuple((float(s), -20.0) for s in range(600)),
+            ),
+        )
+        job = clip_jobs.create(
+            db, source_ref="https://youtu.be/film", profile="film", start_immediately=True
+        )
+        db.commit()
+
+        assert runner.run_once([TaskKind.DOWNLOAD]) is True
+
+        db.expire_all()
+        assert clip_jobs.transcript_settings(db.get(ClipJob, job.id)) is None
+
+    def test_planning_hands_the_render_nothing_but_the_clip(self, db):
+        """Cutting's output is boundaries. How they are dressed is on the job,
+        and a render reads it there rather than being couriered a copy."""
+        job = clip_jobs.create(db, source_ref="https://youtu.be/abc", start_immediately=True)
+        db.commit()
+        runner.run_once([TaskKind.DOWNLOAD])
+
+        db.expire_all()
+        render = next(t for t in db.query(Task).all() if t.kind == TaskKind.RENDER)
+
+        assert set(queue.payload_of(render)) == {"clip_id", "job_id"}
+
     def test_a_film_whose_scenes_cannot_be_read_still_produces_clips(self, db, monkeypatch):
         """Losing the scene signal should cost worse cut points, not the job."""
         from app.adapters.media import scenes
@@ -340,9 +434,11 @@ class TestRenderHandler:
         # Only the encode is faked. Planning runs for real, so what these tests
         # exercise is the composition the handler actually hands to ffmpeg.
         self.rendered_compositions = []
+        self.rendered_kwargs = []
 
         def fake_render(composition, output_path, **kwargs):
             self.rendered_compositions.append(composition)
+            self.rendered_kwargs.append(kwargs)
             return compiler.ClipRenderResult(
                 output_path=str(rendered), output_duration=60.0, segment_count=1,
                 subtitles_path=None, subtitle_count=0, silence_removed_seconds=0.0,
@@ -354,21 +450,41 @@ class TestRenderHandler:
         self.rendered = str(rendered)
 
     def _planned_clip(self, db, source_file, render_options=None) -> tuple[int, int]:
+        """A job with a source and one planned clip, as cutting would leave it.
+
+        The montage options go on the job, which is where a render reads them
+        from; planning is handed boundaries and nothing else. The source path
+        and title are the job's own fields rather than options, because a
+        render that needs them looks them up there.
+        """
+        from app.core.jsonutil import dumps
         from app.domain.cutting import SliceSpec
         from app.services import clips
 
         job = clip_jobs.create(db, source_ref="https://youtu.be/abc", start_immediately=False)
         job.original_path = source_file
+        job.title = "Source"
+        job.render_options_json = dumps(render_options or {})
         db.add(job)
         db.commit()
-        created = clips.plan(
-            db, job.id, [SliceSpec(1, 0.0, 60.0, "headline", "spoken words", 3)],
-            render_options={
-                "source_path": source_file, "source_title": "Source", **(render_options or {})
-            },
-        )
+        created = clips.plan(db, job.id, [SliceSpec(1, 0.0, 60.0, "headline", "spoken words", 3)])
         db.commit()
         return job.id, created[0].id
+
+    def _queue_options_on_the_task(self, db, clip_id, options) -> None:
+        """Put montage options in the render task's payload.
+
+        Where they used to live, and where a re-render still puts the caller's
+        own. A test that sets them on the job instead is not exercising either.
+        """
+        from app.core.jsonutil import dumps
+
+        clip = db.get(Clip, clip_id)
+        task = db.get(Task, clip.task_id)
+        payload = {**queue.payload_of(task), "render": options}
+        task.payload_json = dumps(payload)
+        db.add(task)
+        db.commit()
 
     def test_rendering_marks_the_clip_ready_and_the_job_ready(self, db, source_file):
         job_id, clip_id = self._planned_clip(db, source_file)
@@ -984,10 +1100,11 @@ class TestRenderedStyle(TestRenderHandler):
 
     def test_a_task_queued_before_styles_existed_still_renders(self, db, source_file):
         """The queue can be full during an upgrade. Those tasks carry the old
-        flat switches and nothing else."""
-        self._planned_clip(
-            db, source_file,
-            render_options={"auto_montage": False, "inserts": False, "subtitle_font_size": 64},
+        flat switches in their own payload, and their job carries nothing."""
+        _, clip_id = self._planned_clip(db, source_file)
+        self._queue_options_on_the_task(
+            db, clip_id,
+            {"auto_montage": False, "inserts": False, "subtitle_font_size": 64},
         )
 
         assert runner.run_once([TaskKind.RENDER]) is True
@@ -996,6 +1113,32 @@ class TestRenderedStyle(TestRenderHandler):
         assert style.pacing.remove_silence is False
         assert style.inserts.enabled is False
         assert style.subtitles.font_size == 64
+
+    def test_what_the_task_asks_for_wins_over_the_job_without_erasing_it(
+        self, db, source_file
+    ):
+        """A re-render changes one thing and must not silently drop the rest.
+
+        The look is not the example to test that with: a style is resolved
+        whole before it is queued, so a task carrying one carries all of it and
+        replacing it is correct. `strategy` is the option a style has no say
+        over, which makes it the one that shows whether the job's side of the
+        merge survived at all.
+        """
+        _, clip_id = self._planned_clip(
+            db, source_file,
+            render_options={
+                "strategy": "two_stage", "style": {"subtitles": {"font_size": 40}},
+            },
+        )
+        self._queue_options_on_the_task(
+            db, clip_id, {"style": {"subtitles": {"font_size": 96}}}
+        )
+
+        assert runner.run_once([TaskKind.RENDER]) is True
+
+        assert self.rendered_compositions[-1].style.subtitles.font_size == 96  # the task's
+        assert self.rendered_kwargs[-1]["strategy"] == "two_stage"             # still the job's
 
     def test_a_finished_clip_records_what_it_was_made_of(self, db, source_file):
         """Stored so the clip can be inspected, and re-rendered without

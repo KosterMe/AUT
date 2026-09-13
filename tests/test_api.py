@@ -428,12 +428,10 @@ class TestClipEndpoints:
             db, source_ref=str(source), source_platform="local", start_immediately=False
         )
         job.original_path = str(source)
+        job.title = "Source"
         db.add(job)
         db.flush()
-        created = clips.plan(
-            db, job.id, [SliceSpec(1, 0.0, 60.0, "headline", "words", 3)],
-            render_options={"source_path": str(source), "source_title": "Source"},
-        )
+        created = clips.plan(db, job.id, [SliceSpec(1, 0.0, 60.0, "headline", "words", 3)])
         clips.mark_ready(
             db, created[0].id, video_path=str(source), cover_path=None,
             composition={"segments": [{"source_path": str(source)}], "style": {}},

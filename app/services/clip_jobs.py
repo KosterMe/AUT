@@ -15,7 +15,7 @@ from sqlmodel import Session, col, select
 
 from app.core.clock import utc_now
 from app.core.errors import ConflictError, NotFoundError, ValidationError
-from app.core.jsonutil import dumps
+from app.core.jsonutil import dumps, loads_dict
 from app.db.enums import ClipStatus, JobStatus, TaskKind, TaskStatus
 from app.db.models import Clip, ClipJob, Task
 from app.adapters.youtube import downloader
@@ -92,6 +92,33 @@ def get(session: Session, job_id: int) -> ClipJob:
     return job
 
 
+def montage_options(job: ClipJob) -> dict:
+    """How this job's clips are to be dressed, as recorded when it started."""
+    return loads_dict(job.render_options_json)
+
+
+def transcript_settings(job: ClipJob) -> dict | None:
+    """What this job's source was transcribed with, or None if it never was.
+
+    None rather than `{}` because that is what the render side used to receive
+    when the key was simply absent from the task payload. The transcript cache
+    happens to treat the two the same, which is luck and not a contract.
+    """
+    return loads_dict(job.transcript_settings_json) or None
+
+
+def record_transcript_settings(session: Session, job_id: int, settings: dict | None) -> None:
+    """Remember what the source was transcribed with.
+
+    A fact the cutting stage learned on its own behalf, kept so the montage
+    side can find the same cached transcript instead of asking ASR again.
+    """
+    job = get(session, job_id)
+    job.transcript_settings_json = dumps(settings or {})
+    job.updated_at = utc_now()
+    session.add(job)
+
+
 def list_all(session: Session, *, limit: int = 100, offset: int = 0) -> list[ClipJob]:
     return list(
         session.exec(
@@ -161,8 +188,17 @@ def start(
         "max_clip_seconds": _kept(max_clip_seconds, previous, "max_clip_seconds"),
         "gap_seconds": _kept(gap_seconds, previous, "gap_seconds"),
         "max_clips": max_clips or int(previous.get("max_clips") or 0),
-        "render": {**(render or {}), **settings, "style": look},
     }
+    # The montage options go on the job rather than into the task payload. They
+    # are the job's intent, they outlive any queue row, and cutting has no
+    # opinion about them — it used to carry them from the download task to
+    # every render task purely as a courier.
+    #
+    # Computed exactly as before, including the part that is arguably wrong:
+    # restarting a job with an empty body resolves them back to the profile's
+    # defaults. That is what it did when they lived in the payload, and a
+    # relocation is not the change that should quietly fix it.
+    job.render_options_json = dumps({**(render or {}), **settings, "style": look})
     task = queue.enqueue(
         session,
         TaskKind.DOWNLOAD,

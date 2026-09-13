@@ -227,3 +227,32 @@ class TestGapNeverStallsTheCutter:
             later.start_sec > earlier.start_sec
             for earlier, later in zip(specs, specs[1:])
         )
+
+
+# --- whose need a transcript is ---------------------------------------------
+
+
+class TestTranscriptNeed:
+    """Which cutters cannot work without words.
+
+    Declared by the cutters, because it is their own need. It used to be
+    `profiles.requires_transcript`, which let the montage side decide whether
+    ASR ran during cutting: a profile that wanted subtitles would transcribe a
+    source its own cutter never looked at.
+    """
+
+    def test_the_speech_cutter_cannot_work_without_one(self):
+        assert cutting.needs_transcript(cutting.CUTTER_SPEECH) is True
+
+    @pytest.mark.parametrize("cutter", [cutting.CUTTER_SCENES, cutting.CUTTER_PLAIN])
+    def test_reading_the_picture_or_the_clock_needs_no_words(self, cutter):
+        assert cutting.needs_transcript(cutter) is False
+
+    def test_an_unknown_cutter_is_not_assumed_to_need_one(self):
+        """A typo should not quietly buy an ASR pass over a whole source."""
+        assert cutting.needs_transcript("vibes") is False
+
+    def test_the_declaration_only_names_real_cutters(self):
+        """A misspelling here is invisible: the cutter would simply never be
+        given a transcript, and would fall back to cutting by the clock."""
+        assert set(cutting.NEEDS_TRANSCRIPT) <= set(cutting.CUTTERS)
