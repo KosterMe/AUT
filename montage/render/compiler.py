@@ -282,12 +282,18 @@ def plan_vertical_clip(
 ) -> comp.Composition:
     """Describe one slice of one file, without rendering anything.
 
-    **Nothing calls this any more.** The live path is `compile(scenario,
-    facts)`, and this is what it replaced: one function that probed the file
-    and decided everything about the clip from a style. It stays because the
-    migration test's claim is about it — that the four built-in scenarios
-    produce the same EDL the pipeline produced before them — and a claim whose
-    other side has been deleted is a claim nobody can check (§9.2).
+    **No production path calls this any more.** The live path is
+    `compile(scenario, facts)`, and this is what it replaced: one function that
+    probed the file and decided everything about the clip from a style. It
+    stays because the migration test's claim is about it — that the four
+    built-in scenarios produce the same EDL the pipeline produced before them —
+    and a claim whose other side has been deleted is a claim nobody can check
+    (§9.2).
+
+    That test *calls* it, with its two probes answered from the same
+    `ClipFacts` the scenario side uses. Until it did, this function was not run
+    by anything in the repository, and a reference implementation nobody runs
+    is documentation that rots quietly (trap 57).
 
     What it shows, and the reason it was a dead end: the probes are wired in.
     Silence removal happens here, the frame is chosen here, and a caller who
