@@ -966,6 +966,25 @@ def _warn_unrenderable(element: model.Element, notes: list[CompileWarning]) -> N
             "per-element effects need a layer of their own; they were ignored",
             element.id,
         ))
+    if element.transition_in or element.transition_out:
+        # §7.1 draws the spine as "concat (or xfade where there are
+        # transitions)", and there is no xfade: segments are joined end to end
+        # and always have been. A transition makes them overlap, which moves
+        # every time after it and changes what a cached fragment is worth — a
+        # stage, not an oversight to fix in passing (trap 64).
+        notes.append(CompileWarning(
+            "no_transition",
+            "this renderer joins segments end to end; a transition would have "
+            "to overlap them, and it does not do that yet — the cut is hard",
+            element.id,
+        ))
+    if element.audio.enabled and element.audio.duck_others_db:
+        notes.append(CompileWarning(
+            "no_ducking",
+            "ducking everything else for this element's window is not wired "
+            "up; the other tracks played at their own level",
+            element.id,
+        ))
 
 
 def _unread_frame_fields(frame: model.Frame) -> set[str]:
