@@ -8,10 +8,15 @@ criterion for every stage up to the seventh is that they do not.
 
 The "today" side is assembled from the functions the present pipeline calls —
 `single_source`, `make_subtitle_cues`, `client.dress` — rather than from a
-restatement of what they do. `plan_vertical_clip` itself cannot be called here
-because it probes the file for its shape and its silences, and those two probes
-are exactly what a `ClipFacts` supplies. They are passed in; everything after
-them is the code that runs in production.
+restatement of what they do, and one decision is deliberately spelled out
+instead of called so the two sides cannot agree merely by sharing code.
+
+`plan_vertical_clip` — the function all of that used to live inside — is called
+too, in `TestTheFunctionThisReplaced`. Its two probes are answered from the
+same `ClipFacts`, because that is exactly what a `ClipFacts` is for; everything
+past them is the code that ran in production. Without that, nothing in the
+repository would run the function the claim is about, and a reference
+implementation nobody runs is documentation that rots quietly.
 """
 from __future__ import annotations
 
@@ -25,6 +30,8 @@ from montage import composition as comp
 from montage import scenario as sc
 from montage import style as style_module
 from montage import subtitles as subtitle_builder
+from montage.render import compiler
+from montage.render import probe as probe_module
 from montage.rules.inserts import AssetOption
 from montage.scenario import builtin
 
@@ -140,6 +147,134 @@ def tomorrow(
     composition, notes = sc.compile(scenario, clip)
     assert {note.code for note in notes} == (expect or set()), f"{profile_name}: {notes}"
     return composition
+
+
+def yesterday(
+    profile_name: str, clip: sc.ClipFacts, monkeypatch: pytest.MonkeyPatch
+) -> comp.Composition:
+    """What `plan_vertical_clip` makes of the same clip — the real function.
+
+    `today()` above assembles this out of the pieces that function calls, and
+    deliberately restates one decision rather than calling it, so that the two
+    sides cannot agree merely by sharing an implementation. That leaves a gap
+    the size of the function itself: nothing compares against `plan_vertical_
+    clip`, so its wiring could drift from the assembly and no test would know.
+
+    It is not called directly only because it probes the file — for its shape
+    and for its silences — and those two probes are exactly what a `ClipFacts`
+    supplies. So they are answered from the same facts, and everything past
+    them is the code that ran in production before scenarios existed.
+    """
+    style = style_for(profile_name)
+    monkeypatch.setattr(
+        compiler, "probe_media",
+        lambda path, **kwargs: {"width": clip.width, "height": clip.height},
+    )
+    monkeypatch.setattr(
+        probe_module, "montage_keep_segments",
+        lambda path, **kwargs: list(clip.keep),
+    )
+    companion = None
+    if style.framing.layout == comp.LAYOUT_SPLIT:
+        companion = next(
+            (asset.path for asset in clip.assets
+             if style.framing.companion_tag in asset.tags),
+            None,
+        )
+    made = compiler.plan_vertical_clip(
+        clip.source_path,
+        start_sec=clip.start_sec, end_sec=clip.end_sec,
+        style=style, companion_path=companion,
+        transcript_segments=list(clip.speech),
+        fallback_subtitle_text=clip.title, title_text=clip.title,
+    )
+    # `plan_vertical_clip` stops at the description of the clip; b-roll, music
+    # and effects were laid on by the caller, and `today()` lays them on the
+    # same way.
+    return montage.dress(
+        made, list(clip.assets), seed=clip.seed,
+        broll=style.inserts.enabled,
+        music=style.audio.music and style.audio.enabled,
+        sfx=style.audio.sfx and style.audio.enabled,
+    )
+
+
+@pytest.mark.parametrize("profile_name", sorted(builtin.BUILTIN))
+class TestTheFunctionThisReplaced:
+    """The other side of the claim, called rather than described.
+
+    `plan_vertical_clip` is not reachable from production any more — nothing
+    calls it — and a reference implementation nobody runs is documentation
+    that rots without saying so. Running it here keeps the comparison honest
+    in both directions: if it drifts from the assembly `today()` builds, this
+    goes red; if it stops working at all, this goes red too.
+    """
+
+    def test_the_assembly_matches_the_function_it_was_assembled_from(
+        self, profile_name, monkeypatch
+    ):
+        clip = facts(style_for(profile_name))
+
+        assert yesterday(profile_name, clip, monkeypatch) == today(profile_name, clip)
+
+    def test_and_so_does_the_scenario_that_replaced_it(self, profile_name, monkeypatch):
+        """Which closes the chain: the function that used to run, the pieces it
+        ran, and the scenario that replaced it all describe one clip the same
+        way."""
+        clip = facts(style_for(profile_name))
+
+        assert yesterday(profile_name, clip, monkeypatch) == tomorrow(profile_name, clip)
+
+    def test_on_a_source_that_is_already_vertical_too(self, profile_name, monkeypatch):
+        """The shape probe is the one input that changes the framing, so the
+        other value of it is worth the second call."""
+        clip = facts(style_for(profile_name), width=1080, height=1920)
+
+        assert yesterday(profile_name, clip, monkeypatch) == today(profile_name, clip)
+
+
+class TestASplitScreenWithNothingToPutInIt:
+    """The one branch the parametrised cases never reach.
+
+    `split` asks for a second source in the bottom half, and the library in
+    those cases always has one. When it does not, the clip is still worth
+    making: the framing falls back to a blurred backdrop rather than failing.
+    All three sides have to agree about that, and none of them was being asked
+    — a mutation that broke the fallback passed the whole file.
+    """
+
+    def without_a_companion(self) -> sc.ClipFacts:
+        style = style_for("split")
+        return facts(style, assets=tuple(
+            asset for asset in LIBRARY
+            if style.framing.companion_tag not in asset.tags
+        ))
+
+    def test_the_function_falls_back_to_a_backdrop(self, monkeypatch):
+        clip = self.without_a_companion()
+
+        made = yesterday("split", clip, monkeypatch)
+
+        assert made.spine[0].backdrop is True
+        assert made.spine[0].frame == comp.CONTAINED
+        # And nothing was laid in the bottom half.
+        assert not [layer for layer in made.layers if layer.frame == comp.BOTTOM_HALF]
+
+    def test_and_so_does_the_assembly(self, monkeypatch):
+        clip = self.without_a_companion()
+
+        assert yesterday("split", clip, monkeypatch) == today("split", clip)
+
+    def test_and_so_does_the_scenario(self, monkeypatch):
+        """With one difference that is not in the EDL and is an improvement:
+        the scenario *says* it fell back. The old function wrote a line to a
+        log nobody reads while rendering a clip that is not the one asked
+        for — which is the whole reason compile warnings exist."""
+        clip = self.without_a_companion()
+
+        assert yesterday("split", clip, monkeypatch) == tomorrow(
+            "split", clip, expect={"no_companion"},
+        )
 
 
 @pytest.mark.parametrize("profile_name", sorted(builtin.BUILTIN))
