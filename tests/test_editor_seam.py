@@ -103,6 +103,53 @@ def test_every_place_that_offers_a_slot_asks_which_ones_are_drawn(filename: str)
     assert "useCapabilities" in source
 
 
+# Every field of the scenario model, and what is known to become of it. The
+# point of writing it down is the third column: a field nobody reads is not a
+# field, it is a promise (trap 52), and this session found five of them —
+# `align`, `radius`, `crop`, `blend` and the transitions — by asking the
+# question once rather than one field at a time.
+FIELD_FATE = {
+    # read by the compiler or the layout, and rendered
+    "drawn": {
+        "Frame": {"x", "y", "width", "height", "rotate", "opacity", "fit"},
+        "Element": {"id", "slot", "start", "duration", "frame", "audio",
+                    "label", "optional", "priority"},
+        "ElementAudio": {"enabled", "gain_db", "ducked_by_speech",
+                         "fade_in_sec", "fade_out_sec", "loop"},
+    },
+    # carried by the model and not rendered — and the compiler says so
+    "announced": {
+        "Frame": {"align", "radius", "crop", "blend"},
+        "Element": {"effects", "transition_in", "transition_out"},
+        "ElementAudio": {"duck_others_db"},
+    },
+}
+
+
+@pytest.mark.parametrize("name", sorted(FIELD_FATE["drawn"]))
+def test_every_field_of_the_model_is_accounted_for(name: str):
+    """Each one is either rendered or announced as not rendered. A field that
+    is neither is the silent kind: the montage renders, and the thing somebody
+    put in it is simply not there.
+
+    This is a list, and a list is the weak kind of test — but the thing it
+    guards is a field being *added*, and a new field lands in neither set and
+    fails here. That is the moment the question is worth asking.
+    """
+    import dataclasses
+
+    from montage.scenario import model as scenario_model
+
+    kind = getattr(scenario_model, name)
+    fields = {f.name for f in dataclasses.fields(kind)}
+    known = FIELD_FATE["drawn"][name] | FIELD_FATE["announced"][name]
+
+    assert fields == known, (
+        f"{name}: {fields ^ known} is neither rendered nor announced — decide "
+        "which, and say so in the compiler rather than here"
+    )
+
+
 def test_the_editor_does_not_carry_its_own_map_of_probe_constructions():
     """Which construction carries which property is `ANIMATES`, and it lives
     beside the renderer that picks those constructions. If a copy of it grew in

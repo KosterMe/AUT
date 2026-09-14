@@ -532,6 +532,38 @@ class TestSlotsBecomePaths:
         assert [n for n in quiet if n.code == "no_frame_field"] == []
         assert any("align" in n.message for n in loud if n.code == "no_frame_field")
 
+    def test_a_transition_says_the_cut_is_hard(self):
+        """§7.1 draws the spine as "concat (or xfade where there are
+        transitions)" and there is no xfade — segments are joined end to end
+        and always have been. The model carries the field, the store writes
+        it, the API type declares it, and nothing read it (trap 64)."""
+        _, notes = sc.compile(
+            self.over(sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"),
+                      transition_in=sc.Transition(kind="fade", duration_sec=0.5)),
+            facts(),
+        )
+
+        assert any(n.code == "no_transition" for n in notes)
+
+    def test_ducking_everything_else_says_it_is_not_wired_up(self):
+        """§4.4 lists `duck_others_db` beside the fields that do work. This is
+        the one nobody reads, and a voiceover asking for it got the montage it
+        asked for minus the only thing that makes a voiceover audible."""
+        _, notes = sc.compile(
+            self.over(sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"),
+                      audio=sc.ElementAudio(enabled=True, duck_others_db=-8.0)),
+            facts(),
+        )
+
+        assert any(n.code == "no_ducking" for n in notes)
+
+    def test_and_an_element_asking_for_neither_hears_nothing_about_them(self):
+        _, notes = sc.compile(
+            self.over(sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll")), facts(),
+        )
+
+        assert [n for n in notes if n.code in ("no_transition", "no_ducking")] == []
+
     def test_a_gradient_still_says_it_needs_something_this_renderer_lacks(self):
         """The one of the three that is still missing, and it is missing for a
         reason worth keeping: §1.1 names it and says nothing about what a
