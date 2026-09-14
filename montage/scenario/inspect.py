@@ -29,6 +29,9 @@ class Rect:
     # Degrees. Sampled like the rest, so a turning element is drawn turning
     # rather than drawn still while the render turns it.
     rotate: float = 0.0
+    # 0..1, and sampled for the same reason: an element fading in is drawn
+    # faded, not drawn solid until the render disagrees.
+    opacity: float = 1.0
     fit: str = model.FIT_AUTO
     # Whether this rectangle is one frame of a moving one. The editor draws a
     # moving element from here rather than from the draft, because the draft
@@ -212,7 +215,11 @@ def _keys(element: model.Element, made: compiler.Plan) -> tuple[Key, ...]:
     resolved = made.keys.get(element.id)
     if not resolved:
         return ()
-    written = {"x": element.frame.x, "y": element.frame.y}
+    # Every property that can carry a curve, from the one list of them. This
+    # was a dict of "x" and "y" written out by hand, and a key on any other
+    # property raised `KeyError` here — which is to say the editor's own zoom
+    # and turn presets broke the screen that drew them (trap 53).
+    written = {name: getattr(element.frame, name) for name in comp.CURVES}
     out: list[Key] = []
     for name, keys in resolved.items():
         modes = [key.at.mode.value for key in written[name].keys]
@@ -255,7 +262,7 @@ def _frame(
         frame = given or comp.frame_for_layout(made.layout)
         return Rect(
             x=frame.x, y=frame.y, width=frame.width, height=frame.height,
-            fit=frame.fit,
+            fit=frame.fit, opacity=frame.opacity,
         )
 
     if given is None:
@@ -263,7 +270,7 @@ def _frame(
         return Rect(
             x=own.x.static, y=own.y.static,
             width=own.width.static, height=own.height.static,
-            fit=own.fit,
+            fit=own.fit, opacity=own.opacity.static,
         )
 
     motion = given.motion
@@ -288,8 +295,14 @@ def _frame(
             curve.value_at(motion.rotate, at_sec, static=given.rotate)
             if motion else given.rotate
         ),
+        opacity=(
+            curve.value_at(motion.opacity, at_sec, static=given.opacity)
+            if motion else given.opacity
+        ),
         fit=given.fit,
-        moving=bool(motion and motion.moves),
+        # A fade counts: the rectangle is not in the same state at every
+        # second, which is exactly what this flag tells the editor.
+        moving=bool(motion and (motion.moves or motion.fades)),
     )
 
 

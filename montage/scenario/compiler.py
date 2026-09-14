@@ -607,6 +607,17 @@ def _spine_frame(
             "joined, where every segment's clock starts again. Put what moves "
             "on a layer.",
         ))
+    if frame.opacity.static != 1.0:
+        # The spine is the bottom of the stack, so holding it back would mean
+        # compositing it against nothing — and the renderer does not, which
+        # until now it did not say. Layers fade; the thing they are laid over
+        # does not (trap 52).
+        notes.append(CompileWarning(
+            "no_spine_opacity",
+            "the spine is what everything else is laid over, so there is "
+            "nothing for it to be transparent against; its opacity was "
+            "ignored. Put what fades on a layer.",
+        ))
     return comp.Frame(
         x=frame.x.static,
         y=frame.y.static,
@@ -694,11 +705,7 @@ def _layers(
             name: curve_module.resolved(
                 value, clip_duration_sec=length, facts=facts, placed=spans, cues=cues,
             )
-            for name, value in (
-                ("x", element.frame.x), ("y", element.frame.y),
-                ("width", element.frame.width), ("height", element.frame.height),
-                ("rotate", element.frame.rotate),
-            )
+            for name, value in _animatable(element.frame)
         }
         frame = _edl_frame(
             element.frame, clip_duration_sec=length,
@@ -745,10 +752,7 @@ def _edl_frame(
     """
     height = frame.height.static
     known = facts or fact_module.ClipFacts(end_sec=clip_duration_sec)
-    animated = (
-        ("x", frame.x), ("y", frame.y), ("width", frame.width),
-        ("height", frame.height), ("rotate", frame.rotate),
-    )
+    animated = _animatable(frame)
     resolved = keys if keys is not None else {
         name: curve_module.resolved(
             value, clip_duration_sec=clip_duration_sec, facts=known,
@@ -770,30 +774,32 @@ def _edl_frame(
         fit=frame.fit if frame.fit != model.FIT_AUTO else "cover",
         opacity=frame.opacity.static,
         rotate=frame.rotate.static,
-        motion=motion if motion.moves else None,
+        motion=motion if motion.moves or motion.fades else None,
+    )
+
+
+def _animatable(frame: model.Frame) -> tuple[tuple[str, model.Animated], ...]:
+    """The frame's curves, paired with the names `Motion` knows them by.
+
+    One list, because the resolving happens in two places — once for the EDL
+    and once for the editor's report — and a property animated in one of them
+    and not the other is a difference nobody would see until a render.
+    """
+    return tuple(
+        (name, getattr(frame, name)) for name in comp.CURVES
     )
 
 
 def _warn_unrenderable(element: model.Element, notes: list[CompileWarning]) -> None:
     """Say what this renderer cannot yet carry, rather than dropping it quietly.
 
-    v1 has two insert shapes and no transforms, so an animated frame or a
-    per-element effect compiles to the nearest thing it does have. Silence here
-    would be the expensive kind of bug — a montage that renders successfully
-    without the movement somebody put in it.
+    Silence here would be the expensive kind of bug — a montage that renders
+    successfully without the thing somebody put in it.
+
+    Every property of the frame now animates, so what is left is per-element
+    effects. The opacity warning that used to stand here was retired when the
+    price it quoted turned out to be `geq`'s rather than opacity's (trap 50).
     """
-    frame = element.frame
-    if not frame.opacity.is_static:
-        # Position, size and rotation all animate on this build; an arbitrary
-        # opacity curve is `geq`, measured at ×23 (§7.2), which is a different
-        # conversation from "does it work". Saying which one was dropped beats
-        # a warning that sounds as though nothing moved.
-        notes.append(CompileWarning(
-            "no_animation",
-            "this renderer moves an overlay, resizes it and turns it, but "
-            "cannot yet animate its opacity; those keyframes were ignored",
-            element.id,
-        ))
     if element.effects:
         notes.append(CompileWarning(
             "no_effects",

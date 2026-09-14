@@ -712,9 +712,11 @@ def _layer_chains(
         index = _add_input(inputs, layer.source_path, start=layer.source_start_sec,
                            duration=layer.duration_sec, still=layer.still)
         tag = f"ins{order}"
-        fit, position = _layer_geometry(layer.frame, canvas)
+        fit, position = _layer_geometry(layer.frame, canvas, since=layer.at_sec)
+        veil, head = _veil(layer, canvas, order=order, source=f"[{index}:v]")
+        parts.extend(veil)
         parts.append(
-            f"[{index}:v]fps={canvas.fps},{fit},setpts=PTS-STARTPTS,"
+            f"{head}{fit},setpts=PTS-STARTPTS,"
             f"tpad=start_duration={filters.flt(layer.at_sec)}:start_mode=add:color=black[{tag}]"
         )
         out = f"vins{order}"
@@ -726,7 +728,61 @@ def _layer_chains(
     return parts, current
 
 
-def _layer_geometry(frame: comp.Frame, canvas: comp.Canvas) -> tuple[str, str]:
+def _veil(
+    layer: comp.Layer, canvas: comp.Canvas, *, order: int, source: str
+) -> tuple[list[str], str]:
+    """Hold part of a layer back, and the start of its chain either way.
+
+    Two constructions, both measured on this build (§7.2) and both of which
+    *multiply* the layer's own alpha rather than replacing it — a sticker with
+    a hole in it has to keep the hole:
+
+    * a constant is `colorchannelmixer=aa=…`, one filter and no second input;
+    * a curve is drawn by `geq` on a mask sixteen pixels square, stretched
+      over the layer by `scale2ref`, multiplied into the alpha the layer
+      already has, and merged back.
+
+    The mask is small because `geq` is priced per pixel of its own input. Over
+    a whole canvas it costs ×23, which is what stage 6 recorded against the
+    property and why opacity did not animate then; over 16×16 and a stretch it
+    costs ×3 (trap 50).
+
+    The curve is shifted onto the layer's own clock for the same reason `fit`
+    is: everything up to `tpad` runs before the layer is moved into place, so
+    its second zero is the layer's first frame and not the clip's.
+    """
+    frame = layer.frame
+    fps = canvas.fps
+    if not frame.sheer:
+        return [], f"{source}fps={fps},"
+    if not frame.fades:
+        held = filters.flt(frame.opacity)
+        return [], f"{source}fps={fps},format=rgba,colorchannelmixer=aa={held},"
+
+    assert frame.motion is not None  # `frame.fades` is what got us here
+    curve = filters.polyline(
+        [
+            (round(at - layer.at_sec, 3), round(255.0 * max(0.0, min(1.0, value)), 3))
+            for at, value in frame.motion.opacity
+        ],
+        clock="T",
+    )
+    mask, own, merged = f"m{order}", f"own{order}", f"veil{order}"
+    return [
+        # No duration on the mask and `shortest` on the merge: the layer
+        # decides how long it is, and a mask cut to a length worked out here
+        # would either run out early or hold the graph open past the end.
+        f"color=c=black:s=16x16:r={fps},format=gray,geq=lum='{curve}'[{mask}]",
+        f"{source}fps={fps},format=rgba,split[{merged}a][{merged}b]",
+        f"[{merged}a]alphaextract[{own}]",
+        f"[{mask}][{own}]scale2ref[{mask}s][{own}s]",
+        f"[{own}s][{mask}s]blend=all_mode=multiply:shortest=1[{merged}]",
+    ], f"[{merged}b][{merged}]alphamerge,"
+
+
+def _layer_geometry(
+    frame: comp.Frame, canvas: comp.Canvas, *, since: float = 0.0
+) -> tuple[str, str]:
     """How to scale a layer and where to put it, from its frame.
 
     A frame covering the canvas is scaled up and cropped — there is nothing
@@ -765,6 +821,7 @@ def _layer_geometry(frame: comp.Frame, canvas: comp.Canvas) -> tuple[str, str]:
         return fit, f"{left}:{top}"
     return _moving_geometry(
         frame, canvas, fit=fit, width=width, height=height, left=left, top=top,
+        since=since,
     )
 
 
@@ -777,8 +834,16 @@ def _moving_geometry(
     height: int,
     left: int,
     top: int,
+    since: float = 0.0,
 ) -> tuple[str, str]:
     """The chain and the position for a frame that moves.
+
+    Two clocks, and the difference between them is `since`. `overlay` runs
+    after the layer has been padded into place, so its `t` is the clip's;
+    `scale` and `rotate` run before that, where the layer's own first frame is
+    zero. A curve is written against the clip (§4.3), so the chain gets it
+    shifted and `overlay` gets it as it stands. Before this was noticed, a
+    layer that started at 0:03 grew three seconds early (trap 51).
 
     Three constructions, each one measured on this build rather than read out
     of the documentation (§7.2):
@@ -798,9 +863,9 @@ def _moving_geometry(
 
     chain = [fit]
     if motion.width or motion.height:
-        chain = [_moving_scale(motion, canvas, width=width, height=height)]
+        chain = [_moving_scale(motion, canvas, width=width, height=height, since=since)]
     if motion.rotate:
-        chain.append(_moving_rotate(motion))
+        chain.append(_moving_rotate(motion, since=since))
 
     return ",".join(chain), _moving_position(
         motion, canvas, width=width, height=height, left=left, top=top,
@@ -809,18 +874,21 @@ def _moving_geometry(
 
 
 def _moving_scale(
-    motion: comp.Motion, canvas: comp.Canvas, *, width: int, height: int
+    motion: comp.Motion, canvas: comp.Canvas, *, width: int, height: int,
+    since: float = 0.0,
 ) -> str:
     """`scale` with an expression per side, for the sides that move."""
     across = (
         filters.polyline([
-            (at, round(canvas.width * value / 100.0, 3)) for at, value in motion.width
+            (round(at - since, 3), round(canvas.width * value / 100.0, 3))
+            for at, value in motion.width
         ])
         if motion.width else str(width)
     )
     down = (
         filters.polyline([
-            (at, round(canvas.height * value / 100.0, 3)) for at, value in motion.height
+            (round(at - since, 3), round(canvas.height * value / 100.0, 3))
+            for at, value in motion.height
         ])
         if motion.height
         # A layer that left its height to the aspect ratio keeps doing so
@@ -831,14 +899,15 @@ def _moving_scale(
     return f"scale=w='{across}':h='{down}':eval=frame"
 
 
-def _moving_rotate(motion: comp.Motion) -> str:
+def _moving_rotate(motion: comp.Motion, *, since: float = 0.0) -> str:
     """`rotate` with an angle that moves, in a box cut for the widest one.
 
     Degrees on the way in, because that is what somebody types; radians on the
     way out, because that is what ffmpeg reads.
     """
     radians = filters.polyline([
-        (at, round(value * math.pi / 180.0, 6)) for at, value in motion.rotate
+        (round(at - since, 3), round(value * math.pi / 180.0, 6))
+        for at, value in motion.rotate
     ])
     widest = round(max(abs(value) for _, value in motion.rotate) * math.pi / 180.0, 6)
     # `format=rgba` first: the corners the turn leaves empty have to be

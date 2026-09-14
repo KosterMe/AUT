@@ -28,8 +28,13 @@ def flt(value: float) -> str:
     return f"{float(value):.3f}"
 
 
-def polyline(points: "Sequence[tuple[float, float]]") -> str:
-    """A piecewise-linear function of `t`, as an ffmpeg expression.
+def polyline(points: "Sequence[tuple[float, float]]", *, clock: str = "t") -> str:
+    """A piecewise-linear function of time, as an ffmpeg expression.
+
+    `clock` is the name the filter gives the current second. Almost everything
+    calls it `t`; `geq` calls it `T`, and a curve handed to `geq` under the
+    name `t` is not rejected — `t` there is the pixel index — so the wrong one
+    renders a picture rather than an error.
 
     This is the one construction §7.2 measured as actually animating: an
     expression in `t` handed to `overlay`, evaluated on every frame. The curve
@@ -57,12 +62,12 @@ def polyline(points: "Sequence[tuple[float, float]]") -> str:
             continue
         slope = (to_value - from_value) / span
         moving = (
-            f"{flt(from_value)}+({flt(slope)})*(t-{flt(start)})"
+            f"{flt(from_value)}+({flt(slope)})*({clock}-{flt(start)})"
             if slope else flt(from_value)
         )
-        expression = f"if(lt(t,{flt(end)}),{moving},{expression})"
+        expression = f"if(lt({clock},{flt(end)}),{moving},{expression})"
     first = usable[0][0]
-    return f"if(lt(t,{flt(first)}),{flt(usable[0][1])},{expression})"
+    return f"if(lt({clock},{flt(first)}),{flt(usable[0][1])},{expression})"
 
 
 def fonts_dir() -> str | None:

@@ -96,6 +96,8 @@ class InspectRect(BaseModel):
     height: float
     # Degrees, sampled at the report's moment like everything else here.
     rotate: float = 0.0
+    # 0..1, sampled the same way, so the canvas can draw a fade as a fade.
+    opacity: float = 1.0
     fit: str
     # One frame of a moving rectangle. The editor draws a moving element from
     # here rather than from its own copy of the draft, which only knows where

@@ -726,6 +726,71 @@ class TestScenarioEditing:
         assert where(5.0)["frame"]["x"] == 50.0
         assert where(5.0)["frame"]["moving"] is True
 
+    def test_inspect_carries_the_fade_out_to_the_canvas(self, client):
+        """Over the wire as well as in the compile: the schema strips a field
+        it has not been told about, so a fade that reached the report and not
+        the response would leave the canvas drawing solid blocks."""
+        data = self.a_scenario()
+        data["tracks"].append({
+            "id": "over",
+            "kind": "overlay",
+            "z": 2,
+            "elements": [{
+                "id": "fader",
+                "slot": {"kind": "source"},
+                "start": {"mode": "start", "value": 0},
+                "duration": {"mode": "fixed", "value": 10},
+                "frame": {"opacity": {"static": 1, "keys": [
+                    {"at": {"mode": "start", "value": 0}, "value": 0},
+                    {"at": {"mode": "start", "value": 10}, "value": 1},
+                ]}},
+            }],
+        })
+
+        def opacity(at: float) -> float:
+            body = client.post(
+                "/api/scenarios/inspect",
+                json={"data": data, "duration_sec": 60, "at_sec": at},
+            ).json()
+            block = next(b for b in body["blocks"] if b["element_id"] == "fader")
+            return block["frame"]["opacity"]
+
+        assert opacity(0.0) == 0.0
+        assert opacity(5.0) == 0.5
+
+    def test_a_key_on_any_property_is_answered_rather_than_500(self, client):
+        """The editor writes width and rotate keys from its own presets, and
+        the report used to look the property up in a dict of "x" and "y" —
+        so a preset answered the screen that drew it with a 500 (trap 53)."""
+        for name, value in (("width", 40), ("height", 25), ("rotate", 15),
+                            ("opacity", 0.5), ("x", 20), ("y", 30)):
+            data = self.a_scenario()
+            data["tracks"].append({
+                "id": "over",
+                "kind": "overlay",
+                "z": 2,
+                "elements": [{
+                    "id": "keyed",
+                    "slot": {"kind": "source"},
+                    "start": {"mode": "start", "value": 0},
+                    "duration": {"mode": "fixed", "value": 10},
+                    "frame": {name: {"static": value, "keys": [
+                        {"at": {"mode": "start", "value": 0}, "value": value},
+                        {"at": {"mode": "start", "value": 5}, "value": value / 2},
+                    ]}},
+                }],
+            })
+
+            response = client.post(
+                "/api/scenarios/inspect",
+                json={"data": data, "duration_sec": 60, "at_sec": 2.5},
+            )
+
+            assert response.status_code == 200, f"{name}: {response.text[:200]}"
+            block = next(b for b in response.json()["blocks"]
+                         if b["element_id"] == "keyed")
+            assert [key["property"] for key in block["keys"]] == [name, name]
+
     def test_inspecting_an_unknown_scenario_is_404(self, client):
         assert client.get("/api/scenarios/999/inspect").status_code == 404
 

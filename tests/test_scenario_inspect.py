@@ -278,6 +278,67 @@ class TestWhatABlockSays:
         assert block(halfway, "cta").frame.x == 50.0
         assert block(halfway, "cta").frame.moving is True
 
+    def test_a_fading_overlay_is_reported_half_faded_halfway_through(self):
+        """The canvas draws the block at the opacity this says, so an element
+        fading in reads as fading rather than as solid until the render
+        disagrees."""
+        scenario = with_intro_and_outro()
+        over = scenario.tracks[1]
+        fading = dataclasses.replace(
+            over.elements[0],
+            start=model.Anchor(mode=model.AnchorMode.START, value=0.0),
+            duration=model.Duration(mode=model.DurationMode.FIXED, value=10.0),
+            frame=model.Frame(opacity=model.Animated(1.0, keys=(
+                model.Keyframe(at=model.Anchor(mode=model.AnchorMode.START, value=0.0),
+                               value=0.0),
+                model.Keyframe(at=model.Anchor(mode=model.AnchorMode.START, value=10.0),
+                               value=1.0),
+            ))),
+        )
+        scenario = dataclasses.replace(scenario, tracks=(
+            scenario.tracks[0], dataclasses.replace(over, elements=(fading,)),
+        ))
+        library = (AssetOption(3, "/m/cta.mp4", ("cta",), 4.0),)
+        facts = mock.facts(scenario, 90.0, assets=library)
+
+        at_start = inspector.inspect(scenario, facts, at_sec=0.0)
+        halfway = inspector.inspect(scenario, facts, at_sec=5.0)
+
+        assert block(at_start, "cta").frame.opacity == 0.0
+        assert block(halfway, "cta").frame.opacity == 0.5
+        # A fade is not a move, but it is still one frame of something that
+        # changes, which is what this flag tells the editor.
+        assert block(halfway, "cta").frame.moving is True
+
+    def test_every_property_can_carry_a_key_without_breaking_the_screen(self):
+        """The editor offers a keyframe track per property and two presets
+        that write width and rotate. This function used to look the property
+        up in a hand-written dict of "x" and "y", so pressing either preset
+        answered the screen that drew it with a 500 (trap 53)."""
+        scenario = with_intro_and_outro()
+        over = scenario.tracks[1]
+        library = (AssetOption(3, "/m/cta.mp4", ("cta",), 4.0),)
+
+        for name in ("x", "y", "width", "height", "rotate", "opacity"):
+            resting = {"width": 40.0, "height": 25.0, "opacity": 1.0}.get(name, 10.0)
+            animated = dataclasses.replace(
+                over.elements[0],
+                start=model.Anchor(mode=model.AnchorMode.START, value=0.0),
+                duration=model.Duration(mode=model.DurationMode.FIXED, value=10.0),
+                frame=model.Frame(**{name: model.Animated(resting, keys=(
+                    model.Keyframe(at=model.Anchor(mode=model.AnchorMode.START,
+                                                   value=0.0), value=resting),
+                    model.Keyframe(at=model.Anchor(mode=model.AnchorMode.START,
+                                                   value=10.0), value=resting / 2),
+                ))}),
+            )
+            one = dataclasses.replace(scenario, tracks=(
+                scenario.tracks[0], dataclasses.replace(over, elements=(animated,)),
+            ))
+            got = inspector.inspect(one, mock.facts(one, 90.0, assets=library), at_sec=5.0)
+
+            assert [key.property for key in block(got, "cta").keys] == [name, name], name
+
     def test_a_muted_track_is_reported_as_not_placed(self):
         scenario = with_intro_and_outro()
         scenario = dataclasses.replace(scenario, tracks=(
