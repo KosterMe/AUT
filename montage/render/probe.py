@@ -22,6 +22,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from montage import subtitles
 from montage.config import get_settings
 from montage.render import filters
 from montage.style import PacingStyle

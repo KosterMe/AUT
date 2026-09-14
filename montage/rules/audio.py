@@ -63,7 +63,7 @@ def choose_effects(
     if not sounds:
         return ()
 
-    effects: list[SoundEffect] = []
+    effects: list[AudioTrack] = []
     previous = -rules.effect_min_gap_seconds
     for order, moment in enumerate(_moments(composition, rules)):
         if len(effects) >= rules.max_effects:
