@@ -36,5 +36,11 @@ faster-whisper>=1.1
 
 # --- tests ---
 pytest>=8
+# Two production bugs in one afternoon were a missing import and a mismatched
+# signature — both invisible to a suite that patches the function under test,
+# both visible to a parser. `ruff` is used for exactly one rule here (F821,
+# undefined names); the test skips loudly if it is not installed, so a bare
+# checkout still runs green.
+ruff>=0.5
 pytest-asyncio>=0.23
 freezegun>=1.4

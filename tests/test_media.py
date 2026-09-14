@@ -6,6 +6,9 @@ with the code that builds it.
 """
 from __future__ import annotations
 
+import pathlib
+import subprocess
+
 import os
 import time
 from pathlib import Path
@@ -60,6 +63,53 @@ lavfi.astats.Overall.RMS_level=-inf
 def test_a_value_before_any_frame_is_ignored(tmp_path):
     """Whatever that line is, it is not a measurement of a moment."""
     assert parse_loudness("lavfi.astats.Overall.RMS_level=-3.0\n") == []
+
+
+def test_a_cover_is_drawn_with_its_titles_burned_on(tmp_path, monkeypatch, configure):
+    """The Python side of the cover, run for real.
+
+    It had a `NameError` in it from the day the package was split out — the
+    import of `subtitles` did not come along — and nothing noticed, because
+    every test that touches a cover replaces `render_clip_cover` itself. So
+    this one stubs the subprocess instead, which is the only part that has any
+    business being stubbed.
+    """
+    from montage.render import probe
+
+    configure(AUTOCLIPS_DIR=str(tmp_path / "media"))
+    source = tmp_path / "media" / "clip.mp4"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"\x00" * 2048)
+    seen = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = args
+        # ffmpeg's job, done: a file big enough for the size check below.
+        pathlib.Path(args[-1]).write_bytes(b"\x00" * 4096)
+        return subprocess.CompletedProcess(args, 0, b"", b"")
+
+    monkeypatch.setattr(probe, "ffmpeg_exe", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(probe.subprocess, "run", fake_run)
+
+    out = probe.render_clip_cover(
+        source_path=str(source),
+        output_path=str(tmp_path / "media" / "covers" / "clip.jpg"),
+        start_sec=1.5,
+        title_text="Заголовок",
+        part_text="часть 1",
+        thumbnail_path=None,
+        width=1080,
+        height=1920,
+    )
+
+    assert out is not None
+    graph = seen["args"][seen["args"].index("-filter_complex") + 1]
+    assert "subtitles=" in graph, "the titles are burned with libass, like the clip's"
+    # And the file libass is pointed at was actually written — which is the
+    # line the missing import blew up on.
+    ass = graph.split("subtitles=filename='")[1].split("'")[0].replace("\\:", ":")
+    assert pathlib.Path(ass).exists()
+    assert "Заголовок" in pathlib.Path(ass).read_text(encoding="utf-8")
 
 
 def test_download_candidates_prefer_merged_file(tmp_path):
