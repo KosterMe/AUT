@@ -427,6 +427,69 @@ def test_the_chain_reads_the_layers_clock_and_overlay_reads_the_clips():
     assert "enable='between(t,2.000,6.000)'" in graph
 
 
+def test_a_painted_layer_is_a_source_rather_than_a_file():
+    """§7.3 set a second renderer aside for graphics laid over the picture.
+    A flat fill is `color` and this build has it, so the layer is an input
+    like any other and everything downstream treats it as one (trap 59)."""
+    graph = one_pass(build(layers=(
+        comp.Layer("", at_sec=0.0, duration_sec=4.0,
+                   frame=comp.Frame(x=50.0, y=80.0, width=90.0, height=20.0),
+                   paint=comp.Paint(kind=comp.PAINT_COLOUR, colour="#112233")),
+    )))
+
+    assert "color=c=0x112233:s=1080x1920" in graph
+    assert "overlay=" in graph
+
+
+def test_a_caption_is_drawn_on_a_ground_that_keeps_its_alpha():
+    """`color` negotiates its pixel format with whatever comes next, and the
+    next thing is a scale into the layer's box, which settles on yuv420p and
+    throws the alpha away. The transparent ground then arrives as an opaque
+    black rectangle over whatever the text was meant to sit on — which is what
+    it did, until `format=rgba` went on the ground itself (trap 60)."""
+    graph = one_pass(build(layers=(
+        comp.Layer("", at_sec=0.0, duration_sec=4.0,
+                   frame=comp.Frame(x=50.0, y=80.0, width=90.0, height=20.0),
+                   paint=comp.Paint(kind=comp.PAINT_TEXT, text="Подпишись",
+                                    colour="#FFFFFF", size_pct=5.0)),
+    )))
+
+    # Drawn at the size of its own box — 90% by 20% of a 1080×1920 canvas —
+    # and not at canvas size, or the scale into that box would take the
+    # letters down with it (trap 61).
+    assert "color=c=black@0.0:s=972x384:r=30,format=rgba" in graph
+    assert "drawtext=text='Подпишись'" in graph
+    # The font is the bundled one: the container has none installed, and
+    # `drawtext` silently picks nothing rather than a default.
+    assert "fontfile=" in graph
+    # Centred on its ground, so the layer's own rectangle is what places it.
+    assert "x=(w-text_w)/2" in graph
+
+
+def test_a_caption_that_would_break_the_filter_argument_is_escaped():
+    """A colon ends an option, a quote ends the text, a comma ends the filter
+    and a per cent sign is a strftime directive — so "Скидка 50%" would render
+    as "Скидка 50" with the date after it, and a caption with a colon in it
+    would fail the whole render."""
+    graph = one_pass(build(layers=(
+        comp.Layer("", at_sec=0.0, duration_sec=4.0,
+                   paint=comp.Paint(kind=comp.PAINT_TEXT,
+                                    text="Скидка 50%: это 'всё', правда")),
+    )))
+
+    drawn = graph[graph.index("drawtext="):]
+    for raw in ("50%:", "'всё'"):
+        assert raw not in drawn, raw
+    assert "50\\%\\:" in drawn or "50\%\:" in drawn
+
+
+def test_nothing_is_painted_when_every_layer_is_a_file():
+    graph = one_pass(build(layers=(corner(at_sec=1.0, duration_sec=2.0),)))
+
+    for construction in ("color=c=", "drawtext", "lavfi"):
+        assert construction not in graph
+
+
 def test_a_moving_layer_is_not_a_layer_that_fills_the_canvas():
     """`fills_canvas` unlocks a scale-and-crop with no positioning at all, and
     a frame passing through the middle of the canvas must not take it."""

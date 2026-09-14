@@ -274,6 +274,43 @@ TOP_HALF = Frame(y=25.0, width=100.0, height=50.0)
 BOTTOM_HALF = Frame(y=75.0, width=100.0, height=50.0)
 
 
+PAINT_COLOUR = "colour"   # a flat fill
+PAINT_TEXT = "text"       # words on a transparent ground
+
+
+@dataclass(frozen=True)
+class Paint:
+    """A layer with no file behind it: the renderer makes the picture itself.
+
+    §7.3 reserved a second renderer for "graphics on top", and the graphics
+    this model can actually ask for turned out not to need one — a flat fill is
+    `color`, words are `drawtext`, and both are sources this build of ffmpeg
+    already has (trap 59). What a second renderer is still for is the things
+    the model cannot express yet: springing text, animated stickers, masks.
+
+    `text` is drawn on a transparent ground the size of the layer's box, so
+    everything after it — fitting, placing, moving, fading — is the same code
+    every other layer goes through. A picture made here is a layer like any
+    other the moment it exists.
+    """
+
+    kind: str
+    # #rrggbb. The fill of a colour layer; the ink of a text one.
+    colour: str = "#000000"
+    # Already substituted: {title} and the rest are resolved against the clip
+    # before this exists, because an EDL holding a template would be a plan.
+    text: str = ""
+    # Points at the canvas's own scale, not pixels: a text layer has to survive
+    # a change of canvas the same way a frame does.
+    size_pct: float = 6.0
+
+    def __post_init__(self) -> None:
+        if self.kind not in (PAINT_COLOUR, PAINT_TEXT):
+            raise ValueError(f"unknown paint {self.kind!r}")
+        if self.kind == PAINT_TEXT and not self.text:
+            raise ValueError("a text layer needs something to say")
+
+
 @dataclass(frozen=True)
 class Layer:
     """Something laid over the spine for a stretch of the output.
@@ -300,10 +337,15 @@ class Layer:
     frame: Frame = field(default_factory=lambda: FULL_FRAME)
     # Bigger sits on top. Ties keep the order they were emitted in.
     z: int = 0
+    # Set when there is no file to play: the renderer draws this instead.
+    # `source_path` is then empty, and it is the one case where that is legal.
+    paint: "Paint | None" = None
 
     def __post_init__(self) -> None:
-        if not self.source_path:
-            raise ValueError("a layer needs a source path")
+        if not self.source_path and self.paint is None:
+            raise ValueError("a layer needs a source path or something to paint")
+        if self.source_path and self.paint is not None:
+            raise ValueError("a layer is a file or a painting, not both")
         if self.at_sec < 0:
             raise ValueError("a layer cannot start before the clip does")
         if self.duration_sec <= 0:
@@ -598,7 +640,11 @@ def to_dict(composition: Composition) -> dict[str, Any]:
             for segment in composition.spine
         ],
         "layers": [
-            {**_asdict(layer), "frame": _frame_dict(layer.frame)}
+            {
+                **_asdict(layer),
+                "frame": _frame_dict(layer.frame),
+                "paint": None if layer.paint is None else _asdict(layer.paint),
+            }
             for layer in composition.stack
         ],
         "subtitles": None if composition.subtitles is None else {
@@ -732,8 +778,13 @@ def _layers_from(data: Mapping[str, Any], style: StyleSpec, canvas: Canvas) -> t
         for item in data["layers"]:
             frame_data = item.get("frame") if isinstance(item, Mapping) else None
             frame = _frame_from(frame_data)
-            fields = {k: v for k, v in _only(item, Layer).items() if k != "frame"}
-            out.append(Layer(**fields, frame=frame))
+            fields = {
+                k: v for k, v in _only(item, Layer).items()
+                if k not in ("frame", "paint")
+            }
+            out.append(Layer(
+                **fields, frame=frame, paint=_paint_from(item.get("paint")),
+            ))
         return tuple(out)
 
     return tuple(
@@ -743,6 +794,13 @@ def _layers_from(data: Mapping[str, Any], style: StyleSpec, canvas: Canvas) -> t
         )
         for item in data.get("inserts") or []
     )
+
+
+def _paint_from(data: Any) -> "Paint | None":
+    """What the renderer should draw, read back. Older documents drew nothing."""
+    if not isinstance(data, Mapping):
+        return None
+    return Paint(**_only(data, Paint))
 
 
 def frame_for_kind(kind: str, policy, canvas: Canvas) -> Frame:

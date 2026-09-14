@@ -35,6 +35,7 @@ still made, and losing the clip to say them would be a poor trade.
 from __future__ import annotations
 
 import dataclasses
+import re
 from dataclasses import dataclass
 
 from montage.rules import audio as audio_planner
@@ -48,6 +49,7 @@ from montage.scenario import (
     layout as spine_layout,
     model,
 )
+from montage import style as style_module
 from montage.style import (
     LAYOUT_AUTO,
     LAYOUT_BLUR,
@@ -490,15 +492,54 @@ def _path_of(
     notes: list[CompileWarning],
     used: set[str] | None = None,
 ) -> tuple[str, float, bool]:
-    """The file this element plays, where in it to start, and whether it is a still."""
+    """The file this element plays, where in it to start, and whether it is a still.
+
+    For the callers that need an actual file and can do nothing with a
+    painting: a spine segment is cut out of material, and a sound has no
+    picture to draw. `_source_of` is the one that also says what to paint.
+
+    A painted element reaching one of those is not skipped quietly. It is the
+    same shape as every other silent drop in this file — the montage renders,
+    and the thing somebody put in it is simply not there.
+    """
+    path, at, still, paint = _source_of(element, facts, notes, used)
+    if paint is not None:
+        notes.append(CompileWarning(
+            "drawn_not_played",
+            f"a {element.slot.kind!r} slot is drawn rather than played, so it "
+            "cannot be cut into the spine or heard on an audio track; put it "
+            "on a layer",
+            element.id,
+        ))
+        return "", 0.0, False
+    return path, at, still
+
+
+def _source_of(
+    element: model.Element,
+    facts: fact_module.ClipFacts,
+    notes: list[CompileWarning],
+    used: set[str] | None = None,
+    *,
+    style: "style_module.StyleSpec | None" = None,
+) -> tuple[str, float, bool, comp.Paint | None]:
+    """Where this element's picture comes from: a file, or a painting.
+
+    Two slots have no file and never did — a flat fill and a line of text — and
+    for three stages they compiled to a warning while the editor's palette went
+    on offering both. §7.3 had reserved a second renderer for "graphics on
+    top", so it looked like work waiting on a large piece of machinery. It was
+    not: a fill is `color`, words are `drawtext`, and this build has both
+    (trap 59).
+    """
     slot = element.slot
     if slot.kind in (model.SLOT_SOURCE, model.SLOT_BLUR_OF):
-        return facts.source_path, facts.start_sec, False
+        return facts.source_path, facts.start_sec, False, None
     if slot.kind == model.SLOT_SOURCE_AT:
         at, note = anchors._event(slot.event, facts=facts)
         if note:
             notes.append(CompileWarning("slot", note, element.id))
-        return facts.source_path, round(facts.start_sec + at, 3), False
+        return facts.source_path, round(facts.start_sec + at, 3), False, None
     if slot.kind == model.SLOT_LIBRARY:
         chosen = _pick(slot, facts, used)
         if chosen is None:
@@ -507,17 +548,85 @@ def _path_of(
                 f"the library has nothing tagged {slot.tag!r}, so this is left out",
                 element.id,
             ))
-            return "", 0.0, False
+            return "", 0.0, False, None
         if used is not None:
             used.add(chosen.path)
-        return chosen.path, 0.0, chosen.still
+        return chosen.path, 0.0, chosen.still, None
+    if slot.kind == model.SLOT_COLOR:
+        return "", 0.0, False, comp.Paint(
+            kind=comp.PAINT_COLOUR, colour=slot.color or "#000000",
+        )
+    if slot.kind == model.SLOT_TEXT:
+        return "", 0.0, False, _lettering(element, facts, notes, style)
     notes.append(CompileWarning(
         "unsupported_slot",
         f"a {slot.kind!r} slot needs a layer of its own, which this renderer "
         "does not have yet; left out",
         element.id,
     ))
-    return "", 0.0, False
+    return "", 0.0, False, None
+
+
+def _lettering(
+    element: model.Element,
+    facts: fact_module.ClipFacts,
+    notes: list[CompileWarning],
+    style: "style_module.StyleSpec | None" = None,
+) -> comp.Paint | None:
+    """A text slot, with its template filled in against this clip.
+
+    The substitution happens here and not in the renderer for the same reason
+    anchors are resolved here: an EDL still holding `{title}` would be a plan
+    rather than a description of a clip.
+
+    The look is the one this project owns — the subtitle style — rather than a
+    second set of type settings invented for the occasion. Size travels as a
+    share of the canvas so a text layer survives a change of canvas the way a
+    frame does.
+    """
+    filled, missing = _fill_template(element.slot.template, facts)
+    if missing:
+        # Rendering `{tags}` into the video is the quiet failure: it looks
+        # deliberate. §1.1 lists it, and `ClipFacts` has nowhere to take it
+        # from, so it is dropped and said out loud.
+        notes.append(CompileWarning(
+            "unknown_placeholder",
+            "this clip knows nothing to put in " + ", ".join(sorted(missing))
+            + "; those were left out of the text",
+            element.id,
+        ))
+    if not filled.strip():
+        notes.append(CompileWarning(
+            "empty_text",
+            "a text slot with nothing to say renders nothing; left out",
+            element.id,
+        ))
+        return None
+    look = (style or style_module.StyleSpec()).subtitles
+    return comp.Paint(
+        kind=comp.PAINT_TEXT,
+        text=filled,
+        colour=look.colour,
+        # The subtitle size is in pixels of a 1920-tall canvas, which is the
+        # only canvas this project has had. Carried as a share so a text layer
+        # survives a change of one, the way a frame does.
+        size_pct=round(look.font_size / 19.2, 2),
+    )
+
+
+def _fill_template(template: str, facts: fact_module.ClipFacts) -> tuple[str, set[str]]:
+    """`{title}` and `{index}` against this clip, and whatever else was asked for."""
+    known = {"title": facts.title or "", "index": str(facts.index)}
+    missing: set[str] = set()
+
+    def swap(match: "re.Match[str]") -> str:
+        name = match.group(1)
+        if name in known:
+            return known[name]
+        missing.add("{" + name + "}")
+        return ""
+
+    return re.sub(r"\{(\w+)\}", swap, template).strip(), missing
 
 
 # --- 5. emission ------------------------------------------------------------
@@ -696,8 +805,10 @@ def _layers(
         span = spans.get(element.id)
         if span is None or span.duration_sec <= 0:
             continue
-        path, source_start, still = _path_of(element, facts, notes, used)
-        if not path:
+        path, source_start, still, paint = _source_of(
+            element, facts, notes, used, style=scenario.style,
+        )
+        if not path and paint is None:
             continue
         _warn_unrenderable(element, notes)
         length = clip_duration_sec or _clip_duration(spans)
@@ -710,6 +821,9 @@ def _layers(
         frame = _edl_frame(
             element.frame, clip_duration_sec=length,
             facts=facts, placed=spans, cues=cues, keys=resolved_keys,
+            # A painting has no shape of its own to fall back on, so the
+            # height somebody typed is the only height there is.
+            painted=paint is not None,
         )
         if frames is not None:
             frames[element.id] = frame
@@ -725,6 +839,7 @@ def _layers(
             still=still,
             frame=frame,
             z=z,
+            paint=paint,
         ))
     return tuple(made)
 
@@ -737,6 +852,7 @@ def _edl_frame(
     placed: dict[str, anchors.Span] | None = None,
     cues: tuple = (),
     keys: dict[str, tuple[tuple[float, float, str], ...]] | None = None,
+    painted: bool = False,
 ) -> comp.Frame:
     """The scenario's frame as the EDL's: what it came out as for this clip.
 
@@ -770,7 +886,15 @@ def _edl_frame(
         width=frame.width.static,
         # A frame covering the canvas keeps its height; a smaller one leaves it
         # to the aspect ratio, which is what a picture-in-picture always did.
-        height=height if frame.fills_canvas or height >= 100.0 else 0.0,
+        #
+        # Unless there is no picture. A flat fill and a line of text have no
+        # shape to fall back on, so "let the aspect ratio decide" would mean
+        # "let the size of the ground the renderer happened to draw on decide"
+        # — and a plate asked for at a seventh of the canvas came out running
+        # off the bottom of it (trap 62).
+        height=(
+            height if painted or frame.fills_canvas or height >= 100.0 else 0.0
+        ),
         fit=frame.fit if frame.fit != model.FIT_AUTO else "cover",
         opacity=frame.opacity.static,
         rotate=frame.rotate.static,

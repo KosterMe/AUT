@@ -90,6 +90,7 @@
         "x": 50.0,
         "y": 50.0
       },
+      "paint": null,
       "source_path": "/media/library/machine.mp4",
       "source_start_sec": 0.0,
       "still": false,
@@ -108,6 +109,7 @@
         "x": 50.0,
         "y": 50.0
       },
+      "paint": null,
       "source_path": "/media/library/road.mp4",
       "source_start_sec": 0.0,
       "still": false,

@@ -70,6 +70,91 @@ def polyline(points: "Sequence[tuple[float, float]]", *, clock: str = "t") -> st
     return f"if(lt({clock},{flt(first)}),{flt(usable[0][1])},{expression})"
 
 
+def painted(paint, canvas, box: "tuple[int, int] | None" = None) -> str:
+    """A layer with no file behind it, as a `lavfi` source.
+
+    §7.3 set aside a second renderer for graphics laid over the picture, and
+    the two this model can ask for — a flat fill and a line of text — turned
+    out not to need one: `color` makes the first, `drawtext` on a transparent
+    ground makes the second, and this build has both (trap 59).
+
+    A fill is drawn at canvas size and a caption at the size of its own box,
+    and the difference is not tidiness. Everything the layer chain does after
+    this scales the source into the layer's rectangle — which is harmless for a
+    flat colour and ruinous for type: a full-canvas ground squeezed into a
+    rectangle a seventh as tall takes the letters down with it, and the caption
+    arrives four pixels high (trap 61). Drawn at the box, the scale is a no-op
+    at rest; when the box animates, the type grows with it, which is what a
+    growing text box should look like.
+
+    Nothing here interprets the text: it arrives substituted, because an EDL
+    still holding `{title}` would be a plan rather than a description.
+    """
+    if paint.kind == "colour":
+        return (
+            f"color=c={_colour(paint.colour)}"
+            f":s={canvas.width}x{canvas.height}:r={canvas.fps}"
+        )
+
+    points = max(8, int(round(canvas.height * paint.size_pct / 100.0)))
+    width = max(2, box[0] if box and box[0] else canvas.width)
+    # A frame that leaves its height to the aspect ratio has none to take, so
+    # the ground is as tall as the type needs and the scale keeps it in
+    # proportion from there.
+    height = max(2, box[1] if box and box[1] else int(round(points * 1.6)))
+    # `format=rgba` on the ground and not later: `color` negotiates its output
+    # with whatever comes next, and the next thing is a scale into the layer's
+    # box, which settles on yuv420p and throws the alpha away. The transparent
+    # ground then arrives as an opaque black rectangle covering whatever the
+    # text was meant to sit on (trap 60).
+    ground = f"color=c=black@0.0:s={width}x{height}:r={canvas.fps},format=rgba"
+    font = _font_file()
+    face = f":fontfile='{path(font)}'" if font else ""
+    # Centred on the ground, so the layer's own rectangle is what moves it.
+    # The outline is the subtitle look's, and it is not decoration: white type
+    # on a bright frame is unreadable without it.
+    return (
+        f"{ground},drawtext=text='{_escaped(paint.text)}'"
+        f"{face}:fontsize={points}:fontcolor={_colour(paint.colour)}"
+        f":x=(w-text_w)/2:y=(h-text_h)/2"
+        f":borderw={max(1, round(points * 0.12))}:bordercolor=black@0.8"
+    )
+
+
+def _colour(value: str) -> str:
+    """A `#rrggbb` as ffmpeg writes it."""
+    cleaned = (value or "").strip().lstrip("#")
+    return f"0x{cleaned}" if cleaned else "black"
+
+
+def _font_file() -> str | None:
+    """The bundled display face, as a file `drawtext` can open.
+
+    `subtitles` speaks to libass, which takes a family name and a directory to
+    look in; `drawtext` takes a path. Same font, two ways of naming it.
+    """
+    directory = fonts_dir()
+    if not directory:
+        return None
+    faces = sorted(Path(directory).glob("*.ttf"))
+    return str(faces[0]) if faces else None
+
+
+def _escaped(text: str) -> str:
+    """Text as a `drawtext` argument.
+
+    Four characters have to go: the backslash first or it would escape the
+    escapes, then the quote that ends the option, the colon that separates
+    options, and the percent sign `drawtext` reads as a strftime directive —
+    which is how a caption saying "100%" turns into a caption saying "100" and
+    the date.
+    """
+    out = text.replace("\\", "\\\\")
+    for character in ("'", ":", "%", ","):
+        out = out.replace(character, "\\" + character)
+    return out.replace("\n", "\\n")
+
+
 def fonts_dir() -> str | None:
     """Directory of bundled display fonts (Oswald, …) for libass to load.
 

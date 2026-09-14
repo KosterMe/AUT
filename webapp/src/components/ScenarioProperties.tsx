@@ -189,7 +189,10 @@ function SlotFields({
         </Field>
       )}
       {slot.kind === "text" && (
-        <Field label="Текст">
+        <Field
+          label="Текст"
+          hint="Подставляются {title} и {index}. Всё остальное в фигурных скобках компилятор выбросит и скажет об этом — напечатанные скобки на экране выглядят как задумка."
+        >
           <input
             className="input"
             value={slot.template ?? ""}
