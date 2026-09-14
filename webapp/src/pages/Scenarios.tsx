@@ -16,6 +16,7 @@ import {
   useInvalidatingMutation,
   useJob,
   useJobs,
+  useCapabilities,
   useScenarioInspect,
   useScenarios,
 } from "../api/hooks";
@@ -205,6 +206,10 @@ function Editor({
 
   // Asked of the compiler, on the draft, at the chosen length. Debounced so a
   // held-down arrow key is one question rather than thirty.
+  // What this montage draws, asked once for the session. A palette offering a
+  // block that compiles to a warning is the same fault as a keyframe track
+  // for a property that will not move.
+  const { data: build } = useCapabilities();
   const asked = useDebounced(draft, 200);
   // The playhead is part of the question once anything moves: "where is this"
   // has no answer without "when".
@@ -375,7 +380,14 @@ function Editor({
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-[190px_1fr_330px]">
         <div className="card space-y-2">
           <h3 className="font-medium">Добавить</h3>
-          {PALETTE.map((item) => (
+          {PALETTE
+            // A rule is not a slot and is always offered; a slot is offered
+            // only if this montage draws it. Two of the model's kinds are
+            // not drawn, and one more depends on the build having `drawtext`
+            // — offering either means offering a block that compiles to a
+            // warning (trap 59).
+            .filter((item) => build?.slots?.[item.kind] !== false)
+            .map((item) => (
             <button
               key={item.kind}
               onClick={() => add(item.kind)}
@@ -385,7 +397,7 @@ function Editor({
             >
               {item.label}
             </button>
-          ))}
+            ))}
         </div>
 
         <div className="card">

@@ -6,6 +6,7 @@ actually enforced.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import timedelta
 
@@ -13,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.clock import aware_utc_now
+from montage import client as montage_client
 from app.db.enums import ClipStatus
 from app.db.models import Account, Clip
 
@@ -73,6 +75,42 @@ class TestCapabilities:
 
         assert body["animatable"]["rotate"] is False
         assert body["build"] == "6.1.1"
+
+    def test_it_says_which_slots_this_montage_draws(self, client):
+        """Two different reasons a thing is unavailable, and the editor needs
+        both: a property may not animate because this ffmpeg cannot drive it,
+        a slot may not be offered because this compiler does not draw it.
+        Answering only the first left the editor offering a gradient it will
+        drop (trap 59)."""
+        body = client.get("/api/capabilities").json()
+
+        assert body["slots"]["color"] is True
+        assert body["slots"]["text"] is True
+        # The two the compiler does not draw are absent rather than false:
+        # there is nothing to report about them but their absence.
+        assert "gradient" not in body["slots"]
+        assert "upload" not in body["slots"]
+
+    def test_a_slot_whose_filter_this_build_lacks_is_withheld(self, client, monkeypatch):
+        """Text is `drawtext`, and a build without libfreetype has none. The
+        slot is then not offered rather than offered and failed at render."""
+        from montage.render import capabilities as caps
+        from app.api.routers import system
+
+        real = caps.capabilities()
+        without = dataclasses.replace(real, findings=tuple(
+            dataclasses.replace(f, verdict=caps.REJECTED) if f.key == "drawtext" else f
+            for f in real.findings
+        ))
+        monkeypatch.setattr(caps, "capabilities", lambda: without)
+        monkeypatch.setattr(
+            system.montage, "capabilities", montage_client.capabilities_here,
+        )
+
+        body = client.get("/api/capabilities").json()
+
+        assert body["slots"]["text"] is False
+        assert body["slots"]["color"] is True, "a fill needs nothing from the build"
 
     def test_it_goes_through_the_client_so_it_answers_for_the_right_ffmpeg(
         self, client, monkeypatch

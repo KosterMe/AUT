@@ -440,6 +440,58 @@ class TestSlotsBecomePaths:
 
         assert got.layers[0].frame.height == 0.0
 
+    def test_what_the_table_promises_is_what_compiles(self):
+        """`SLOTS_DRAWN` is what the editor is offered, so it has to be the
+        truth about this compiler rather than a list somebody kept in step by
+        hand. Checked by compiling each kind rather than by comparing lists:
+        the question is what happens, not what is written down.
+
+        A fill and a caption were dropped for three stages while the palette
+        went on offering both (trap 59). This is the guard that would have
+        said so on the first run."""
+        from montage.scenario.compiler import SLOTS_DRAWN
+
+        for kind in sc.SLOT_KINDS:
+            got, notes = sc.compile(self.over(self.slot_of(kind)), facts())
+            dropped = any(n.code == "unsupported_slot" for n in notes)
+            promised = kind in SLOTS_DRAWN
+
+            assert promised != dropped, (
+                f"{kind}: the table says {'drawn' if promised else 'not drawn'} "
+                f"and the compiler {'dropped it' if dropped else 'drew it'}"
+            )
+            if not promised:
+                continue
+            # `blur_of` is the one that is drawn without becoming a layer: a
+            # blurred copy of the spine is the backdrop the renderer already
+            # builds under it, and emitting it again on top would put a
+            # blurred clip over the clip.
+            if kind == sc.SLOT_BLUR_OF:
+                assert got.spine[0].backdrop, f"{kind}: promised, and nothing came out"
+            else:
+                assert got.layers, f"{kind}: promised, and nothing came out"
+
+    def slot_of(self, kind: str) -> sc.Slot:
+        """A valid slot of each kind — the model refuses half of them empty.
+
+        Written as branches rather than a lookup table because a table builds
+        every value before it picks one, and half of these raise when their
+        field is missing.
+        """
+        if kind == sc.SLOT_LIBRARY:
+            return sc.Slot(kind=kind, tag="broll")
+        if kind == sc.SLOT_BLUR_OF:
+            return sc.Slot(kind=kind, ref="source")
+        if kind == sc.SLOT_UPLOAD:
+            return sc.Slot(kind=kind, upload_id=1)
+        if kind == sc.SLOT_TEXT:
+            return sc.Slot(kind=kind, template="{title}")
+        if kind in (sc.SLOT_COLOR, sc.SLOT_GRADIENT):
+            return sc.Slot(kind=kind, color="#112233")
+        if kind == sc.SLOT_SOURCE_AT:
+            return sc.Slot(kind=kind, event=sc.EventRef(kind="loudest"))
+        return sc.Slot(kind=kind)
+
     def test_a_gradient_still_says_it_needs_something_this_renderer_lacks(self):
         """The one of the three that is still missing, and it is missing for a
         reason worth keeping: §1.1 names it and says nothing about what a
