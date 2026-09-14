@@ -419,6 +419,13 @@ export interface InspectKey {
   value: number;
   easing: string;
   anchor: string;
+  /**
+   * Which key of the scenario's own list this is. Rows are shown in the order
+   * the keys happen and edited in the order they were written, and a key
+   * pinned to the end sits in a different place in each — so edits address
+   * this and never the row's position (trap 56).
+   */
+  index: number;
 }
 
 export interface InspectBlock {

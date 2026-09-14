@@ -243,7 +243,7 @@ def _inspect(scenario_id: int, name: str, report: inspector.Report) -> ScenarioI
                 keys=[
                     InspectKey(
                         property=key.property, at_sec=key.at_sec, value=key.value,
-                        easing=key.easing, anchor=key.anchor,
+                        easing=key.easing, anchor=key.anchor, index=key.index,
                     )
                     for key in block.keys
                 ],

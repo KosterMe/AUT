@@ -32,6 +32,8 @@ one expression builder instead of one per easing.
 """
 from __future__ import annotations
 
+from typing import NamedTuple
+
 from montage.scenario import anchors, facts as fact_module, model
 
 # (second in output time, value)
@@ -67,6 +69,20 @@ def ease(name: str, p: float) -> float:
     return p
 
 
+class Resolved(NamedTuple):
+    """One key, once it has met a clip."""
+
+    at_sec: float
+    value: float
+    easing: str
+    # Where the key sits in the scenario's own list — which the sort below
+    # loses, and which is the only way to say *which key* this is. The editor
+    # shows keys in the order they happen and edits them in the order they
+    # were written, and those two orders differ the moment a key anchored to
+    # the end sits beside one anchored to the start (trap 56).
+    index: int
+
+
 def resolved(
     animated: model.Animated,
     *,
@@ -74,8 +90,8 @@ def resolved(
     facts: fact_module.ClipFacts,
     placed: dict[str, anchors.Span] | None = None,
     cues: tuple = (),
-) -> tuple[tuple[float, float, str], ...]:
-    """The keys as (second, value, easing), sorted by the second they land on.
+) -> tuple[Resolved, ...]:
+    """The keys, resolved against this clip and sorted by when they land.
 
     Separate from `points` because two different things want it: the renderer
     wants the polyline between the keys, and the editor wants the keys
@@ -86,33 +102,35 @@ def resolved(
     if animated.is_static:
         return ()
     out = [
-        (
+        Resolved(
             round(anchors.resolve(
                 key.at, clip_duration_sec=clip_duration_sec, facts=facts,
                 placed=placed or {}, cues=cues,
             )[0], 3),
             float(key.value),
             key.easing,
+            index,
         )
-        for key in animated.keys
+        for index, key in enumerate(animated.keys)
     ]
     # Stable by time, so two keys on the same second keep the order the
     # scenario wrote them in and the later one ends up last — which is the one
     # that wins, because it is the one the curve arrives at.
-    out.sort(key=lambda item: item[0])
+    out.sort(key=lambda item: item.at_sec)
     return tuple(out)
 
 
-def polyline(keys: tuple[tuple[float, float, str], ...]) -> tuple[Point, ...]:
+def polyline(keys: tuple[Resolved, ...]) -> tuple[Point, ...]:
     """Resolved keys as the polyline the renderer is given."""
     if not keys:
         return ()
     if len(keys) == 1:
-        at, value, _ = keys[0]
-        return ((at, value),)
+        return ((keys[0].at_sec, keys[0].value),)
 
-    out: list[Point] = [(keys[0][0], keys[0][1])]
-    for (start, from_value, easing), (end, to_value, _) in zip(keys, keys[1:]):
+    out: list[Point] = [(keys[0].at_sec, keys[0].value)]
+    for first, second in zip(keys, keys[1:]):
+        start, from_value, easing = first.at_sec, first.value, first.easing
+        end, to_value = second.at_sec, second.value
         span = end - start
         if span <= 0:
             # Two keys on the same second: a jump, which is a real thing to

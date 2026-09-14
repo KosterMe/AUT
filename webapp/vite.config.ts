@@ -1,3 +1,4 @@
+/// <reference types="vitest" />
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -16,5 +17,13 @@ export default defineConfig({
   build: {
     outDir: "dist",
     sourcemap: true,
+  },
+  test: {
+    // `node`, not a fake DOM: what is worth testing here is the model — pure
+    // functions over the draft — and a test that renders a component to find
+    // out what `setKeys` did would be testing React as well as the thing it
+    // meant to. The screen is checked in a browser instead (§8.5).
+    environment: "node",
+    include: ["src/**/*.test.ts"],
   },
 });

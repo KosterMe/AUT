@@ -53,6 +53,11 @@ class Key:
     value: float
     easing: str = "linear"
     anchor: str = "start"
+    # Which key of the scenario's own list this is. The rows are shown in the
+    # order the keys happen and edited in the order they were written, and a
+    # key pinned to the end sits in a different place in each — so the editor
+    # addresses them by this and never by their position on screen (trap 56).
+    index: int = 0
 
 
 @dataclass(frozen=True)
@@ -223,16 +228,18 @@ def _keys(element: model.Element, made: compiler.Plan) -> tuple[Key, ...]:
     out: list[Key] = []
     for name, keys in resolved.items():
         modes = [key.at.mode.value for key in written[name].keys]
-        for index, (at_sec, value, easing) in enumerate(keys):
+        for key in keys:
             out.append(Key(
                 property=name,
-                at_sec=at_sec,
-                value=value,
-                easing=easing,
-                # Sorting can reorder the keys relative to how they were
-                # written, so this is a hint for the label and not an index
-                # into the scenario.
-                anchor=modes[index] if index < len(modes) else "start",
+                at_sec=key.at_sec,
+                value=key.value,
+                easing=key.easing,
+                # By the key's own index, not by its position here: sorting
+                # reorders these against the scenario, and reading the label
+                # off the position gave the key at 0:03 the anchor belonging
+                # to the one pinned to the end (trap 56).
+                anchor=modes[key.index] if key.index < len(modes) else "start",
+                index=key.index,
             ))
     return tuple(out)
 
