@@ -482,25 +482,35 @@ export function removeKey(
 export const MOTION_PRESETS: {
   name: string;
   hint: string;
+  /**
+   * Which property it writes keys on. Declared rather than implied by `apply`,
+   * so a build that cannot animate that property can have the preset withheld
+   * — the editor asks the probe what this ffmpeg does (§7.2).
+   */
+  property: Animatable;
   apply: (data: ScenarioData, id: string) => ScenarioData;
 }[] = [
   {
     name: "Въезд слева",
+    property: "x",
     hint: "За полсекунды из-за левого края на своё место",
     apply: (data, id) => fromOffscreen(data, id, "x", -20),
   },
   {
     name: "Въезд снизу",
+    property: "y",
     hint: "За полсекунды снизу на своё место",
     apply: (data, id) => fromOffscreen(data, id, "y", 120),
   },
   {
     name: "Уезд вправо",
+    property: "x",
     hint: "Уходит за правый край в конце, прижато к концу клипа",
     apply: (data, id) => offscreenAtEnd(data, id, "x", 120),
   },
   {
     name: "Зум 1.0→1.15",
+    property: "width",
     hint: "Медленно наезжает, пока элемент на экране (§8.2)",
     apply: (data, id) => {
       const element = findElement(data, id);
@@ -514,6 +524,7 @@ export const MOTION_PRESETS: {
   },
   {
     name: "Доворот",
+    property: "rotate",
     hint: "Приезжает под углом и выравнивается за полсекунды",
     apply: (data, id) =>
       setKeys(data, id, "rotate", [
@@ -523,6 +534,7 @@ export const MOTION_PRESETS: {
   },
   {
     name: "Проявление",
+    property: "opacity",
     hint: "За полсекунды из прозрачного в непрозрачное",
     apply: (data, id) =>
       setKeys(data, id, "opacity", [
@@ -532,6 +544,7 @@ export const MOTION_PRESETS: {
   },
   {
     name: "Затухание",
+    property: "opacity",
     hint: "Уходит в прозрачность за полсекунды до конца",
     apply: (data, id) =>
       setKeys(data, id, "opacity", [
@@ -541,6 +554,7 @@ export const MOTION_PRESETS: {
   },
   {
     name: "Проезд насквозь",
+    property: "x",
     hint: "Слева направо через весь кадр, пока элемент на экране",
     apply: (data, id) =>
       setKeys(data, id, "x", [

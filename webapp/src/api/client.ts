@@ -1,6 +1,7 @@
 import axios from "axios";
 import type {
   Account,
+  Capabilities,
   Clip,
   ClipJob,
   ClipJobDetail,
@@ -41,6 +42,7 @@ export function errorMessage(error: unknown): string {
 
 export const System = {
   health: () => api.get<Health>("/health").then((r) => r.data),
+  capabilities: () => api.get<Capabilities>("/capabilities").then((r) => r.data),
   tasks: (params?: { status?: string; kind?: string }) =>
     api.get<Task[]>("/tasks", { params }).then((r) => r.data),
   cancelTask: (id: number) => api.post(`/tasks/${id}/cancel`).then((r) => r.data),

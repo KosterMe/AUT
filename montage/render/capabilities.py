@@ -128,6 +128,27 @@ class Report:
     def by_key(self, key: str) -> Finding | None:
         return next((f for f in self.findings if f.key == key), None)
 
+    def animatable(self) -> dict[str, bool]:
+        """Which properties of a frame this build can actually animate.
+
+        The findings are keyed by construction, and the editor thinks in
+        properties — so somebody has to hold the mapping between the two. It
+        is held here, next to the renderer that chooses those constructions,
+        rather than in the editor: a list of names written out a second time
+        is where the sixth one gets forgotten (traps 25 and 53).
+        """
+        return {
+            name: all(self._offerable(key) for key in keys)
+            for name, keys in ANIMATES.items()
+        }
+
+    def _offerable(self, key: str) -> bool:
+        found = self.by_key(key)
+        # A construction that was not probed at all is not a construction this
+        # build is known to have: unknown reads as no, the same way `frozen`
+        # does, and for the same reason.
+        return found is not None and found.offerable
+
     def as_dict(self) -> dict:
         """The payload `GET /api/capabilities` returns."""
         return {
@@ -135,6 +156,7 @@ class Report:
             "build": self.build,
             "ffmpeg": self.ffmpeg,
             "detail": self.detail,
+            "animatable": self.animatable(),
             "capabilities": {
                 f.key: {
                     "label": f.label,
@@ -147,6 +169,24 @@ class Report:
                 for f in self.findings
             },
         }
+
+
+# What each animated property of a frame actually rests on: the constructions
+# the renderer emits for it, and not every construction that could in
+# principle have carried it. A property is offered in the editor only when all
+# of them hold on this build — `rotate` needs both the angle by expression and
+# the box cut for the widest angle, and half of that is not a turn.
+#
+# The names on the left are `composition.CURVES`, checked against it by a test:
+# a property missing here would be silently offered whatever ffmpeg says.
+ANIMATES: dict[str, tuple[str, ...]] = {
+    "x": ("position",),
+    "y": ("position",),
+    "width": ("scale_eval_frame", "scale_and_move"),
+    "height": ("scale_eval_frame", "scale_and_move"),
+    "rotate": ("rotation", "rotation_box_max"),
+    "opacity": ("opacity_mask_multiplied",),
+}
 
 
 # A source that does not move. Any difference between two output frames is
@@ -717,8 +757,17 @@ def capabilities() -> Report:
     Cached for the same reason `encoders.is_usable` is: the answer cannot
     change while the process lives, and two dozen ffmpeg runs is not something
     to repeat on every request.
+
+    The timing group is left out, and that is the difference between an editor
+    that waits two seconds for its first answer and one that waits fifteen.
+    Those checks render 1080×1920 three times each to price a filter against an
+    empty pass: a number for §7.2 and for deciding what the renderer may
+    afford, not something anybody's screen needs on load. They still run — from
+    the command line, where somebody asked for them:
+
+        python -m montage.render.capabilities --markdown
     """
-    return probe()
+    return probe(ANIMATION + CHAIN)
 
 
 # What each verdict means where it is read: the doc table, and the editor.
@@ -784,7 +833,7 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        prog="python -m app.adapters.media.capabilities",
+        prog="python -m montage.render.capabilities",
         description="Run every construction in docs/montage-service.md §7.2 "
                     "through the installed ffmpeg and report what survived.",
     )

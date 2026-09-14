@@ -55,6 +55,45 @@ class TestHealth:
         assert body["tasks_due_now"] == 0
 
 
+class TestCapabilities:
+    """§7.2 said for three stages that the editor does not offer what this
+    build cannot do. There was no route to ask, so it offered everything."""
+
+    def test_the_editor_can_ask_what_this_build_animates(self, client, monkeypatch):
+        from app.api.routers import system
+
+        monkeypatch.setattr(system.montage, "capabilities", lambda: {
+            "ok": True, "build": "6.1.1", "ffmpeg": "/usr/bin/ffmpeg", "detail": "",
+            "animatable": {"x": True, "y": True, "width": True,
+                           "height": True, "rotate": False, "opacity": True},
+            "capabilities": {},
+        })
+
+        body = client.get("/api/capabilities").json()
+
+        assert body["animatable"]["rotate"] is False
+        assert body["build"] == "6.1.1"
+
+    def test_it_goes_through_the_client_so_it_answers_for_the_right_ffmpeg(
+        self, client, monkeypatch
+    ):
+        """Pointed at a montage service, the build that matters is that
+        container's, not the API's. Asking `montage.client` is what makes the
+        answer follow the montage rather than the process serving the page."""
+        from app.api.routers import system
+
+        asked: list[str] = []
+
+        def through():
+            asked.append("client")
+            return {"ok": True, "animatable": {}, "capabilities": {}}
+
+        monkeypatch.setattr(system.montage, "capabilities", through)
+        client.get("/api/capabilities")
+
+        assert asked == ["client"]
+
+
 class TestBrowserLoginAvailability:
     def test_health_says_whether_a_browser_login_could_work(self, client):
         """The UI needs this to stop offering a button that only 503s.

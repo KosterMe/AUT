@@ -231,6 +231,23 @@ class TestDeclaredChecks:
         for check in caps.CHECKS:
             assert set(re.findall(r"\{(\w+)\}", check.graph)) <= {"ass"}, check.key
 
+    def test_every_animated_property_of_a_frame_is_accounted_for(self):
+        """`ANIMATES` is the one place that says which construction carries
+        which property. A property missing from it would be offered by the
+        editor whatever ffmpeg said about it, because nothing would be asked."""
+        from montage import composition as comp
+
+        assert tuple(caps.ANIMATES) == comp.CURVES
+
+    def test_every_construction_named_there_is_one_the_probe_asks_about(self):
+        """A key with a typo in it reads as "not probed", which reads as "this
+        build cannot do it" — the property would vanish from the editor and
+        the render would have been fine."""
+        known = {check.key for check in caps.CHECKS}
+
+        for name, keys in caps.ANIMATES.items():
+            assert set(keys) <= known, f"{name}: {set(keys) - known}"
+
     def test_the_probe_writes_a_real_subtitle_file_for_the_libass_check(self, monkeypatch):
         seen: list[str] = []
 
@@ -285,6 +302,9 @@ class TestWhatTheEditorIsTold:
         assert report.as_dict() == {
             "ok": False, "build": "", "ffmpeg": "",
             "detail": "no ffmpeg on this machine", "capabilities": {},
+            # Nothing was asked, so nothing is known to work — and the editor
+            # offers nothing rather than everything. Unknown reads as no.
+            "animatable": {name: False for name in caps.ANIMATES},
         }
 
     def test_a_missing_build_is_reported_rather_than_raised(self, monkeypatch):
@@ -293,6 +313,42 @@ class TestWhatTheEditorIsTold:
 
         assert not report.ok
         assert report.findings == ()
+
+    def test_the_payload_names_properties_and_not_only_constructions(self):
+        """The editor thinks in properties, the probe in constructions. If the
+        mapping between them lived in the editor it would be a second list of
+        names — which is where the sixth one gets forgotten (trap 53)."""
+        report = caps.Report(findings=tuple(
+            finding(key=key) for keys in caps.ANIMATES.values() for key in keys
+        ))
+
+        assert report.as_dict()["animatable"] == {
+            name: True for name in caps.ANIMATES
+        }
+
+    def test_a_property_needs_every_construction_it_rests_on(self):
+        """`rotate` is an angle *and* a box cut for the widest angle, and half
+        of that is not a turn — it is a picture with its corners sliced off."""
+        working = tuple(
+            finding(key=key) for keys in caps.ANIMATES.values() for key in keys
+            if key != "rotation_box_max"
+        )
+        report = caps.Report(findings=working + (
+            finding(key="rotation_box_max", verdict=caps.REJECTED),
+        ))
+
+        animatable = report.animatable()
+
+        assert animatable["rotate"] is False
+        assert animatable["x"] is True, "one property failing takes no others"
+
+    def test_a_construction_nobody_probed_counts_as_missing(self):
+        report = caps.Report(findings=(finding(key="position"),))
+
+        assert report.animatable() == {
+            "x": True, "y": True,
+            "width": False, "height": False, "rotate": False, "opacity": False,
+        }
 
     def test_a_finding_can_be_looked_up_by_key(self):
         report = caps.Report(findings=(finding(key="a"), finding(key="b")))

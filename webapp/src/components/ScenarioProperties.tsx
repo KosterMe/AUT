@@ -9,6 +9,7 @@ import type {
   ScenarioElement,
   SlotKind,
 } from "../api/types";
+import { useCapabilities } from "../api/hooks";
 import {
   ANCHOR_LABELS,
   ANIMATABLE,
@@ -689,9 +690,14 @@ function Field({
  * «Въезда слева» элемент остаётся тем же элементом с двумя ключами, которые
  * можно двигать.
  *
- * Двигаются пока только координаты, и причина измерена, а не выдумана (§7.2):
- * `overlay` берёт выражения по `t` и анимирует каждый кадр, масштабу нужен
- * `zoompan`, произвольная прозрачность — это `geq` за ×23, поворот — ×3.3.
+ * Что именно двигается, решает не этот файл, а установленный ffmpeg: зонд §7.2
+ * прогоняет каждую конструкцию через него и говорит, какие свойства рамки
+ * анимируются на **этом** билде. Дорожка ключей у свойства, которое не поедет,
+ * хуже отсутствующей: рендер пройдёт, а движения не будет.
+ *
+ * Сопоставление «свойство → конструкция» делается на сервере, рядом с
+ * рендерером, который эти конструкции и выбирает. Здесь только чтение ответа:
+ * второй список имён — это место, где забудут шестое (ловушки 25 и 53).
  */
 function MotionFields({
   element,
@@ -710,19 +716,27 @@ function MotionFields({
     patch: { value?: number; easing?: string; remove?: boolean },
   ) => void;
 }) {
+  const { data: build, isPending } = useCapabilities();
+  // Unknown reads as no, the same way a `frozen` verdict does and for the same
+  // reason: the dangerous answer is the one where the render succeeds without
+  // the animation. The probe answers in about two seconds and is then cached
+  // for the session, so this is the first open of the panel and nothing more.
+  const animates = (property: Animatable) => build?.animatable?.[property] === true;
+  const offered = ANIMATABLE.filter(animates);
   const moving = ANIMATABLE.filter((property) => keysOf(element, property).length > 0);
+  const withheld = ANIMATABLE.filter((property) => !animates(property));
 
   return (
     <div className="space-y-2 rounded-md border border-brand-100 bg-brand-50/40 p-2">
       <p className="text-[11px] font-medium text-brand-800">Движение</p>
 
       <div className="flex flex-wrap gap-1">
-        {MOTION_PRESETS.map((preset) => (
+        {MOTION_PRESETS.filter((preset) => animates(preset.property)).map((preset) => (
           <button
             key={preset.name}
             className="chip border border-brand-200 bg-white hover:bg-brand-50"
             title={preset.hint}
-            onClick={() => onAnimate?.("preset", "x", preset.name)}
+            onClick={() => onAnimate?.("preset", preset.property, preset.name)}
           >
             {preset.name}
           </button>
@@ -730,7 +744,7 @@ function MotionFields({
       </div>
 
       <div className="flex flex-wrap gap-1">
-        {ANIMATABLE.map((property) => (
+        {offered.map((property) => (
           <button
             key={property}
             className="chip border border-slate-200 bg-white hover:bg-slate-50"
@@ -750,6 +764,20 @@ function MotionFields({
           </button>
         ))}
       </div>
+
+      {isPending ? (
+        <p className="text-[11px] leading-snug text-slate-500">
+          Спрашиваем ffmpeg, что он умеет анимировать…
+        </p>
+      ) : withheld.length > 0 ? (
+        <p className="text-[11px] leading-snug text-amber-700">
+          {build?.ok === false
+            ? "ffmpeg не отвечает, поэтому ключи не предлагаются: анимация, которой не будет, хуже её отсутствия."
+            : `Этот ffmpeg не анимирует: ${withheld
+                .map((property) => PROPERTY_LABELS[property])
+                .join(", ")}. Замерено зондом на этом билде, а не прочитано в документации.`}
+        </p>
+      ) : null}
 
       {block && block.keys.length > 0 ? (
         <ul className="space-y-1">
