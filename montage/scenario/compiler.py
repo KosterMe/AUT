@@ -947,12 +947,44 @@ def _warn_unrenderable(element: model.Element, notes: list[CompileWarning]) -> N
     effects. The opacity warning that used to stand here was retired when the
     price it quoted turned out to be `geq`'s rather than opacity's (trap 50).
     """
+    unread = _unread_frame_fields(element.frame)
+    if unread:
+        # §4.2 lists five fields beside the rectangle and this renderer reads
+        # one of them. The other four are accepted by the model, stored,
+        # round-tripped and never looked at — which is what `opacity` was for
+        # three stages before anyone noticed (trap 52). A scenario written by
+        # hand can ask for any of them, and until now got silence.
+        notes.append(CompileWarning(
+            "no_frame_field",
+            "this renderer does not read " + ", ".join(sorted(unread))
+            + " yet; the rest of the frame was used as written",
+            element.id,
+        ))
     if element.effects:
         notes.append(CompileWarning(
             "no_effects",
             "per-element effects need a layer of their own; they were ignored",
             element.id,
         ))
+
+
+def _unread_frame_fields(frame: model.Frame) -> set[str]:
+    """Which of the frame's fields this renderer ignores, given how it is set.
+
+    Only what is actually asked for: `align` on a frame that is not contained
+    changes nothing even where it is read, and a scenario is not told off for
+    leaving a default alone.
+    """
+    unread: set[str] = set()
+    if frame.align != "center" and frame.fit == model.FIT_CONTAIN:
+        unread.add("align")
+    if frame.radius:
+        unread.add("radius")
+    if frame.crop is not None:
+        unread.add("crop")
+    if frame.blend != "normal":
+        unread.add("blend")
+    return unread
 
 
 def _audio(

@@ -492,6 +492,46 @@ class TestSlotsBecomePaths:
             return sc.Slot(kind=kind, event=sc.EventRef(kind="loudest"))
         return sc.Slot(kind=kind)
 
+    def test_a_frame_field_nobody_reads_says_so(self):
+        """§4.2 lists five fields beside the rectangle and the renderer reads
+        one. The other four are accepted, stored and round-tripped — which is
+        exactly what `opacity` was for three stages before anyone noticed
+        (trap 52). A scenario written by hand can ask for any of them."""
+        _, notes = sc.compile(
+            self.over(
+                sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"),
+                frame=sc.Frame(width=sc.Animated(40.0), radius=24.0, blend="screen"),
+            ),
+            facts(),
+        )
+
+        said = next(n for n in notes if n.code == "no_frame_field")
+        assert "radius" in said.message and "blend" in said.message
+
+    def test_and_a_default_left_alone_is_not_told_off(self):
+        _, notes = sc.compile(
+            self.over(sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll")), facts(),
+        )
+
+        assert [n for n in notes if n.code == "no_frame_field"] == []
+
+    def test_align_is_only_mentioned_where_it_would_have_mattered(self):
+        """It says where a contained picture sits in its box, so on a frame
+        that is not contained there is nothing it could have changed."""
+        _, quiet = sc.compile(
+            self.over(sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"),
+                      frame=sc.Frame(fit="cover", align="top")),
+            facts(),
+        )
+        _, loud = sc.compile(
+            self.over(sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"),
+                      frame=sc.Frame(fit="contain", align="top")),
+            facts(),
+        )
+
+        assert [n for n in quiet if n.code == "no_frame_field"] == []
+        assert any("align" in n.message for n in loud if n.code == "no_frame_field")
+
     def test_a_gradient_still_says_it_needs_something_this_renderer_lacks(self):
         """The one of the three that is still missing, and it is missing for a
         reason worth keeping: §1.1 names it and says nothing about what a
