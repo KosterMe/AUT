@@ -115,6 +115,12 @@ class Segment:
         return round(self.source_end_sec - self.source_start_sec, 3)
 
 
+# Every property that can carry a curve. Spelled out once: it is read back
+# from JSON, written to it, shifted onto another clock and asked whether it is
+# empty, and a sixth curve added in five places is a fifth chance to forget one.
+CURVES = ("x", "y", "width", "height", "rotate", "opacity")
+
+
 @dataclass(frozen=True)
 class Motion:
     """How a frame's numbers change while it is on screen.
@@ -126,16 +132,18 @@ class Motion:
     happens rather than a plan somebody still has to interpret, and it is why
     the renderer needs one expression builder instead of one per easing.
 
-    Position, size and rotation, and each one is here because the probe said
-    it animates on this build (§7.2): `overlay` takes expressions in `t`;
-    `scale` takes them too with `eval=frame`, and `overlay` can then read the
-    layer's current `w`/`h` to keep it centred; `rotate` takes one for the
-    angle but sizes its box once at the start, so the box is cut for the
-    widest angle the curve reaches.
+    Position, size, rotation and opacity, and each one is here because the
+    probe said it animates on this build (§7.2): `overlay` takes expressions
+    in `t`; `scale` takes them too with `eval=frame`, and `overlay` can then
+    read the layer's current `w`/`h` to keep it centred; `rotate` takes one
+    for the angle but sizes its box once at the start, so the box is cut for
+    the widest angle the curve reaches; opacity is a curve drawn on a mask
+    sixteen pixels square and stretched over the layer.
 
-    Opacity is still missing, and for the same kind of reason the others are
-    here: an arbitrary alpha curve is `geq`, measured at ×23, which is a
-    different conversation from "does it work".
+    Opacity arrived late, and the reason it was missing is worth keeping: the
+    price quoted against it, ×23, belonged to `geq` run over a whole canvas,
+    not to the property. Priced per pixel of its own input, the same filter on
+    a small mask costs ×3 — see the amendment in §7.2 and trap 50.
     """
 
     # (second of the output, value in per cent of the canvas)
@@ -145,10 +153,22 @@ class Motion:
     height: tuple[tuple[float, float], ...] = ()
     # Degrees, because that is what somebody types. The renderer converts.
     rotate: tuple[tuple[float, float], ...] = ()
+    # 0..1, the share of the layer that reaches the canvas.
+    opacity: tuple[tuple[float, float], ...] = ()
 
     @property
     def moves(self) -> bool:
+        """Whether the rectangle goes anywhere — geometry only.
+
+        A layer that only fades has not moved, and the distinction earns its
+        keep in the renderer: fading is one filter in front of the chain,
+        moving is a different road through it.
+        """
         return bool(self.x or self.y or self.width or self.height or self.rotate)
+
+    @property
+    def fades(self) -> bool:
+        return bool(self.opacity)
 
     @property
     def resizes(self) -> bool:
@@ -190,6 +210,20 @@ class Frame:
         return self.motion is not None and self.motion.moves
 
     @property
+    def fades(self) -> bool:
+        """Whether how much of it reaches the canvas changes over time.
+
+        Separate from `moves` because the renderer treats them separately: a
+        fade is a mask in front of the chain, a move is the chain itself.
+        """
+        return self.motion is not None and self.motion.fades
+
+    @property
+    def sheer(self) -> bool:
+        """Whether anything at all is held back — a constant or a curve."""
+        return self.opacity != 1.0 or self.fades
+
+    @property
     def fills_canvas(self) -> bool:
         """Whether this covers the frame edge to edge, centred and upright.
 
@@ -200,7 +234,9 @@ class Frame:
             (self.x, self.y) == (50.0, 50.0)
             and self.width >= 100.0
             and self.height >= 100.0
-            and self.opacity == 1.0
+            # A curve that happens to start at 1.0 is not an opacity of 1.0,
+            # and the shortcut below cannot carry one.
+            and not self.sheer
             and self.rotate == 0.0
             # A moving frame is not a frame that fills the canvas, even while
             # it is passing through the middle of it: the shortcut this
@@ -764,7 +800,7 @@ def _shifted(frame: Frame, by: float) -> Frame:
         return tuple((round(at - by, 3), value) for at, value in points)
     return replace(frame, motion=Motion(**{
         name: move(getattr(frame.motion, name))
-        for name in ("x", "y", "width", "height", "rotate")
+        for name in CURVES
     }))
 
 
@@ -778,7 +814,7 @@ def _frame_dict(frame: Frame) -> dict[str, Any]:
     motion = data.pop("motion", None)
     data["motion"] = None if motion is None else {
         name: [[at, value] for at, value in getattr(motion, name)]
-        for name in ("x", "y", "width", "height", "rotate")
+        for name in CURVES
     }
     return data
 
@@ -797,9 +833,9 @@ def _motion_from(data: Any) -> "Motion | None":
         return None
     motion = Motion(**{
         name: _curve_from(data.get(name))
-        for name in ("x", "y", "width", "height", "rotate")
+        for name in CURVES
     })
-    return motion if motion.moves else None
+    return motion if motion.moves or motion.fades else None
 
 
 def _curve_from(data: Any) -> tuple[tuple[float, float], ...]:

@@ -470,6 +470,10 @@ class TestKeyframesReachTheRenderer:
     to keep compiling to exactly what it compiled to before."""
 
     def moving(self, frame: sc.Frame) -> comp.Composition:
+        got, _ = sc.compile(self.scenario(frame), facts())
+        return got
+
+    def scenario(self, frame: sc.Frame) -> sc.Scenario:
         element = sc.Element(
             id="mover", slot=sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"),
             start=sc.Anchor(mode=sc.AnchorMode.START, value=0.0),
@@ -486,8 +490,7 @@ class TestKeyframesReachTheRenderer:
             ),
             style=style(),
         )
-        got, _ = sc.compile(scenario, facts())
-        return got
+        return scenario
 
     def test_a_still_overlay_carries_no_motion_at_all(self):
         """`is_static` is not decoration: a scenario without animation must
@@ -540,36 +543,60 @@ class TestKeyframesReachTheRenderer:
 
         assert got.layers[0].frame.motion.rotate == ((0.0, -15.0), (4.0, 15.0))
 
-    def test_opacity_is_the_one_that_still_cannot_move(self):
-        """And it says so. `geq` was measured at ×23 — a different
-        conversation from "does it work"."""
-        got, notes = sc.compile(
-            with_rule(),  # a plain spine; the overlay is added below
-            facts(),
-        )
-        element = sc.Element(
-            id="fading", slot=sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"),
-            duration=sc.Duration(mode=sc.DurationMode.FIXED, value=5.0),
-            frame=sc.Frame(opacity=sc.Animated(1.0, keys=(
-                sc.Keyframe(at=sc.Anchor(), value=0.2),
-                sc.Keyframe(at=sc.Anchor(mode=sc.AnchorMode.END), value=1.0),
-            ))),
-        )
+    def test_opacity_animates_like_everything_else(self):
+        """It was the last property that did not, and the reason was a price
+        misread: ×23 was `geq` over a whole canvas, not opacity. Drawn on a
+        mask sixteen pixels square the same curve costs ×3 (trap 50)."""
+        got = self.moving(sc.Frame(opacity=sc.Animated(1.0, keys=(
+            sc.Keyframe(at=sc.Anchor(), value=0.2),
+            sc.Keyframe(at=sc.Anchor(mode=sc.AnchorMode.START, value=4.0), value=1.0),
+        ))))
+
+        assert got.layers[0].frame.motion.opacity == ((0.0, 0.2), (4.0, 1.0))
+
+    def test_a_fade_is_not_a_move(self):
+        """The renderer reads these separately — a fade is one filter in front
+        of the chain, a move is the chain itself — so the composition has to
+        tell them apart rather than lump them into "animated"."""
+        frame = self.moving(sc.Frame(opacity=sc.Animated(1.0, keys=(
+            sc.Keyframe(at=sc.Anchor(), value=0.0),
+            sc.Keyframe(at=sc.Anchor(mode=sc.AnchorMode.START, value=1.0), value=1.0),
+        )))).layers[0].frame
+
+        assert frame.fades and not frame.moves
+
+    def test_the_spine_says_its_opacity_was_dropped(self):
+        """A layer fades; the thing layers are laid over has nothing to fade
+        against, and the renderer does not try. Saying so is the whole point:
+        a number carried into the EDL and ignored there is the expensive kind
+        of bug, because it renders (trap 52)."""
         scenario = sc.Scenario(
-            name="fading",
+            name="dim",
             tracks=(
                 sc.Track(id="spine", kind=sc.TRACK_SPINE, elements=(
-                    sc.Element(id="source", duration=sc.Duration(mode=sc.DurationMode.ELASTIC)),
+                    sc.Element(
+                        id="source",
+                        duration=sc.Duration(mode=sc.DurationMode.ELASTIC),
+                        frame=sc.Frame(opacity=sc.Animated(0.5)),
+                    ),
                 )),
-                sc.Track(id="over", kind=sc.TRACK_OVERLAY, z=1, elements=(element,)),
             ),
             style=style(),
         )
 
-        got, notes = sc.compile(scenario, facts())
+        _, notes = sc.compile(scenario, facts())
 
-        assert [n.code for n in notes if n.code == "no_animation"] == ["no_animation"]
-        assert "opacity" in next(n for n in notes if n.code == "no_animation").message
+        assert [n.code for n in notes if n.code == "no_spine_opacity"] == [
+            "no_spine_opacity"
+        ]
+
+    def test_nothing_warns_about_opacity_any_more(self):
+        got, notes = sc.compile(self.scenario(sc.Frame(opacity=sc.Animated(
+            1.0, keys=(sc.Keyframe(at=sc.Anchor(), value=0.3),),
+        ))), facts())
+
+        assert [n.code for n in notes if n.code == "no_animation"] == []
+        assert got.layers[0].frame.motion is not None
 
 
 class TestRulesExpandAgainstTheClip:

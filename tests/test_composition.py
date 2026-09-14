@@ -229,6 +229,63 @@ def test_an_excerpt_moves_a_curve_onto_its_own_clock():
     assert window.layers[0].frame.motion.x == ((1.0, -20.0), (3.0, 120.0))
 
 
+def test_an_excerpt_moves_the_fade_too():
+    """`_shifted` walks a list of curve names, and a curve left off that list
+    would preview at the wrong second while every other one was right."""
+    composition = build(
+        layers=(
+            comp.Layer(
+                "/media/b.mp4", at_sec=11.0, duration_sec=2.0,
+                frame=comp.Frame(
+                    width=40.0,
+                    motion=comp.Motion(opacity=((11.0, 0.0), (13.0, 1.0))),
+                ),
+            ),
+        ),
+    )
+
+    window = comp.excerpt(composition, at_sec=10.0, duration_sec=4.0)
+
+    assert window.layers[0].frame.motion.opacity == ((1.0, 0.0), (3.0, 1.0))
+
+
+def test_a_fade_survives_a_trip_through_json():
+    """Every curve is written out by hand, name by name, so the one that gets
+    forgotten is silently dropped rather than loudly rejected."""
+    composition = build(
+        layers=(
+            comp.Layer(
+                "/media/b.mp4", at_sec=0.0, duration_sec=2.0,
+                frame=comp.Frame(
+                    width=40.0, opacity=0.8,
+                    motion=comp.Motion(
+                        x=((0.0, 10.0), (2.0, 90.0)),
+                        opacity=((0.0, 0.0), (2.0, 1.0)),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    back = comp.from_dict(comp.to_dict(composition))
+
+    assert back.layers[0].frame.motion == composition.layers[0].frame.motion
+    assert back.layers[0].frame.opacity == 0.8
+
+
+def test_a_document_carrying_only_a_fade_still_has_motion_when_it_is_read_back():
+    """`_motion_from` drops a motion with nothing in it, and "nothing in it"
+    used to mean "does not move" — which threw the fade away."""
+    frame = comp.Frame(width=40.0, motion=comp.Motion(opacity=((0.0, 0.0), (1.0, 1.0))))
+    composition = build(layers=(comp.Layer("/media/b.mp4", at_sec=0.0,
+                                           duration_sec=2.0, frame=frame),))
+
+    back = comp.from_dict(comp.to_dict(composition))
+
+    assert back.layers[0].frame.motion is not None
+    assert back.layers[0].frame.fades
+
+
 def test_an_excerpt_leaves_a_still_layer_exactly_as_it_was():
     composition = build(layers=(comp.Layer("/media/b.mp4", at_sec=11.0, duration_sec=2.0),))
 

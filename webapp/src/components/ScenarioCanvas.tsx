@@ -140,7 +140,14 @@ export default function ScenarioCanvas({
                 // Degrees, and the same angle the renderer turns it by — the
                 // sample comes from the compile rather than from the draft.
                 transform: block.frame.rotate ? `rotate(${block.frame.rotate}deg)` : undefined,
-                opacity: spine ? 0.85 : 0.9,
+                // The block is drawn slightly see-through as a matter of
+                // chrome, and its own opacity multiplies that — so an element
+                // fading in reads as fading rather than as solid until the
+                // render disagrees. Floored, because a block at zero would
+                // otherwise be invisible and therefore unselectable, and the
+                // moment you most want to click it is the one where it has
+                // faded out.
+                opacity: Math.max(0.15, (spine ? 0.85 : 0.9) * (block.frame.opacity ?? 1)),
               }}
               title={
                 block.frame.moving

@@ -393,6 +393,8 @@ export interface InspectRect {
   height: number;
   /** Degrees, sampled at the report's moment like everything else here. */
   rotate: number;
+  /** 0..1, sampled the same way. */
+  opacity: number;
   fit: string;
   /** One frame of a moving rectangle: sampled at the report's `at_sec`. */
   moving: boolean;

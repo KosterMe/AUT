@@ -308,7 +308,7 @@ function round(value: number): number {
 // keys by default and drags those; a key anchored to the end is shown and
 // respected but dragged by its offset, because that is the number it has.
 
-export const ANIMATABLE = ["x", "y", "width", "height", "rotate"] as const;
+export const ANIMATABLE = ["x", "y", "width", "height", "rotate", "opacity"] as const;
 export type Animatable = (typeof ANIMATABLE)[number];
 
 export const PROPERTY_LABELS: Record<Animatable, string> = {
@@ -317,6 +317,7 @@ export const PROPERTY_LABELS: Record<Animatable, string> = {
   width: "ширина",
   height: "высота",
   rotate: "поворот",
+  opacity: "прозрачность",
 };
 
 /** What each property is worth when nothing has been said about it. */
@@ -328,6 +329,24 @@ const RESTING: Record<Animatable, number> = {
   // different thing and the reason this table exists rather than one number.
   height: 0,
   rotate: 0,
+  // The only one on a 0..1 scale rather than a per-cent one.
+  opacity: 1,
+};
+
+/**
+ * How finely each property is typed, and between which bounds.
+ *
+ * Opacity is the reason this exists: everything else is a per cent or a
+ * degree, where stepping by one is right, and a share of 0..1 stepped by one
+ * has two usable values.
+ */
+export const SCALES: Record<Animatable, { step: number; min?: number; max?: number }> = {
+  x: { step: 1 },
+  y: { step: 1 },
+  width: { step: 1, min: 0 },
+  height: { step: 1, min: 0 },
+  rotate: { step: 1 },
+  opacity: { step: 0.05, min: 0, max: 1 },
 };
 
 export function keysOf(element: ScenarioElement, property: Animatable): ScenarioKeyframe[] {
@@ -455,9 +474,10 @@ export function removeKey(
  * explicit that a preset *is* keyframes — so applying one leaves an element
  * anybody can then drag.
  *
- * Only position, because only position animates on this build without costing
- * something absurd: scale wants `zoompan`, an arbitrary opacity curve is `geq`
- * at ×23, rotation is ×3.3 (§7.2).
+ * Every property here animates on this build, measured rather than assumed
+ * (§7.2). Opacity was the last to arrive: the ×23 once quoted against it was
+ * `geq` run over a whole canvas, and the same curve drawn on a mask sixteen
+ * pixels square costs ×3 (trap 50).
  */
 export const MOTION_PRESETS: {
   name: string;
@@ -499,6 +519,24 @@ export const MOTION_PRESETS: {
       setKeys(data, id, "rotate", [
         { at: { mode: "start", value: 0 }, value: -8, easing: "out" },
         { at: { mode: "start", value: 0.5 }, value: 0, easing: "linear" },
+      ]),
+  },
+  {
+    name: "Проявление",
+    hint: "За полсекунды из прозрачного в непрозрачное",
+    apply: (data, id) =>
+      setKeys(data, id, "opacity", [
+        { at: { mode: "start", value: 0 }, value: 0, easing: "out" },
+        { at: { mode: "start", value: 0.5 }, value: 1, easing: "linear" },
+      ]),
+  },
+  {
+    name: "Затухание",
+    hint: "Уходит в прозрачность за полсекунды до конца",
+    apply: (data, id) =>
+      setKeys(data, id, "opacity", [
+        { at: { mode: "end", offset_sec: 0.5 }, value: 1, easing: "in" },
+        { at: { mode: "end", offset_sec: 0 }, value: 0 },
       ]),
   },
   {

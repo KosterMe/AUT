@@ -167,6 +167,12 @@ PAN_SRC = f"smptebars=size={PAN_W}x{PAN_H}:rate={PAN_N}:duration=1"
 # rather than about the filter.
 PAN_LAYER = f"smptebars=size=128x128:rate={PAN_N}:duration=1"
 
+# The alpha curve is drawn on a patch this small and then stretched to the
+# layer. `geq` is priced per pixel of its own input, so where that input is
+# sixteen pixels square the curve costs nothing and the stretch costs a scale.
+# That is the whole of the difference between ×23 and ×2 in the price table.
+MASK = "color=c=black:size=16x16:rate=12:duration=1"
+
 ANIMATION: tuple[Check, ...] = (
     Check(
         key="position",
@@ -292,6 +298,45 @@ ANIMATION: tuple[Check, ...] = (
             "[0:v][l]overlay"
         ),
         sources=(BARS, FULL_PATCH),
+    ),
+    Check(
+        key="opacity_mask",
+        label="прозрачность кривой через маску",
+        construction="geq на маленькой маске + alphamerge",
+        graph=(
+            "[2:v]format=gray,geq=lum='255*(0.1+0.8*T)'[m];"
+            "[1:v]format=rgba[l];[m][l]scale2ref[m2][l2];"
+            "[l2][m2]alphamerge[la];[0:v][la]overlay"
+        ),
+        sources=(BARS, FULL_PATCH, MASK),
+        note="кривая рисуется на 16×16 и растягивается под слой; alphamerge "
+             "заменяет альфу, поэтому сам по себе годится только для "
+             "непрозрачного слоя",
+    ),
+    Check(
+        key="opacity_mask_multiplied",
+        label="прозрачность кривой поверх своей альфы",
+        construction="alphaextract + blend=multiply + alphamerge",
+        graph=(
+            "[2:v]format=gray,geq=lum='255*(0.1+0.8*T)'[m];"
+            "[1:v]format=rgba,split[la][lb];[la]alphaextract[a0];"
+            "[m][a0]scale2ref[m2][a1];[a1][m2]blend=all_mode=multiply[am];"
+            "[lb][am]alphamerge[out];[0:v][out]overlay"
+        ),
+        sources=(BARS, FULL_PATCH, MASK),
+        note="умножает, а не заменяет: дырки стикера остаются дырками",
+    ),
+    Check(
+        key="opacity_constant",
+        label="прозрачность постоянная",
+        construction="colorchannelmixer=aa=число",
+        graph="[1:v]format=rgba,colorchannelmixer=aa=0.4[l];[0:v][l]overlay",
+        sources=(BARS, FULL_PATCH),
+        # Judged by the exit code rather than by counting frames: a constant
+        # opacity that animated would be the defect. The picture checks ask
+        # "does it move", and the honest answer here is "no, and it must not".
+        kind=RUN,
+        note="тоже умножает свою альфу, а не заменяет её",
     ),
     Check(
         key="opacity_colorchannelmixer",
@@ -454,6 +499,13 @@ COST: tuple[Check, ...] = (
           "[0:v]rotate=a='0.8*t':fillcolor=black"),
     _cost("cost_opacity_curve", "прозрачность кривой", "geq=a='…T…'",
           "[0:v]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='255*(0.1+0.8*T)'"),
+    _cost("cost_opacity_mask", "прозрачность маской",
+          "geq на 16×16 + alphamerge",
+          f"color=c=black:size=16x16:rate={COST_N}:duration=1,format=gray,"
+          "geq=lum='255*(0.1+0.8*T)'[m];"
+          "[0:v]format=rgba,split[la][lb];[la]alphaextract[a0];"
+          "[m][a0]scale2ref[m2][a1];[a1][m2]blend=all_mode=multiply[am];"
+          "[lb][am]alphamerge"),
     _cost("cost_scale", "масштаб", "zoompan=z='…on…'",
           f"[0:v]zoompan=z='1+0.4*on/{COST_N}':d=1:s={COST_W}x{COST_H}:fps={COST_N}"),
     _cost("cost_scale_eval", "масштаб через scale", "scale=w='…t…':eval=frame",

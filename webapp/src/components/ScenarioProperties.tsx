@@ -15,6 +15,7 @@ import {
   DURATION_LABELS,
   MOTION_PRESETS,
   PROPERTY_LABELS,
+  SCALES,
   SLOT_LABELS,
   elementsOf,
   isRule,
@@ -410,6 +411,24 @@ function FrameFields({
           </Field>
         ))}
       </div>
+      {!spine && (
+        <Field label="Прозрачность">
+          <div className="flex items-center gap-2">
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              className="w-full"
+              value={numberOf(frame.opacity, 1)}
+              onChange={(event) => set({ opacity: Number(event.target.value) })}
+            />
+            <span className="w-10 shrink-0 text-right text-[11px] tabular-nums text-slate-500">
+              {Math.round(numberOf(frame.opacity, 1) * 100)}%
+            </span>
+          </div>
+        </Field>
+      )}
       <Field label="Вписывание">
         <select
           className="input"
@@ -773,6 +792,7 @@ function KeyRow({
   ) => void;
 }) {
   const property = item.property as Animatable;
+  const scale = SCALES[property] ?? { step: 1 };
 
   return (
     <li className="flex items-center gap-1 text-[11px]">
@@ -782,7 +802,9 @@ function KeyRow({
       </span>
       <input
         type="number"
-        step="1"
+        step={scale.step}
+        min={scale.min}
+        max={scale.max}
         className="input h-7 w-16 px-1 py-0"
         value={item.value}
         onChange={(event) =>

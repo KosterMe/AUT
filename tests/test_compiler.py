@@ -350,6 +350,83 @@ def test_nothing_of_this_appears_when_the_frame_stands_still():
         assert construction not in graph
 
 
+def test_a_layer_that_fades_gets_a_curve_drawn_on_a_small_mask():
+    """The construction §7.2 measured at ×3, against `geq`-over-the-canvas at
+    ×23. The mask is small because `geq` is priced per pixel of its own
+    input, and the price was what kept opacity still until trap 50."""
+    graph = one_pass(build(layers=(
+        comp.Layer(
+            BROLL, at_sec=0.0, duration_sec=4.0,
+            frame=comp.Frame(x=50.0, y=50.0, width=40.0,
+                             motion=comp.Motion(opacity=((0.0, 0.0), (4.0, 1.0)))),
+        ),
+    )))
+
+    assert "color=c=black:s=16x16" in graph
+    # `geq` calls the second `T`. Under the name `t` it would be the pixel
+    # index, and the render would succeed with the wrong picture.
+    assert "geq=lum='if(lt(T," in graph
+    assert "scale2ref" in graph
+    # Multiplied into the alpha the layer already has, never substituted for
+    # it: a source with a hole in it has to keep the hole.
+    assert "alphaextract" in graph and "blend=all_mode=multiply" in graph
+    assert "alphamerge" in graph
+    # 0..1 in the composition, 0..255 in the filter.
+    assert "255.000" in graph
+
+
+def test_a_constant_opacity_is_one_filter_and_no_mask():
+    """It used to be nothing at all: the EDL carried the number and the
+    renderer never read it, so a layer asked for at half strength rendered
+    solid and nothing said so (trap 52)."""
+    graph = one_pass(build(layers=(
+        comp.Layer(BROLL, at_sec=0.0, duration_sec=4.0,
+                   frame=comp.Frame(x=50.0, y=50.0, width=40.0, opacity=0.4)),
+    )))
+
+    assert "colorchannelmixer=aa=0.400" in graph
+    assert "geq" not in graph and "alphamerge" not in graph
+
+
+def test_a_solid_layer_carries_no_alpha_machinery_at_all():
+    """The same floor the still layer has: what does not fade must compile to
+    the string it compiled to before fading existed."""
+    graph = one_pass(build(layers=(corner(at_sec=1.0, duration_sec=2.0),)))
+
+    for construction in ("format=rgba", "colorchannelmixer", "alphamerge", "geq"):
+        assert construction not in graph
+
+
+def test_the_chain_reads_the_layers_clock_and_overlay_reads_the_clips():
+    """Everything up to `tpad` runs before the layer is moved into place, so
+    its second zero is the layer's first frame; `overlay` runs after, on the
+    clip's. A curve is written against the clip, so one of them has to be
+    shifted — and before that was noticed a layer starting at 0:02 grew two
+    seconds early (trap 51)."""
+    graph = one_pass(build(layers=(
+        comp.Layer(
+            BROLL, at_sec=2.0, duration_sec=4.0,
+            frame=comp.Frame(
+                x=50.0, y=50.0, width=40.0,
+                motion=comp.Motion(
+                    x=((2.0, 20.0), (6.0, 80.0)),
+                    width=((2.0, 20.0), (6.0, 80.0)),
+                    opacity=((2.0, 0.0), (6.0, 1.0)),
+                ),
+            ),
+        ),
+    )))
+
+    # The scale and the mask start counting at the layer's own zero...
+    assert "scale=w='if(lt(t,0.000)" in graph
+    assert "geq=lum='if(lt(T,0.000)" in graph
+    # ...and both end four seconds later, which is how long the layer is.
+    assert "if(lt(t,4.000)" in graph and "if(lt(T,4.000)" in graph
+    # `overlay` keeps the clip's clock, where the layer appears at 0:02.
+    assert "overlay=x='(if(lt(t,2.000)" in graph
+    assert "enable='between(t,2.000,6.000)'" in graph
+
+
 def test_a_moving_layer_is_not_a_layer_that_fills_the_canvas():
     """`fills_canvas` unlocks a scale-and-crop with no positioning at all, and
     a frame passing through the middle of the canvas must not take it."""
@@ -359,6 +436,18 @@ def test_a_moving_layer_is_not_a_layer_that_fills_the_canvas():
     )
 
     assert still.fills_canvas and not moving.fills_canvas
+
+
+def test_a_fading_layer_is_not_one_that_fills_the_canvas_either():
+    """And a curve that happens to start at 1.0 is not an opacity of 1.0: the
+    shortcut is a scale and a crop, which cannot carry an alpha."""
+    still = comp.Frame(width=100.0, height=100.0)
+    fading = dataclasses.replace(
+        still, motion=comp.Motion(opacity=((0.0, 1.0), (1.0, 0.2))),
+    )
+
+    assert not fading.fills_canvas
+    assert fading.fades and not fading.moves, "a fade is not a move"
 
 
 # --- the door ----------------------------------------------------------------
