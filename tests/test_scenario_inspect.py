@@ -106,13 +106,19 @@ class TestTheLayoutSwitcher:
         assert made.duration_sec == 90.0
 
     def test_and_disagree_when_something_cannot_be_rendered_yet(self):
-        """A colour slot takes its place on the timeline and contributes
-        nothing to the file. An editor shown only the file's length would draw
-        a timeline that does not match its own blocks."""
+        """An element the renderer cannot make takes its place on the timeline
+        and contributes nothing to the file. An editor shown only the file's
+        length would draw a timeline that does not match its own blocks.
+
+        A gradient is the example because it is what is still missing: colour
+        and text used to be here too, and both are drawn now — the second
+        renderer §7.3 reserved for them turned out not to be needed (trap 59).
+        """
         scenario = with_intro_and_outro()
         spine = scenario.tracks[0]
         painted = dataclasses.replace(
-            spine.elements[0], slot=model.Slot(kind=model.SLOT_COLOR, color="#000")
+            spine.elements[0],
+            slot=model.Slot(kind=model.SLOT_GRADIENT, color="#000"),
         )
         scenario = dataclasses.replace(scenario, tracks=(
             dataclasses.replace(spine, elements=(painted,) + spine.elements[1:]),
@@ -124,6 +130,25 @@ class TestTheLayoutSwitcher:
         assert made.duration_sec == 70.0
         assert any(w.code == "unsupported_slot" for w in made.warnings)
         assert block(made, "intro").note
+
+    def test_a_colour_on_the_spine_is_refused_rather_than_dropped(self):
+        """It is drawn, not played, and the spine is pieces of material. The
+        distinction matters now that a colour renders on a layer: "this slot
+        is not supported" and "this slot is not supported *here*" are
+        different sentences, and the second one is the true one."""
+        scenario = with_intro_and_outro()
+        spine = scenario.tracks[0]
+        painted = dataclasses.replace(
+            spine.elements[0], slot=model.Slot(kind=model.SLOT_COLOR, color="#000")
+        )
+        scenario = dataclasses.replace(scenario, tracks=(
+            dataclasses.replace(spine, elements=(painted,) + spine.elements[1:]),
+        ) + scenario.tracks[1:])
+
+        made = report(scenario, 90.0)
+
+        assert any(w.code == "drawn_not_played" for w in made.warnings)
+        assert made.duration_sec == 70.0
 
 
 class TestWhatABlockSays:

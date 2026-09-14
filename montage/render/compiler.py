@@ -716,7 +716,9 @@ def _layer_chains(
     canvas = composition.canvas
     for order, layer in enumerate(composition.stack):
         index = _add_input(inputs, layer.source_path, start=layer.source_start_sec,
-                           duration=layer.duration_sec, still=layer.still)
+                           duration=layer.duration_sec, still=layer.still,
+                           paint=layer.paint, canvas=canvas,
+                           box=layer.frame.box(canvas)[2:])
         tag = f"ins{order}"
         fit, position = _layer_geometry(layer.frame, canvas, since=layer.at_sec)
         veil, head = _veil(layer, canvas, order=order, source=f"[{index}:v]")
@@ -1184,8 +1186,16 @@ def _add_input(
     duration: float,
     still: bool = False,
     loop: bool = False,
+    paint: comp.Paint | None = None,
+    canvas: comp.Canvas | None = None,
+    box: tuple[int, int] | None = None,
 ) -> int:
     """Append a seeked input and return its index.
+
+    A painted layer has no file to seek into: it is a `lavfi` source the
+    renderer synthesises — a flat colour, or words drawn on a transparent
+    ground. It still becomes an input like any other, so everything after this
+    point treats it as one (§7.3, trap 59).
 
     Seeking at the input rather than trimming in the graph is the whole reason
     a montage spread across a long source is affordable: the decoder only
@@ -1200,6 +1210,12 @@ def _add_input(
     """
     index = sum(1 for item in inputs if item == "-i")
     length = filters.flt(max(0.01, duration))
+    if paint is not None:
+        inputs.extend([
+            "-f", "lavfi", "-t", length,
+            "-i", filters.painted(paint, canvas, box),
+        ])
+        return index
     if still:
         inputs.extend(["-loop", "1", "-t", length, "-i", path])
         return index

@@ -350,22 +350,103 @@ class TestSlotsBecomePaths:
 
         assert first.layers[0].source_path == again.layers[0].source_path
 
-    def test_a_text_slot_says_it_needs_a_layer_this_renderer_lacks(self):
-        """Loudly: a montage that renders without the text somebody put in it
-        is the expensive kind of bug."""
+    def over(self, slot: sc.Slot, **kwargs) -> sc.Scenario:
         element = sc.Element(
-            id="caption", slot=sc.Slot(kind=sc.SLOT_TEXT, template="{title}"),
+            id="caption", slot=slot,
             duration=sc.Duration(mode=sc.DurationMode.FIXED, value=2.0),
+            **kwargs,
         )
         scenario = sc.default()
-        scenario = dataclasses.replace(
+        return dataclasses.replace(
             scenario,
             tracks=scenario.tracks + (
                 sc.Track(id="over", kind=sc.TRACK_OVERLAY, z=1, elements=(element,)),
             ),
         )
 
-        got, notes = sc.compile(scenario, facts())
+    def test_a_text_slot_is_drawn_with_its_template_filled_in(self):
+        """For three stages this was a warning, because §7.3 had reserved a
+        second renderer for graphics on top. It never needed one: words are
+        `drawtext` and this build has it (trap 59)."""
+        got, notes = sc.compile(
+            self.over(sc.Slot(kind=sc.SLOT_TEXT, template="{title} · {index}")),
+            facts(),
+        )
+
+        paint = got.layers[0].paint
+        assert paint.kind == "text"
+        # Substituted here rather than in the renderer: an EDL still holding
+        # `{title}` would be a plan rather than a description of a clip.
+        assert paint.text == "Заголовок клипа · 1"
+        assert "{" not in paint.text
+        assert notes == ()
+
+    def test_a_colour_slot_is_drawn_too(self):
+        got, _ = sc.compile(
+            self.over(sc.Slot(kind=sc.SLOT_COLOR, color="#112233")), facts(),
+        )
+
+        assert got.layers[0].paint == comp.Paint(kind="colour", colour="#112233")
+        assert got.layers[0].source_path == "", "a painting has no file behind it"
+
+    def test_a_placeholder_this_clip_cannot_fill_is_dropped_and_said_aloud(self):
+        """§1.1 lists `{tags}` and `ClipFacts` has nowhere to take it from.
+        Rendering the braces into the video is the quiet failure: on screen it
+        looks deliberate."""
+        got, notes = sc.compile(
+            self.over(sc.Slot(kind=sc.SLOT_TEXT, template="{title} {tags}")), facts(),
+        )
+
+        assert got.layers[0].paint.text == "Заголовок клипа"
+        assert [n.code for n in notes] == ["unknown_placeholder"]
+        assert "{tags}" in notes[0].message
+
+    def test_a_text_slot_with_nothing_to_say_is_left_out(self):
+        got, notes = sc.compile(
+            self.over(sc.Slot(kind=sc.SLOT_TEXT, template="{tags}")), facts(),
+        )
+
+        assert got.layers == ()
+        assert {n.code for n in notes} == {"unknown_placeholder", "empty_text"}
+
+    def test_a_painting_keeps_the_height_it_was_given(self):
+        """The EDL flattens the height of anything smaller than the canvas to
+        "let the aspect ratio decide", which is right for material and empty
+        for a painting: there is no picture whose shape could decide. A plate
+        asked for at a seventh of the canvas came out running off the bottom
+        of it (trap 62)."""
+        got, _ = sc.compile(
+            self.over(
+                sc.Slot(kind=sc.SLOT_COLOR, color="#112233"),
+                frame=sc.Frame(y=sc.Animated(80.0), width=sc.Animated(90.0),
+                               height=sc.Animated(14.0)),
+            ),
+            facts(),
+        )
+
+        assert got.layers[0].frame.height == 14.0
+
+    def test_while_a_clip_of_film_still_leaves_its_height_to_its_shape(self):
+        """The rule this makes an exception to, kept where it belongs: a
+        picture-in-picture has a shape, and stretching it to a typed height
+        would be the wrong answer."""
+        got, _ = sc.compile(
+            self.over(
+                sc.Slot(kind=sc.SLOT_LIBRARY, tag="broll"),
+                frame=sc.Frame(width=sc.Animated(40.0), height=sc.Animated(25.0)),
+            ),
+            facts(),
+        )
+
+        assert got.layers[0].frame.height == 0.0
+
+    def test_a_gradient_still_says_it_needs_something_this_renderer_lacks(self):
+        """The one of the three that is still missing, and it is missing for a
+        reason worth keeping: §1.1 names it and says nothing about what a
+        gradient is between, so there is nothing here to render faithfully."""
+        got, notes = sc.compile(
+            self.over(sc.Slot(kind=sc.SLOT_GRADIENT, color="#112233")), facts(),
+        )
 
         assert got.layers == ()
         assert any(n.code == "unsupported_slot" for n in notes)
