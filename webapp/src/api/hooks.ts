@@ -18,6 +18,7 @@ function jobIsLive(job?: Pick<ClipJob, "status">) {
 
 export const keys = {
   health: ["health"] as const,
+  capabilities: ["capabilities"] as const,
   accounts: ["accounts"] as const,
   assets: ["assets"] as const,
   jobs: ["jobs"] as const,
@@ -75,6 +76,16 @@ export function useStyleDefaults(profile?: string) {
     // The defaults only move when the server's configuration does, which does
     // not happen while a tab is open.
     staleTime: 5 * 60 * 1000,
+  });
+}
+
+export function useCapabilities() {
+  // The answer is a property of the installed ffmpeg, so it changes when the
+  // container does and not before: asked once and kept for the session.
+  return useQuery({
+    queryKey: keys.capabilities,
+    queryFn: System.capabilities,
+    staleTime: Infinity,
   });
 }
 

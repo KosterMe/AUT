@@ -386,6 +386,19 @@ export interface Scenario {
   updated_at: string;
 }
 
+/**
+ * What this build of ffmpeg can do, measured by the probe rather than assumed
+ * (§7.2). `animatable` is keyed by the frame properties the editor knows, and
+ * that mapping is made on the server, next to the renderer choosing the
+ * filters — an editor holding its own copy would be a second list of names.
+ */
+export interface Capabilities {
+  ok: boolean;
+  build: string;
+  detail: string;
+  animatable: Record<string, boolean>;
+}
+
 export interface InspectRect {
   x: number;
   y: number;
