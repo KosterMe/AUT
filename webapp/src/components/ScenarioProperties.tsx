@@ -781,11 +781,10 @@ function MotionFields({
 
       {block && block.keys.length > 0 ? (
         <ul className="space-y-1">
-          {block.keys.map((key, index) => (
+          {block.keys.map((key) => (
             <KeyRow
-              key={`${key.property}-${index}`}
+              key={`${key.property}-${key.index}`}
               item={key}
-              index={indexWithin(block.keys, index)}
               onChange={onKeyChange}
             />
           ))}
@@ -800,19 +799,11 @@ function MotionFields({
   );
 }
 
-/** The key's index within its own property, which is what the model edits. */
-function indexWithin(keys: InspectKey[], position: number): number {
-  const property = keys[position].property;
-  return keys.slice(0, position).filter((key) => key.property === property).length;
-}
-
 function KeyRow({
   item,
-  index,
   onChange,
 }: {
   item: InspectKey;
-  index: number;
   onChange?: (
     property: Animatable,
     index: number,
@@ -821,6 +812,10 @@ function KeyRow({
 }) {
   const property = item.property as Animatable;
   const scale = SCALES[property] ?? { step: 1 };
+  // The scenario's own index, handed down by the compile. Counting rows here
+  // would count them in the order the keys happen, and the model edits them in
+  // the order they were written (trap 56).
+  const { index } = item;
 
   return (
     <li className="flex items-center gap-1 text-[11px]">

@@ -339,6 +339,45 @@ class TestWhatABlockSays:
 
             assert [key.property for key in block(got, "cta").keys] == [name, name], name
 
+    def test_every_key_says_which_key_of_the_scenario_it_is(self):
+        """Rows are shown in the order the keys happen; the editor edits them
+        in the order they were written. Those differ the moment a key pinned
+        to the end sits beside one anchored to the start — and the editor was
+        addressing them by their row, so typing a value into the row at 0:03
+        changed the key pinned to the end instead (trap 56)."""
+        scenario = with_intro_and_outro()
+        over = scenario.tracks[1]
+        written = (
+            model.Keyframe(at=model.Anchor(mode=model.AnchorMode.START, value=0.0),
+                           value=10.0),
+            model.Keyframe(at=model.Anchor(mode=model.AnchorMode.END, offset_sec=0.0),
+                           value=90.0),
+            model.Keyframe(at=model.Anchor(mode=model.AnchorMode.START, value=3.0),
+                           value=50.0),
+        )
+        keyed = dataclasses.replace(
+            over.elements[0],
+            start=model.Anchor(mode=model.AnchorMode.START, value=0.0),
+            duration=model.Duration(mode=model.DurationMode.FIXED, value=10.0),
+            frame=model.Frame(x=model.Animated(10.0, keys=written)),
+        )
+        one = dataclasses.replace(scenario, tracks=(
+            scenario.tracks[0], dataclasses.replace(over, elements=(keyed,)),
+        ))
+        library = (AssetOption(3, "/m/cta.mp4", ("cta",), 4.0),)
+
+        keys = block(report(one, 90.0, assets=library), "cta").keys
+
+        # Reported in the order they happen: 0, 3, then the one at the end.
+        assert [key.at_sec for key in keys] == [0.0, 3.0, 90.0]
+        # And each one names the key of the scenario it came from, which is a
+        # different order.
+        assert [key.index for key in keys] == [0, 2, 1]
+        for key in keys:
+            source = written[key.index]
+            assert key.value == source.value
+            assert key.anchor == source.at.mode.value
+
     def test_a_muted_track_is_reported_as_not_placed(self):
         scenario = with_intro_and_outro()
         scenario = dataclasses.replace(scenario, tracks=(

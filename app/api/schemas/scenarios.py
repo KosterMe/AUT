@@ -115,6 +115,10 @@ class InspectKey(BaseModel):
     # How the key was written, so a key held to the end reads as held to the
     # end rather than as a number that happens to be large.
     anchor: str = "start"
+    # Which key of the scenario's own list this is. Rows are shown in the
+    # order the keys happen and edited in the order they were written, and
+    # those differ as soon as one is pinned to the end (trap 56).
+    index: int = 0
 
 
 class InspectBlock(BaseModel):
