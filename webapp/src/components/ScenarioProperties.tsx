@@ -150,6 +150,7 @@ function SlotFields({
   element: ScenarioElement;
   onChange: (patch: Partial<ScenarioElement>) => void;
 }) {
+  const { data: build } = useCapabilities();
   const slot = element.slot ?? { kind: "source" as SlotKind };
   const set = (patch: Record<string, unknown>) => onChange({ slot: { ...slot, ...patch } });
 
@@ -161,11 +162,19 @@ function SlotFields({
           value={slot.kind}
           onChange={(event) => set({ kind: event.target.value as SlotKind })}
         >
-          {(Object.keys(SLOT_LABELS) as SlotKind[]).map((kind) => (
-            <option key={kind} value={kind}>
-              {SLOT_LABELS[kind]}
-            </option>
-          ))}
+          {(Object.keys(SLOT_LABELS) as SlotKind[])
+            // What this montage actually draws. The list used to be every
+            // kind the model knows, two of which compile to nothing —
+            // offering them is offering a block that will be dropped with a
+            // warning (trap 59). The kind already on the element stays in
+            // the list whatever the answer, or an older scenario could not
+            // be opened without silently becoming something else.
+            .filter((kind) => build?.slots?.[kind] !== false || kind === slot.kind)
+            .map((kind) => (
+              <option key={kind} value={kind}>
+                {SLOT_LABELS[kind]}
+              </option>
+            ))}
         </select>
       </Field>
 

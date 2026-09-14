@@ -397,6 +397,13 @@ export interface Capabilities {
   build: string;
   detail: string;
   animatable: Record<string, boolean>;
+  /**
+   * Which slot kinds this montage draws. Two different reasons one can be
+   * missing — the compiler does not make it, or this ffmpeg cannot — and the
+   * editor does not need to tell them apart: either way, offering it would
+   * mean offering something that gets dropped.
+   */
+  slots: Record<string, boolean>;
 }
 
 export interface InspectRect {

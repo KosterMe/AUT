@@ -486,6 +486,29 @@ def _pick(
     return min(candidates, key=lambda asset: (asset.last_used_rank, asset.asset_id))
 
 
+# Which slots this compiler can turn into something, and what the installed
+# ffmpeg has to be able to do for each. An empty tuple means nothing
+# build-specific: a file is a file, and `color` is a source every build has.
+#
+# This is the list the editor is offered, so a slot missing from it is not
+# offered rather than offered and dropped — which is what happened to a fill
+# and a caption for three stages while the palette went on suggesting both
+# (trap 59). Two are still absent and say why:
+#
+# * `gradient` — §1.1 names it and does not say what it is a gradient between,
+#   and inventing the second colour is not a decision to take here.
+# * `upload` — a `ClipFacts` has no uploads in it, so there is nothing to
+#   resolve the id against. It needs a fact, not a filter.
+SLOTS_DRAWN: dict[str, tuple[str, ...]] = {
+    model.SLOT_SOURCE: (),
+    model.SLOT_SOURCE_AT: (),
+    model.SLOT_LIBRARY: (),
+    model.SLOT_BLUR_OF: (),
+    model.SLOT_COLOR: (),
+    model.SLOT_TEXT: ("drawtext",),
+}
+
+
 def _path_of(
     element: model.Element,
     facts: fact_module.ClipFacts,

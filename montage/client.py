@@ -29,6 +29,7 @@ from montage import composition as comp
 from montage import style as style_module
 from montage import subtitles as subtitle_builder
 from montage.render import capabilities as build_capabilities
+from montage.scenario import compiler as scenario_compiler
 from montage.render import compiler
 from montage import scenario
 from montage.render import probe
@@ -430,7 +431,27 @@ def capabilities() -> dict[str, Any]:
 
 
 def capabilities_here() -> dict[str, Any]:
-    return build_capabilities.capabilities().as_dict()
+    """What this montage can do — the build's part and the compiler's.
+
+    Two different reasons a thing is unavailable, and the editor needs both.
+    A property may not animate because *this ffmpeg* cannot drive it; a slot
+    may not be offered because *this compiler* does not draw it. Answering
+    only the first would leave the editor offering a gradient it will drop,
+    which is how a fill and a caption went on being offered for three stages
+    while nothing rendered them (trap 59).
+
+    Assembled here rather than inside the probe because this is the seam that
+    knows both halves: the probe measures ffmpeg and knows nothing about
+    slots, and the compiler draws slots and does not run ffmpeg.
+    """
+    report = build_capabilities.capabilities()
+    payload = report.as_dict()
+    payload["slots"] = {
+        kind: all(report.by_key(key) is not None and report.by_key(key).offerable
+                  for key in needs)
+        for kind, needs in scenario_compiler.SLOTS_DRAWN.items()
+    }
+    return payload
 
 
 def subtitle_cues(

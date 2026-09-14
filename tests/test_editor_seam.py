@@ -25,6 +25,7 @@ import pytest
 
 from montage import composition as comp
 from montage.render import capabilities as caps
+from montage.scenario import model as scenario_model
 
 WEBAPP = Path(__file__).resolve().parents[1] / "webapp" / "src"
 MODEL = WEBAPP / "pages" / "scenarioModel.ts"
@@ -74,6 +75,32 @@ def test_every_animated_property_is_described_by_every_table(model: str, constan
     checks the same thing from the inside; this checks it against the model,
     which is where the list is actually decided."""
     assert keys_of(model, constant) == set(comp.CURVES)
+
+
+def test_the_editor_labels_every_slot_the_model_has(model: str):
+    """The dropdown is built from `SLOT_LABELS`, and a kind missing from it
+    would be unselectable — including for a scenario that already uses it,
+    which could then not be opened without silently becoming something else."""
+    from montage.scenario import model as scenario_model
+
+    assert keys_of(model, "SLOT_LABELS") == set(scenario_model.SLOT_KINDS)
+
+
+@pytest.mark.parametrize("filename", ["pages/Scenarios.tsx", "components/ScenarioProperties.tsx"])
+def test_every_place_that_offers_a_slot_asks_which_ones_are_drawn(filename: str):
+    """Which slots this montage draws is the compiler's answer, served over
+    `/api/capabilities` (trap 59). The two places that offer a slot — the
+    palette and the "filled with" dropdown — have to read it rather than
+    decide for themselves, or they go stale the moment a slot is implemented.
+
+    Checked as a positive: slot *names* belong in the editor, that is the
+    model's vocabulary, so their presence proves nothing. What proves
+    something is asking.
+    """
+    source = (WEBAPP / filename).read_text(encoding="utf-8")
+
+    assert "slots?.[" in source, f"{filename} offers a slot without asking"
+    assert "useCapabilities" in source
 
 
 def test_the_editor_does_not_carry_its_own_map_of_probe_constructions():
