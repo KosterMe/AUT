@@ -271,11 +271,38 @@ class InsertSettings(BaseSettings):
 
     max_upload_mb: int = Field(default=200, ge=1, le=4096)
 
+class ServiceSettings(BaseSettings):
+    """The service as a service: where it answers, and who may ask.
+
+    Empty by default, and that is the whole of the switch. Nothing here is
+    read while the montage runs in the same process as AUT, which is how it
+    runs today; setting `MONTAGE_SERVICE_URL` is what makes AUT send the work
+    over a wire instead (§1в).
+    """
+
+    model_config = _BASE
+
+    # Where the montage service answers. Empty means "in this process".
+    url: str = Field(default="", validation_alias="MONTAGE_SERVICE_URL")
+    # The shared token of §2.6 — the same shape as AUT's `APP_AUTH_TOKEN`, and
+    # empty means the door is open, which is fine while it is not exposed.
+    token: str = Field(default="", validation_alias="MONTAGE_SERVICE_TOKEN")
+    # A render is minutes. A probe is milliseconds. One timeout for both would
+    # be either a hair trigger or no protection at all.
+    timeout_seconds: float = Field(
+        default=30.0, ge=1.0, validation_alias="MONTAGE_SERVICE_TIMEOUT_SECONDS"
+    )
+    render_timeout_seconds: float = Field(
+        default=1800.0, ge=30.0, validation_alias="MONTAGE_SERVICE_RENDER_TIMEOUT_SECONDS"
+    )
+
+
 class Settings(BaseSettings):
     """Everything the montage service is tuned with."""
 
     model_config = _BASE
 
+    service: ServiceSettings = Field(default_factory=ServiceSettings)
     paths: PathSettings = Field(default_factory=PathSettings)
     subtitles: SubtitleSettings = Field(default_factory=SubtitleSettings)
     render: RenderSettings = Field(default_factory=RenderSettings)

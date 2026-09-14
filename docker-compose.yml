@@ -2,6 +2,7 @@
 #   source video -> clips -> scheduled publications -> TikTok
 #
 #   api             REST API + OpenAPI docs at /docs      (127.0.0.1:8000)
+#   montage         scenarios, compositions, ffmpeg        (internal, §1в)
 #   worker-media    downloads, transcribes, renders clips  (CPU bound)
 #   worker-publish  uploads publications at their time     (network bound)
 #   bgutil          PO-token provider yt-dlp needs for YouTube (internal)
@@ -88,6 +89,40 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+    restart: unless-stopped
+
+  # The montage service (§1в). Off by default: `MONTAGE_SERVICE_URL` is what
+  # sends AUT's work here instead of doing it in-process, and nothing sets it
+  # unless somebody does. Start it with
+  #   docker compose --profile montage up -d
+  # and add MONTAGE_SERVICE_URL=http://montage:8080 to .env.
+  #
+  # No port is published. The service is not meant to be reachable from
+  # outside the compose network at all (§2.6); MONTAGE_SERVICE_TOKEN is the
+  # belt for the day somebody publishes one by accident.
+  montage:
+    <<: *app-base
+    profiles: ["montage"]
+    environment:
+      <<: *app-env
+      MONTAGE_SERVICE_TOKEN: ${MONTAGE_SERVICE_TOKEN:-}
+      # Deliberately empty in here: this container *is* the service, and a
+      # service that knows where the service is would be told to forward its
+      # own work to itself.
+      MONTAGE_SERVICE_URL: ""
+    # The same volume as everything else, which is the compromise §2.4 makes
+    # on purpose: a source is tens of gigabytes, so paths travel and files do
+    # not. Two services writing into one directory are not two independent
+    # services, and §13.3 says so rather than pretending otherwise.
+    volumes: *app-volumes
+    command: >
+      sh -c "uvicorn montage.service.app:app --host 0.0.0.0 --port 8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
 
   worker-media:

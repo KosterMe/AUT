@@ -47,6 +47,12 @@ def test_no_module_imports_from_aut(path: Path):
     )
 
 
+# The door of §1в, and the one place in the service that knows what HTTP is.
+# Everything else under `montage/` is a library AUT can call in the same
+# process, which is how it still runs by default.
+DOOR = MONTAGE / "service"
+
+
 @pytest.mark.parametrize("path", SOURCES, ids=lambda p: str(p.relative_to(MONTAGE)))
 def test_no_module_reaches_for_a_database_or_a_queue(path: Path):
     """Not by name either: what crosses the seam is values, not sessions.
@@ -54,13 +60,40 @@ def test_no_module_reaches_for_a_database_or_a_queue(path: Path):
     A service that renders video has no rows of its own to read here. When it
     gets its own database (§2.5) it will, and this test will be the thing that
     says so out loud rather than letting a session arrive through an argument.
+
+    **Amended at §1в, deliberately and in one place.** `montage/service/` is
+    the HTTP door, so it imports a web framework; nothing else may, and the
+    ban on databases and queues holds there too — the door reads values off a
+    wire and calls the same functions AUT would have called, which is the only
+    reason the two ways of calling cannot drift apart.
     """
     banned = {"sqlmodel", "sqlalchemy", "alembic", "fastapi"}
+    if path.is_relative_to(DOOR):
+        banned -= {"fastapi"}
     reached = sorted(
         name for name in imports(path) if name.split(".")[0] in banned
     )
 
     assert reached == [], f"{path.relative_to(MONTAGE.parent)} imports {reached}"
+
+
+def test_only_the_door_knows_about_http():
+    """The exception above, pinned from the other side.
+
+    Without this the carve-out is a hole somebody widens by moving a file into
+    `service/` — which would be the cheapest possible way to lose the property
+    the whole split is for.
+    """
+    web = {"fastapi", "starlette", "httpx", "requests", "uvicorn"}
+    offenders = {
+        str(path.relative_to(MONTAGE.parent)): sorted(
+            name for name in imports(path) if name.split(".")[0] in web
+        )
+        for path in SOURCES
+        if not path.is_relative_to(DOOR)
+    }
+
+    assert {k: v for k, v in offenders.items() if v} == {}
 
 
 def test_aut_is_the_side_that_calls():

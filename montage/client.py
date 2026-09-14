@@ -110,8 +110,37 @@ def wants_transcript(montage: scenario_model.Scenario) -> bool:
     return scenario.FactKind.CUES in scenario.required_facts(montage)
 
 
+def _elsewhere():
+    """The remote implementation, when the service runs elsewhere (§1в).
+
+    `None` while the montage runs in this process, which is the default and
+    what every test and every single-container deployment gets. The import is
+    lazy on purpose: asking the client a question must not drag an HTTP
+    library into a process that will never send a request.
+
+    Only the calls that touch files or burn CPU go through here. Building a
+    scenario, trimming a composition, asking what a montage needs to know —
+    those stay local, because sending arithmetic over a network to have it
+    done is not a service, it is latency.
+    """
+    from montage.service import remote
+
+    return remote if remote.configured() else None
+
+
 def compose(request: ClipRequest) -> ClipPlan:
-    """Everything between "this clip exists" and "hand it to ffmpeg".
+    """Everything between "this clip exists" and "hand it to ffmpeg"."""
+    away = _elsewhere()
+    return away.compose(request) if away else compose_here(request)
+
+
+def compose_here(request: ClipRequest) -> ClipPlan:
+    """The same, done in this process — what the service itself calls.
+
+    The `_here` half of each travelling call exists so that the door never
+    goes through the dispatcher: a service that asked itself would recurse
+    until the stack gave out, and a flag saying "not this time" is a rule to
+    remember rather than a shape that cannot be got wrong.
 
     The scenario says what it needs to know about the clip, and only that is
     measured. A montage with no subtitles never asks for word timings, so
@@ -225,6 +254,27 @@ def render(
     on_progress: Progress | None = None,
 ) -> compiler.ClipRenderResult:
     """Turn an EDL into a file."""
+    away = _elsewhere()
+    if away is not None:
+        return away.render(
+            composition, output_path,
+            strategy=strategy, source_duration_sec=source_duration_sec,
+            on_progress=on_progress,
+        )
+    return render_here(
+        composition, output_path,
+        strategy=strategy, source_duration_sec=source_duration_sec,
+    )
+
+
+def render_here(
+    composition: comp.Composition,
+    output_path: str,
+    *,
+    strategy: str | None = None,
+    source_duration_sec: float = 0.0,
+) -> compiler.ClipRenderResult:
+    """Turn an EDL into a file, in this process."""
     return compiler.render(
         composition, output_path,
         strategy=strategy, source_duration_sec=source_duration_sec,
@@ -243,6 +293,32 @@ def cover(
     height: int,
 ) -> str | None:
     """The still that goes with a clip, framed the way the clip is."""
+    away = _elsewhere()
+    if away is not None:
+        return away.cover(
+            source_path=source_path, output_path=output_path, start_sec=start_sec,
+            title_text=title_text, part_text=part_text,
+            thumbnail_path=thumbnail_path, width=width, height=height,
+        )
+    return cover_here(
+        source_path=source_path, output_path=output_path, start_sec=start_sec,
+        title_text=title_text, part_text=part_text, thumbnail_path=thumbnail_path,
+        width=width, height=height,
+    )
+
+
+def cover_here(
+    *,
+    source_path: str,
+    output_path: str,
+    start_sec: float,
+    title_text: str,
+    part_text: str,
+    thumbnail_path: str | None,
+    width: int,
+    height: int,
+) -> str | None:
+    """The same, drawn in this process."""
     return probe.render_clip_cover(
         source_path=source_path, output_path=output_path, start_sec=start_sec,
         title_text=title_text, part_text=part_text, thumbnail_path=thumbnail_path,
@@ -263,16 +339,31 @@ def excerpt(
 
 def analyse(source_path: str) -> dict[str, Any]:
     """What this file is: size, length, whether it has sound."""
+    away = _elsewhere()
+    return away.analyse(source_path) if away else analyse_here(source_path)
+
+
+def analyse_here(source_path: str) -> dict[str, Any]:
     return probe.probe_media(source_path)
 
 
 def has_audio(source_path: str) -> bool:
     """Whether there is any sound in this file at all."""
+    away = _elsewhere()
+    return away.has_audio(source_path) if away else has_audio_here(source_path)
+
+
+def has_audio_here(source_path: str) -> bool:
     return probe.ffprobe_has_audio(source_path)
 
 
 def renderer_available() -> str | None:
     """The ffmpeg this service would use, or None if there is not one."""
+    away = _elsewhere()
+    return away.renderer_available() if away else renderer_available_here()
+
+
+def renderer_available_here() -> str | None:
     return probe.ffmpeg_exe()
 
 
@@ -290,6 +381,19 @@ def preview(
     style it was composed with, and a second one here would be a way to
     preview something that is not what will be rendered.
     """
+    away = _elsewhere()
+    if away is not None:
+        return away.preview(composition, output_path, spec=spec)
+    return preview_here(composition, output_path, spec=spec)
+
+
+def preview_here(
+    composition: comp.Composition,
+    output_path: str,
+    *,
+    spec: compiler.PreviewSpec | None = None,
+) -> compiler.ClipRenderResult:
+    """The same, rendered in this process."""
     return compiler.render_preview(composition, output_path, spec=spec)
 
 
@@ -303,6 +407,13 @@ def fragment_cache() -> tuple[Path, str]:
     it has a reason to know the renderer keeps files of its own. Over HTTP this
     becomes the service sweeping its own volume.
     """
+    away = _elsewhere()
+    if away is not None:
+        return away.fragment_cache()
+    return fragment_cache_here()
+
+
+def fragment_cache_here() -> tuple[Path, str]:
     return compiler.fragment_cache_dir(), compiler.FRAGMENT_SUFFIX
 
 
@@ -312,6 +423,13 @@ def capabilities() -> dict[str, Any]:
     The probe of stage 0, served as data. The editor asks once and stops
     offering what this build cannot deliver.
     """
+    away = _elsewhere()
+    if away is not None:
+        return away.capabilities()
+    return capabilities_here()
+
+
+def capabilities_here() -> dict[str, Any]:
     return build_capabilities.capabilities().as_dict()
 
 
