@@ -736,6 +736,44 @@ def _layer_chains(
     return parts, current
 
 
+def _fitted(fit: str, width: int, height: int) -> str:
+    """How a source meets a box with both dimensions given.
+
+    Four words and four pictures (§4.2), and for a long time two of them were
+    the same picture: `contain` and `none` both compiled to `scale=w:h`, which
+    is the stretch that `fill` means. The editor offers `contain` as "the whole
+    of it, with margins" and got a squashed one instead (trap 63).
+
+    * `cover` scales past the box and crops — no bars, some of the picture lost.
+    * `contain` scales until it fits and pads the rest **transparently**, so
+      what is behind the layer shows through the margins. Opaque padding would
+      draw a black box around the picture, which is a different instruction.
+    * `fill` stretches to the box, which is the one that distorts on purpose.
+    * `none` leaves the source at its own size, centred, cropped if it is
+      bigger than the box and padded if it is smaller. `pad` first because
+      `crop` refuses a window larger than its input.
+    """
+    if fit == "cover":
+        # A box with both dimensions and something that has to fill it: scale
+        # past and crop, rather than stretch a wide source into a tall hole.
+        return (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height}"
+        )
+    if fit == "contain":
+        return (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"format=rgba,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=#00000000"
+        )
+    if fit == "none":
+        return (
+            f"format=rgba,"
+            f"pad=max(iw\\,{width}):max(ih\\,{height}):(ow-iw)/2:(oh-ih)/2"
+            f":color=#00000000,crop={width}:{height}"
+        )
+    return f"scale={width}:{height}"
+
+
 def _veil(
     layer: comp.Layer, canvas: comp.Canvas, *, order: int, source: str
 ) -> tuple[list[str], str]:
@@ -815,15 +853,8 @@ def _layer_geometry(
         # No height asked for, so the aspect ratio decides it — `-2` keeps the
         # dimension even, which yuv420p requires.
         fit = f"scale={width}:-2"
-    elif frame.fit == "cover":
-        # A box with both dimensions and something that has to fill it: scale
-        # past and crop, rather than stretch a wide source into a tall hole.
-        fit = (
-            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height}"
-        )
     else:
-        fit = f"scale={width}:{height}"
+        fit = _fitted(frame.fit, width, height)
 
     if not frame.moves:
         return fit, f"{left}:{top}"

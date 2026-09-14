@@ -427,6 +427,55 @@ def test_the_chain_reads_the_layers_clock_and_overlay_reads_the_clips():
     assert "enable='between(t,2.000,6.000)'" in graph
 
 
+def fitted(fit: str) -> str:
+    """The chain a layer gets for one `fit`, in a box with both dimensions."""
+    graph = one_pass(build(layers=(
+        comp.Layer(BROLL, at_sec=0.0, duration_sec=4.0,
+                   frame=comp.Frame(x=50.0, y=50.0, width=40.0, height=25.0, fit=fit)),
+    )))
+    chain = next(p for p in graph.split(";") if "[ins0]" in p)
+    return ",".join(chain.split(",")[1:-2])
+
+
+def test_each_of_the_four_fits_is_a_different_picture():
+    """§4.2 lists four and for a long time two of them were the same one:
+    `contain` and `none` both compiled to the stretch that `fill` means, so
+    the editor's "the whole of it, with margins" delivered a squashed one
+    (trap 63)."""
+    chains = {fit: fitted(fit) for fit in ("cover", "contain", "fill", "none")}
+
+    assert len(set(chains.values())) == 4, chains
+
+
+def test_contain_letterboxes_into_the_box_and_pads_it_transparently():
+    """Opaque padding would draw a black rectangle around the picture, which
+    is a different instruction from "the whole of it, with margins": what is
+    behind the layer has to show through the margins."""
+    chain = fitted("contain")
+
+    assert "force_original_aspect_ratio=decrease" in chain
+    assert "pad=432:480" in chain
+    assert "color=#00000000" in chain
+    assert "format=rgba" in chain
+
+
+def test_none_leaves_the_source_at_its_own_size():
+    """Padded before cropped, because `crop` refuses a window bigger than its
+    input — which is what a source smaller than the box is."""
+    chain = fitted("none")
+
+    assert "scale=" not in chain
+    assert chain.index("pad=") < chain.index("crop=")
+
+
+def test_cover_and_fill_are_what_they_were():
+    """The two that already worked, kept honest while the other two changed."""
+    assert fitted("cover") == (
+        "scale=432:480:force_original_aspect_ratio=increase,crop=432:480"
+    )
+    assert fitted("fill") == "scale=432:480"
+
+
 def test_a_painted_layer_is_a_source_rather_than_a_file():
     """§7.3 set a second renderer aside for graphics laid over the picture.
     A flat fill is `color` and this build has it, so the layer is an input
