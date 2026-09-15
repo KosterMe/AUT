@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import pytest
 
-from app.domain import audio
-from app.domain import composition as comp
-from app.domain.inserts import AssetOption
+from montage.rules import audio
+from montage import composition as comp
+from montage.rules.inserts import AssetOption
 
 
 def asset(asset_id: int, *tags: str, duration: float = 120.0, still: bool = False, rank: int = 0):
@@ -20,16 +20,15 @@ def asset(asset_id: int, *tags: str, duration: float = 120.0, still: bool = Fals
     )
 
 
-def clip(*, segments=((0.0, 60.0),), inserts=()) -> comp.Composition:
+def clip(*, windows=((0.0, 60.0),), layers=()) -> comp.Composition:
     return comp.Composition(
-        segments=tuple(comp.Segment("/media/src.mp4", start, end) for start, end in segments),
-        inserts=tuple(inserts),
+        spine=tuple(comp.Segment("/media/src.mp4", start, end) for start, end in windows),
+        layers=tuple(layers),
     )
 
 
-def insert_at(at: float) -> comp.Insert:
-    return comp.Insert(kind=comp.INSERT_FULL, source_path="/library/b.mp4",
-                       at_sec=at, duration_sec=2.0)
+def layer_at(at: float) -> comp.Layer:
+    return comp.Layer(source_path="/library/b.mp4", at_sec=at, duration_sec=2.0)
 
 
 # --- the music bed ----------------------------------------------------------
@@ -72,7 +71,7 @@ class TestMusic:
         library = [asset(1, "music", duration=300.0)]
 
         offsets = {
-            audio.choose_music(clip(), assets=library, seed=seed).start_sec
+            audio.choose_music(clip(), assets=library, seed=seed).source_start_sec
             for seed in range(5)
         }
 
@@ -81,7 +80,7 @@ class TestMusic:
     def test_a_track_barely_longer_than_the_clip_starts_at_the_beginning(self):
         bed = audio.choose_music(clip(), assets=[asset(1, "music", duration=60.5)], seed=3)
 
-        assert bed.start_sec == 0.0
+        assert bed.source_start_sec == 0.0
 
     def test_the_choice_is_stable_for_one_clip(self):
         library = [asset(i, "music", duration=300.0) for i in range(1, 5)]
@@ -97,7 +96,7 @@ class TestMusic:
 
 class TestEffects:
     def test_an_effect_lands_on_every_cut(self):
-        composition = clip(segments=((0.0, 20.0), (30.0, 45.0), (60.0, 80.0)))
+        composition = clip(windows=((0.0, 20.0), (30.0, 45.0), (60.0, 80.0)))
 
         effects = audio.choose_effects(composition, assets=[asset(1, "sfx")])
 
@@ -111,14 +110,14 @@ class TestEffects:
         assert effects == ()
 
     def test_an_insert_appearing_is_a_cut_too(self):
-        composition = clip(inserts=(insert_at(12.0),))
+        composition = clip(layers=(layer_at(12.0),))
 
         effects = audio.choose_effects(composition, assets=[asset(1, "sfx")])
 
         assert [effect.at_sec for effect in effects] == [11.88]
 
     def test_effects_keep_their_distance(self):
-        composition = clip(inserts=(insert_at(10.0), insert_at(11.0), insert_at(30.0)))
+        composition = clip(layers=(layer_at(10.0), layer_at(11.0), layer_at(30.0)))
 
         effects = audio.choose_effects(
             composition, assets=[asset(1, "sfx")],
@@ -128,7 +127,7 @@ class TestEffects:
         assert [effect.at_sec for effect in effects] == [9.88, 29.88]
 
     def test_the_count_is_capped(self):
-        composition = clip(inserts=tuple(insert_at(5.0 + i * 5) for i in range(10)))
+        composition = clip(layers=tuple(layer_at(5.0 + i * 5) for i in range(10)))
 
         effects = audio.choose_effects(
             composition, assets=[asset(1, "sfx")],
@@ -138,7 +137,7 @@ class TestEffects:
         assert len(effects) == 3
 
     def test_a_library_without_sound_effects_produces_none(self):
-        composition = clip(segments=((0.0, 20.0), (30.0, 45.0)))
+        composition = clip(windows=((0.0, 20.0), (30.0, 45.0)))
 
         assert audio.choose_effects(composition, assets=[asset(1, "music")]) == ()
 
@@ -147,7 +146,7 @@ class TestEffects:
         ({"effects_on_inserts": False}, [19.88]),
     ])
     def test_either_kind_of_moment_can_be_switched_off(self, switch, expected):
-        composition = clip(segments=((0.0, 20.0), (30.0, 45.0)), inserts=(insert_at(12.0),))
+        composition = clip(windows=((0.0, 20.0), (30.0, 45.0)), layers=(layer_at(12.0),))
 
         effects = audio.choose_effects(
             composition, assets=[asset(1, "sfx")], policy=audio.AudioPolicy(**switch),
@@ -156,7 +155,7 @@ class TestEffects:
         assert [effect.at_sec for effect in effects] == expected
 
     def test_a_short_sound_is_not_stretched_and_a_long_one_is_trimmed(self):
-        composition = clip(inserts=(insert_at(20.0),))
+        composition = clip(layers=(layer_at(20.0),))
         policy = audio.AudioPolicy(effect_seconds=1.0)
 
         short = audio.choose_effects(
@@ -170,13 +169,15 @@ class TestEffects:
         assert long[0].duration_sec == 1.0
 
     def test_the_result_is_a_valid_composition(self):
-        composition = clip(segments=((0.0, 20.0), (30.0, 45.0)))
+        """Every constraint a composition enforces — nothing past the end, in
+        particular — has to survive the sounds being put into it."""
+        composition = clip(windows=((0.0, 20.0), (30.0, 45.0)))
 
         effects = audio.choose_effects(composition, assets=[asset(1, "sfx")])
 
         import dataclasses
 
-        assert dataclasses.replace(composition, effects=effects).effects == effects
+        assert dataclasses.replace(composition, audio=effects).audio == effects
 
 
 # --- the model --------------------------------------------------------------
@@ -185,14 +186,14 @@ class TestEffects:
 def test_an_effect_past_the_end_of_the_clip_is_rejected():
     with pytest.raises(ValueError, match="past the end"):
         comp.Composition(
-            segments=(comp.Segment("/media/src.mp4", 0.0, 10.0),),
-            effects=(comp.SoundEffect("/library/w.wav", at_sec=30.0),),
+            spine=(comp.Segment("/media/src.mp4", 0.0, 10.0),),
+            audio=(comp.AudioTrack("/library/w.wav", at_sec=30.0),),
         )
 
 
 def test_music_that_would_be_boosted_under_speech_is_rejected():
     with pytest.raises(ValueError, match="duck_ratio"):
-        comp.MusicBed("/library/track.mp3", duck_ratio=0.5)
+        comp.AudioTrack("/library/track.mp3", duck_ratio=0.5)
 
 
 def test_a_composition_reports_the_audio_it_brings_of_its_own():
@@ -200,7 +201,8 @@ def test_a_composition_reports_the_audio_it_brings_of_its_own():
     produce an audio track."""
     silent = clip()
     scored = comp.Composition(
-        segments=silent.segments, music=comp.MusicBed("/library/track.mp3")
+        spine=silent.spine,
+        audio=(comp.AudioTrack("/library/track.mp3", loop=True),),
     )
 
     assert silent.has_own_audio is False

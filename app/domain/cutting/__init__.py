@@ -35,8 +35,24 @@ CUTTER_SCENES = "scenes"
 CUTTER_PLAIN = "plain"
 CUTTERS = (CUTTER_SPEECH, CUTTER_SCENES, CUTTER_PLAIN)
 
+# Which cutters cannot work without words. Declared here, beside the cutters
+# themselves, because it is the cutter's own need and nobody else's: the speech
+# cutter reads sentence ends, the other two read the picture and the clock.
+#
+# It used to be `profiles.requires_transcript`, which made the montage side
+# decide whether ASR ran during cutting — a profile asking for subtitles would
+# transcribe a source its own cutter never looked at. Subtitles are welcome to
+# want a transcript; they are not the reason the cutting stage runs one.
+NEEDS_TRANSCRIPT = (CUTTER_SPEECH,)
+
+
+def needs_transcript(cutter: str) -> bool:
+    """Whether this cutter cannot do its job without a transcript."""
+    return cutter in NEEDS_TRANSCRIPT
+
 __all__ = [
     "CUTTERS",
+    "NEEDS_TRANSCRIPT",
     "CUTTER_PLAIN",
     "CUTTER_SCENES",
     "CUTTER_SPEECH",
@@ -52,6 +68,7 @@ __all__ = [
     "compact_text",
     "is_sentence_boundary",
     "loudness_of",
+    "needs_transcript",
     "renumber",
     "title_from_text",
 ]

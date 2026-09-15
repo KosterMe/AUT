@@ -75,10 +75,21 @@ class ClipJob(SQLModel, table=True):
     source_platform: str = Field(max_length=16, index=True)  # youtube | local
     source_ref: str = Field(max_length=2048)
 
-    # What kind of video this is: talking | plain | split | film. It picks the
-    # cutter and the frame, so it is a property of the job rather than of one
-    # render — re-rendering a film with the podcast cutter would recut it.
+    # What kind of video this is: talking | plain | split | film. Kept as the
+    # deprecated synonym for one release — it says the same thing `cutter` and
+    # `scenario_id` now say separately, and saying it in one word is what made
+    # a montage decision reach back into cutting (§2.1).
     profile: str = Field(default="talking", max_length=16, index=True)
+    # Which signal the cutter reads: speech | scenes | plain. The job's own,
+    # because re-rendering a film with the podcast cutter would recut it — and
+    # because it is the half of the old profile that is not about montage.
+    cutter: str = Field(default="speech", max_length=16, index=True)
+    # The montage its clips are dressed with. Null means the built-in the
+    # profile names, which is what every job created before scenarios existed
+    # has and what a job that chose nothing still gets.
+    scenario_id: Optional[int] = Field(
+        default=None, foreign_key="scenarios.id", index=True
+    )
     # The look this job's clips are rendered with. Null means the defaults for
     # its profile, which is what an unattended job gets and why nothing has to
     # be chosen for one to run.
@@ -105,6 +116,18 @@ class ClipJob(SQLModel, table=True):
 
     # Raw extractor output (yt-dlp). Read-only reference data, never state.
     source_metadata_json: str = Field(default="{}")
+
+    # How this job's clips are to be dressed: the montage options it was
+    # started with. They live on the job because that is whose intent they are.
+    # They used to be assembled by the cutting stage and copied into every
+    # render task, which made a re-render depend on its old queue row still
+    # being there, and made cutting responsible for relaying decisions it has
+    # no opinion about.
+    render_options_json: str = Field(default="{}")
+    # What the source was transcribed with, when it was. A fact the cutting
+    # stage learned and the montage side needs to find the same cached
+    # transcript again — not an option, and not something to ask ASR twice for.
+    transcript_settings_json: str = Field(default="{}")
 
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -207,6 +230,41 @@ class Publication(SQLModel, table=True):
 
     account: Optional[Account] = Relationship(back_populates="publications")
     clip: Optional[Clip] = Relationship(back_populates="publications")
+
+
+class Scenario(SQLModel, table=True):
+    """A montage, stored whole.
+
+    Not sparse, unlike a style preset: a style says "the usual, but bigger
+    subtitles" and a scenario says what is on screen and when, which has no
+    "the usual" to be a difference from. The whole tree is written down, so a
+    scenario still means what it meant after anything else changes.
+
+    `builtin` marks the four that ship with the service. They cannot be
+    deleted, and editing one writes a copy instead — otherwise the first
+    accidental edit to `talking` changes how every existing job renders, and
+    nothing about that edit would look like a migration.
+    """
+
+    __tablename__ = "scenarios"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    owner_id: Optional[int] = Field(default=None, index=True)
+
+    name: str = Field(index=True, unique=True, max_length=64)
+    description: str = Field(default="", max_length=500)
+    builtin: bool = Field(default=False, index=True)
+
+    # The scenario itself: tracks, elements, style, canvas, mock.
+    data_json: str = Field(default="{}")
+    # Bumped on every save. A client sends the version it opened, and a save
+    # against an older one is refused rather than applied: two tabs on one
+    # montage is an ordinary afternoon, and the loser of that race would
+    # otherwise never learn that their work was overwritten.
+    version: int = Field(default=1)
+
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
 
 class StylePreset(SQLModel, table=True):

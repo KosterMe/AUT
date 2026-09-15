@@ -110,7 +110,7 @@ def encoder_args(encoder: str, *, crf: int, fast: bool = True) -> list[str]:
 @lru_cache(maxsize=16)
 def is_usable(encoder: str) -> bool:
     """Encode a few frames to find out whether the encoder really works."""
-    from app.adapters.media.ffmpeg import ffmpeg_exe
+    from montage.render.probe import ffmpeg_exe
 
     ffmpeg = ffmpeg_exe()
     if not ffmpeg:

@@ -6,6 +6,7 @@ that would have caught a job stuck in "slicing" with all its clips rendered.
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 from datetime import timedelta
 
@@ -21,6 +22,7 @@ from app.domain.transcript import TranscriptSegment, TranscriptWord
 from app.services import clip_jobs, publications
 from app.tasks import queue, runner
 from app.tasks.registry import load_handlers
+from montage import composition as comp
 
 load_handlers()
 
@@ -252,6 +254,100 @@ class TestDownloadHandler:
         # Cut where the picture cuts, not at a round number of seconds.
         assert clips[0].end_sec == 95.0
 
+    def test_a_profile_cannot_make_the_scene_cutter_transcribe(self, db, monkeypatch):
+        """The coupling this replaced.
+
+        `requires_transcript` was the montage side's field, and it gated ASR at
+        the cutting stage: a talking profile pointed at the scene cutter used to
+        transcribe a whole source that its cutter never read a word of. Whether
+        the subtitles later want a transcript is a separate question, asked by
+        whoever burns them.
+        """
+        from app.adapters.media import scenes
+        from app.services import transcripts
+
+        def explode(*a, **k):
+            raise AssertionError("the scene cutter must not transcribe")
+
+        monkeypatch.setattr(transcripts, "load_or_build", explode)
+        monkeypatch.setattr(
+            scenes, "analyse",
+            lambda path, **k: scenes.SceneAnalysis(
+                scene_changes=tuple(float(at) for at in range(95, 600, 95)),
+                loudness=tuple((float(s), -20.0) for s in range(600)),
+            ),
+        )
+        job = clip_jobs.create(
+            db, source_ref="https://youtu.be/abc", profile="talking",
+            start_immediately=False,
+        )
+        clip_jobs.start(db, job.id, render={"cutter": "scenes"})
+        db.commit()
+
+        assert runner.run_once([TaskKind.DOWNLOAD]) is True
+
+        db.expire_all()
+        assert db.get(ClipJob, job.id).status == JobStatus.RENDERING
+        assert db.query(Clip).count() > 1
+
+    def test_the_job_remembers_what_its_source_was_transcribed_with(self, db, monkeypatch):
+        """A fact the cutting stage learned, kept so the montage side finds the
+        same cached transcript instead of paying ASR a second time."""
+        from app.services import transcripts
+
+        monkeypatch.setattr(
+            transcripts, "load_or_build",
+            lambda *a, **k: transcripts.TranscriptResult(
+                transcript(), "fake", {"model": "small", "language": "ru"}
+            ),
+        )
+        job = clip_jobs.create(db, source_ref="https://youtu.be/abc", start_immediately=True)
+        db.commit()
+
+        assert runner.run_once([TaskKind.DOWNLOAD]) is True
+
+        db.expire_all()
+        refreshed = db.get(ClipJob, job.id)
+        assert clip_jobs.transcript_settings(refreshed) == {
+            "model": "small", "language": "ru",
+        }
+
+    def test_a_job_that_was_never_transcribed_says_so_rather_than_guessing(
+        self, db, monkeypatch
+    ):
+        from app.adapters.media import scenes
+        from app.services import transcripts
+
+        monkeypatch.setattr(transcripts, "load_or_build", lambda *a, **k: None)
+        monkeypatch.setattr(
+            scenes, "analyse",
+            lambda path, **k: scenes.SceneAnalysis(
+                scene_changes=tuple(float(at) for at in range(95, 600, 95)),
+                loudness=tuple((float(s), -20.0) for s in range(600)),
+            ),
+        )
+        job = clip_jobs.create(
+            db, source_ref="https://youtu.be/film", profile="film", start_immediately=True
+        )
+        db.commit()
+
+        assert runner.run_once([TaskKind.DOWNLOAD]) is True
+
+        db.expire_all()
+        assert clip_jobs.transcript_settings(db.get(ClipJob, job.id)) is None
+
+    def test_planning_hands_the_render_nothing_but_the_clip(self, db):
+        """Cutting's output is boundaries. How they are dressed is on the job,
+        and a render reads it there rather than being couriered a copy."""
+        job = clip_jobs.create(db, source_ref="https://youtu.be/abc", start_immediately=True)
+        db.commit()
+        runner.run_once([TaskKind.DOWNLOAD])
+
+        db.expire_all()
+        render = next(t for t in db.query(Task).all() if t.kind == TaskKind.RENDER)
+
+        assert set(queue.payload_of(render)) == {"clip_id", "job_id"}
+
     def test_a_film_whose_scenes_cannot_be_read_still_produces_clips(self, db, monkeypatch):
         """Losing the scene signal should cost worse cut points, not the job."""
         from app.adapters.media import scenes
@@ -308,7 +404,9 @@ class TestRenderHandler:
     @pytest.fixture(autouse=True)
     def _fakes(self, monkeypatch, tmp_path, source_file):
         from app.adapters.asr import cache, selection
-        from app.adapters.media import compiler, ffmpeg
+        from app.adapters.media import ffmpeg
+        from montage.render import compiler
+        from montage.render import probe as media_probe
 
         rendered = tmp_path / "rendered.mp4"
         rendered.write_bytes(b"\x00" * 512)
@@ -336,13 +434,15 @@ class TestRenderHandler:
             lambda *a, **k: (transcript, {"source": "fake"}),
         )
         monkeypatch.setattr(ffmpeg, "clip_output_path", lambda *a, **k: str(rendered))
-        monkeypatch.setattr(ffmpeg, "cover_path_for", lambda path: str(cover))
+        monkeypatch.setattr(media_probe, "cover_path_for", lambda path: str(cover))
         # Only the encode is faked. Planning runs for real, so what these tests
         # exercise is the composition the handler actually hands to ffmpeg.
         self.rendered_compositions = []
+        self.rendered_kwargs = []
 
         def fake_render(composition, output_path, **kwargs):
             self.rendered_compositions.append(composition)
+            self.rendered_kwargs.append(kwargs)
             return compiler.ClipRenderResult(
                 output_path=str(rendered), output_duration=60.0, segment_count=1,
                 subtitles_path=None, subtitle_count=0, silence_removed_seconds=0.0,
@@ -350,25 +450,45 @@ class TestRenderHandler:
             )
 
         monkeypatch.setattr(compiler, "render", fake_render)
-        monkeypatch.setattr(ffmpeg, "render_clip_cover", lambda **k: str(cover))
+        monkeypatch.setattr(media_probe, "render_clip_cover", lambda **k: str(cover))
         self.rendered = str(rendered)
 
     def _planned_clip(self, db, source_file, render_options=None) -> tuple[int, int]:
+        """A job with a source and one planned clip, as cutting would leave it.
+
+        The montage options go on the job, which is where a render reads them
+        from; planning is handed boundaries and nothing else. The source path
+        and title are the job's own fields rather than options, because a
+        render that needs them looks them up there.
+        """
+        from app.core.jsonutil import dumps
         from app.domain.cutting import SliceSpec
         from app.services import clips
 
         job = clip_jobs.create(db, source_ref="https://youtu.be/abc", start_immediately=False)
         job.original_path = source_file
+        job.title = "Source"
+        job.render_options_json = dumps(render_options or {})
         db.add(job)
         db.commit()
-        created = clips.plan(
-            db, job.id, [SliceSpec(1, 0.0, 60.0, "headline", "spoken words", 3)],
-            render_options={
-                "source_path": source_file, "source_title": "Source", **(render_options or {})
-            },
-        )
+        created = clips.plan(db, job.id, [SliceSpec(1, 0.0, 60.0, "headline", "spoken words", 3)])
         db.commit()
         return job.id, created[0].id
+
+    def _queue_options_on_the_task(self, db, clip_id, options) -> None:
+        """Put montage options in the render task's payload.
+
+        Where they used to live, and where a re-render still puts the caller's
+        own. A test that sets them on the job instead is not exercising either.
+        """
+        from app.core.jsonutil import dumps
+
+        clip = db.get(Clip, clip_id)
+        task = db.get(Task, clip.task_id)
+        payload = {**queue.payload_of(task), "render": options}
+        task.payload_json = dumps(payload)
+        db.add(task)
+        db.commit()
 
     def test_rendering_marks_the_clip_ready_and_the_job_ready(self, db, source_file):
         job_id, clip_id = self._planned_clip(db, source_file)
@@ -382,6 +502,47 @@ class TestRenderHandler:
         assert clip.cover_path is not None
         # The job's status follows from its clips, with no separate bookkeeping.
         assert db.get(ClipJob, job_id).status == JobStatus.READY
+
+    def test_a_job_renders_with_the_scenario_it_names(self, db, source_file):
+        """The whole point of storing them, shown as an A/B: two jobs over the
+        same source, one pointing at a stored scenario and one not, come out
+        framed differently — so what the render read is the scenario and not
+        the built-in the profile names.
+
+        The stored one says the picture fills the canvas; the default for a
+        wide source is to contain it over a blurred copy of itself.
+        """
+        from app.services import scenarios
+        from montage.scenario import builtin, model, store
+        from montage.style import StyleSpec
+
+        original = builtin.plain(StyleSpec.from_settings())
+        spine = original.tracks[0]
+        filled = dataclasses.replace(
+            spine.elements[0],
+            frame=dataclasses.replace(spine.elements[0].frame, fit=model.FIT_FILL),
+        )
+        stored = scenarios.create(db, name="Во весь кадр", data=store.to_dict(
+            dataclasses.replace(original, tracks=(
+                dataclasses.replace(spine, elements=(filled,)),
+            ) + original.tracks[1:])
+        ))
+
+        self._planned_clip(db, source_file)
+        assert runner.run_once([TaskKind.RENDER]) is True
+
+        job_id, _ = self._planned_clip(db, source_file)
+        job = db.get(ClipJob, job_id)
+        job.scenario_id = stored.id
+        db.add(job)
+        db.commit()
+        assert runner.run_once([TaskKind.RENDER]) is True
+
+        by_profile, by_scenario = self.rendered_compositions[-2:]
+        assert by_profile.spine[0].backdrop is True
+        assert by_profile.spine[0].frame == comp.CONTAINED
+        assert by_scenario.spine[0].backdrop is False
+        assert by_scenario.spine[0].frame == comp.FULL_FRAME
 
     def test_broll_from_the_library_reaches_the_composition(self, db, source_file):
         """The end of the chain: an uploaded fragment, tagged with a word the
@@ -397,9 +558,9 @@ class TestRenderHandler:
         assert runner.run_once([TaskKind.RENDER]) is True
 
         composition = self.rendered_compositions[-1]
-        assert [insert.source_path for insert in composition.inserts] == [asset.path]
+        assert [insert.source_path for insert in composition.layers] == [asset.path]
         # Placed on the word itself, not somewhere near it.
-        assert composition.inserts[0].at_sec == 12.0
+        assert composition.layers[0].at_sec == 12.0
         # Using a fragment is recorded, so the next clip reaches for another one.
         db.expire_all()
         assert db.get(type(asset), asset.id).use_count == 1
@@ -413,7 +574,7 @@ class TestRenderHandler:
 
         assert runner.run_once([TaskKind.RENDER]) is True
 
-        assert self.rendered_compositions[-1].inserts == ()
+        assert self.rendered_compositions[-1].layers == ()
 
     def test_the_split_profile_puts_a_background_under_the_speaker(self, db, source_file):
         from app.services import assets
@@ -429,8 +590,14 @@ class TestRenderHandler:
         assert runner.run_once([TaskKind.RENDER]) is True
 
         composition = self.rendered_compositions[-1]
-        assert composition.layouts == frozenset({"split"})
-        assert composition.segments[0].companion_path == background.path
+        # Two elements, each in its half of the canvas: the speaker up top and
+        # the gameplay below, as one layer running the length of the clip.
+        assert composition.spine[0].frame == comp.TOP_HALF
+        assert composition.spine[0].backdrop is False
+        bottom = composition.stack[0]
+        assert bottom.source_path == background.path
+        assert bottom.frame == comp.BOTTOM_HALF
+        assert bottom.duration_sec == composition.duration_sec
 
     def test_a_split_screen_with_nothing_to_put_under_it_falls_back(self, db, source_file):
         """A missing background should cost the split screen, not the clip."""
@@ -441,7 +608,9 @@ class TestRenderHandler:
         assert runner.run_once([TaskKind.RENDER]) is True
 
         db.expire_all()
-        assert self.rendered_compositions[-1].layouts == frozenset({"blur"})
+        composition = self.rendered_compositions[-1]
+        assert composition.spine[0].backdrop is True     # fell back to a backdrop
+        assert composition.layers == ()                  # and nothing below
         assert db.get(Clip, clip_id).status == ClipStatus.READY
 
     def test_a_soundtrack_is_chosen_from_the_library(self, db, source_file):
@@ -460,11 +629,11 @@ class TestRenderHandler:
         assert runner.run_once([TaskKind.RENDER]) is True
 
         composition = self.rendered_compositions[-1]
-        assert composition.music is not None
-        assert composition.music.source_path == track.path
+        assert composition.beds
+        assert composition.beds[0].source_path == track.path
         # The b-roll appears at 12s, so the transition sound leads it.
-        assert [effect.source_path for effect in composition.effects] == [whoosh.path]
-        assert composition.effects[0].at_sec == pytest.approx(11.88)
+        assert [effect.source_path for effect in composition.stingers] == [whoosh.path]
+        assert composition.stingers[0].at_sec == pytest.approx(11.88)
 
     def test_a_soundtrack_is_recorded_as_used_like_any_other_asset(self, db, source_file):
         from app.services import assets
@@ -487,18 +656,18 @@ class TestRenderHandler:
 
         assert runner.run_once([TaskKind.RENDER]) is True
 
-        assert self.rendered_compositions[-1].music is None
-        assert self.rendered_compositions[-1].effects == ()
+        assert self.rendered_compositions[-1].beds == ()
+        assert self.rendered_compositions[-1].stingers == ()
 
     def test_a_library_without_music_leaves_the_clip_alone(self, db, source_file):
         self._planned_clip(db, source_file, render_options={"music": True, "sfx": True})
 
         assert runner.run_once([TaskKind.RENDER]) is True
 
-        assert self.rendered_compositions[-1].music is None
+        assert self.rendered_compositions[-1].beds == ()
 
     def test_a_failed_render_marks_only_that_clip(self, db, source_file, monkeypatch):
-        from app.adapters.media import compiler
+        from montage.render import compiler
 
         def explode(*a, **k):
             raise RuntimeError("ffmpeg exited with code 1")
@@ -984,10 +1153,11 @@ class TestRenderedStyle(TestRenderHandler):
 
     def test_a_task_queued_before_styles_existed_still_renders(self, db, source_file):
         """The queue can be full during an upgrade. Those tasks carry the old
-        flat switches and nothing else."""
-        self._planned_clip(
-            db, source_file,
-            render_options={"auto_montage": False, "inserts": False, "subtitle_font_size": 64},
+        flat switches in their own payload, and their job carries nothing."""
+        _, clip_id = self._planned_clip(db, source_file)
+        self._queue_options_on_the_task(
+            db, clip_id,
+            {"auto_montage": False, "inserts": False, "subtitle_font_size": 64},
         )
 
         assert runner.run_once([TaskKind.RENDER]) is True
@@ -996,6 +1166,32 @@ class TestRenderedStyle(TestRenderHandler):
         assert style.pacing.remove_silence is False
         assert style.inserts.enabled is False
         assert style.subtitles.font_size == 64
+
+    def test_what_the_task_asks_for_wins_over_the_job_without_erasing_it(
+        self, db, source_file
+    ):
+        """A re-render changes one thing and must not silently drop the rest.
+
+        The look is not the example to test that with: a style is resolved
+        whole before it is queued, so a task carrying one carries all of it and
+        replacing it is correct. `strategy` is the option a style has no say
+        over, which makes it the one that shows whether the job's side of the
+        merge survived at all.
+        """
+        _, clip_id = self._planned_clip(
+            db, source_file,
+            render_options={
+                "strategy": "two_stage", "style": {"subtitles": {"font_size": 40}},
+            },
+        )
+        self._queue_options_on_the_task(
+            db, clip_id, {"style": {"subtitles": {"font_size": 96}}}
+        )
+
+        assert runner.run_once([TaskKind.RENDER]) is True
+
+        assert self.rendered_compositions[-1].style.subtitles.font_size == 96  # the task's
+        assert self.rendered_kwargs[-1]["strategy"] == "two_stage"             # still the job's
 
     def test_a_finished_clip_records_what_it_was_made_of(self, db, source_file):
         """Stored so the clip can be inspected, and re-rendered without
@@ -1008,9 +1204,9 @@ class TestRenderedStyle(TestRenderHandler):
 
         db.expire_all()
         stored = json.loads(db.get(Clip, clip_id).composition_json)
-        assert stored["segments"]
+        assert stored["spine"]
         assert stored["style"]["delivery"]["width"] == 1080
         # And it loads back into the very thing that produced it.
-        from app.domain import composition as comp
+        from montage import composition as comp
 
         assert comp.from_dict(stored) == self.rendered_compositions[-1]

@@ -13,7 +13,7 @@ import logging
 import os
 
 from app.adapters.asr import whisper
-from app.adapters.media import ffmpeg
+from montage import client as montage
 from app.core.errors import PermanentError
 from app.domain.transcript import TranscriptSegment
 
@@ -45,7 +45,7 @@ def _require_audio(media_path: str) -> None:
     usual way to get one here is an interrupted download whose video and audio
     streams were never merged.
     """
-    if ffmpeg.ffprobe_has_audio(media_path):
+    if montage.has_audio(media_path):
         return
     raise PermanentError(
         f"{os.path.basename(media_path)} has no audio track, so there is nothing "

@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import pytest
 
-from app.domain import composition as comp
-from app.domain import inserts
-from app.domain.subtitles import SubtitleCue
+from montage import composition as comp
+from montage.rules import inserts
+from montage.subtitles import SubtitleCue
 
 CLIP = "/media/source.mp4"
 
@@ -23,7 +23,7 @@ def words(*pairs: tuple[float, str]) -> tuple[SubtitleCue, ...]:
 
 def clip(*, duration: float = 60.0, cues=()) -> comp.Composition:
     return comp.Composition(
-        segments=(comp.Segment(CLIP, 0.0, duration),),
+        spine=(comp.Segment(CLIP, 0.0, duration),),
         subtitles=comp.SubtitleSpec(cues=tuple(cues)),
     )
 
@@ -250,13 +250,13 @@ def test_a_clip_without_subtitles_gets_no_broll():
     """No cues is no words, and words are the only thing that places b-roll.
 
     Turning subtitles off used to turn the whole library on instead."""
-    composition = comp.Composition(segments=(comp.Segment(CLIP, 0.0, 30.0),))
+    composition = comp.Composition(spine=(comp.Segment(CLIP, 0.0, 30.0),))
 
     assert inserts.choose_inserts(composition, assets=[asset(1, "машина")]) == ()
 
 
 def test_a_clip_without_subtitles_takes_the_beat_when_it_is_asked_for():
-    composition = comp.Composition(segments=(comp.Segment(CLIP, 0.0, 30.0),))
+    composition = comp.Composition(spine=(comp.Segment(CLIP, 0.0, 30.0),))
 
     chosen = inserts.choose_inserts(
         composition,
@@ -291,4 +291,4 @@ def test_the_result_is_a_valid_composition():
 
     import dataclasses
 
-    assert dataclasses.replace(composition, inserts=chosen).inserts == chosen
+    assert dataclasses.replace(composition, layers=chosen).layers == chosen

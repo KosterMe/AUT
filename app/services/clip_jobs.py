@@ -15,12 +15,12 @@ from sqlmodel import Session, col, select
 
 from app.core.clock import utc_now
 from app.core.errors import ConflictError, NotFoundError, ValidationError
-from app.core.jsonutil import dumps
+from app.core.jsonutil import dumps, loads_dict
 from app.db.enums import ClipStatus, JobStatus, TaskKind, TaskStatus
 from app.db.models import Clip, ClipJob, Task
 from app.adapters.youtube import downloader
-from app.domain import profiles, sources
-from app.services import styles
+from app.domain import cutting, profiles, sources
+from app.services import scenarios, styles
 from app.tasks import queue
 
 log = logging.getLogger(__name__)
@@ -35,6 +35,8 @@ def create(
     custom_title: str | None = None,
     caption_tags: str | None = None,
     profile: str | None = None,
+    scenario_id: int | None = None,
+    cutter: str | None = None,
     start_immediately: bool = False,
     min_clip_seconds: float | None = None,
     max_clip_seconds: float | None = None,
@@ -66,6 +68,10 @@ def create(
         custom_title=_normalize_title(custom_title),
         caption_tags=caption_tags.strip() if caption_tags else None,
         profile=chosen.name,
+        scenario_id=_scenario_id(session, scenario_id),
+        # Named at creation, it holds even for a job that is not started yet:
+        # `start` only fills in a cutter the job does not have.
+        cutter=_cutter(cutter) if cutter is not None else chosen.cutter,
         style_id=_style_id(session, style_id),
         status=JobStatus.CREATED,
     )
@@ -81,6 +87,7 @@ def create(
             gap_seconds=gap_seconds,
             max_clips=max_clips,
             render=render,
+            cutter=cutter,
         )
     return job
 
@@ -90,6 +97,33 @@ def get(session: Session, job_id: int) -> ClipJob:
     if job is None:
         raise NotFoundError(f"clip job {job_id} not found")
     return job
+
+
+def montage_options(job: ClipJob) -> dict:
+    """How this job's clips are to be dressed, as recorded when it started."""
+    return loads_dict(job.render_options_json)
+
+
+def transcript_settings(job: ClipJob) -> dict | None:
+    """What this job's source was transcribed with, or None if it never was.
+
+    None rather than `{}` because that is what the render side used to receive
+    when the key was simply absent from the task payload. The transcript cache
+    happens to treat the two the same, which is luck and not a contract.
+    """
+    return loads_dict(job.transcript_settings_json) or None
+
+
+def record_transcript_settings(session: Session, job_id: int, settings: dict | None) -> None:
+    """Remember what the source was transcribed with.
+
+    A fact the cutting stage learned on its own behalf, kept so the montage
+    side can find the same cached transcript instead of asking ASR again.
+    """
+    job = get(session, job_id)
+    job.transcript_settings_json = dumps(settings or {})
+    job.updated_at = utc_now()
+    session.add(job)
 
 
 def list_all(session: Session, *, limit: int = 100, offset: int = 0) -> list[ClipJob]:
@@ -112,6 +146,8 @@ def start(
     gap_seconds: float | None = None,
     max_clips: int = 0,
     profile: str | None = None,
+    scenario_id: int | None = None,
+    cutter: str | None = None,
     render: dict | None = None,
     style_id: int | None = None,
 ) -> Task:
@@ -134,10 +170,26 @@ def start(
             raise ValidationError(str(exc)) from exc
     if style_id is not None:
         job.style_id = _style_id(session, style_id)
+    if scenario_id is not None:
+        job.scenario_id = _scenario_id(session, scenario_id)
 
     # Resolved once, here, so the download and every render of this job agree
     # about what kind of video it is — including renders queued days later.
     settings = profiles.resolve(profiles.get(job.profile), render or {})
+    # The cutting half, on the job rather than only in the task payload: a
+    # re-run reads it from the same place the first run wrote it, and nothing
+    # has to re-derive it from a profile name.
+    #
+    # An explicitly asked-for cutter wins and stays — named on this call, or
+    # in the render options, which is where it used to be asked for. Otherwise
+    # the profile decides, but only when one was named on this call or the job
+    # has no cutter at all: re-running a job with an empty body must not
+    # quietly undo a cutter that was chosen for it.
+    asked = cutter if cutter is not None else (render or {}).get("cutter")
+    if asked is not None:
+        job.cutter = _cutter(str(asked))
+    elif profile is not None or not job.cutter:
+        job.cutter = str(settings["cutter"])
     # And the same for how it looks. Resolving the style now rather than per
     # render is what stops the fiftieth clip of a job coming out different from
     # the first because somebody edited a preset while it was running.
@@ -156,13 +208,22 @@ def start(
     payload = {
         "job_id": job_id,
         "profile": settings["profile"],
-        "cutter": settings["cutter"],
+        "cutter": job.cutter,
         "min_clip_seconds": _kept(min_clip_seconds, previous, "min_clip_seconds"),
         "max_clip_seconds": _kept(max_clip_seconds, previous, "max_clip_seconds"),
         "gap_seconds": _kept(gap_seconds, previous, "gap_seconds"),
         "max_clips": max_clips or int(previous.get("max_clips") or 0),
-        "render": {**(render or {}), **settings, "style": look},
     }
+    # The montage options go on the job rather than into the task payload. They
+    # are the job's intent, they outlive any queue row, and cutting has no
+    # opinion about them — it used to carry them from the download task to
+    # every render task purely as a courier.
+    #
+    # Computed exactly as before, including the part that is arguably wrong:
+    # restarting a job with an empty body resolves them back to the profile's
+    # defaults. That is what it did when they lived in the payload, and a
+    # relocation is not the change that should quietly fix it.
+    job.render_options_json = dumps({**(render or {}), **settings, "style": look})
     task = queue.enqueue(
         session,
         TaskKind.DOWNLOAD,
@@ -178,6 +239,24 @@ def start(
     session.flush()
     log.info("queued download task %s for job %s", task.id, job_id)
     return task
+
+
+def _cutter(cutter: str | None) -> str:
+    """A cutter name, checked. Empty means the profile's."""
+    resolved = (cutter or "").strip().lower()
+    if resolved not in cutting.CUTTERS:
+        raise ValidationError(
+            f"unknown cutter {cutter!r}; expected one of {', '.join(cutting.CUTTERS)}"
+        )
+    return resolved
+
+
+def _scenario_id(session: Session, scenario_id: int | None) -> int | None:
+    """A scenario id, checked to exist. `None` means "the profile's built-in"."""
+    if not scenario_id:
+        return None
+    scenarios.get(session, int(scenario_id))  # raises NotFoundError if it is gone
+    return int(scenario_id)
 
 
 def _style_id(session: Session, style_id: int | None) -> int | None:

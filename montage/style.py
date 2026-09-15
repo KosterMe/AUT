@@ -38,7 +38,7 @@ import logging
 from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Any, Mapping
 
-from app.core.config import get_settings
+from montage.config import get_settings
 
 log = logging.getLogger(__name__)
 

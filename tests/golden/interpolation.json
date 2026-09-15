@@ -1,0 +1,292 @@
+{
+  "spec": "montage/scenario/curve.py",
+  "note": "Samples are of the polyline the renderer is given, easing already applied. at/value/easing per key; samples are [second, value].",
+  "cases": [
+    {
+      "name": "linear",
+      "why": "a straight line, and held at both ends rather than extrapolated",
+      "keys": [
+        {
+          "at": 0.0,
+          "value": 0.0,
+          "easing": "linear"
+        },
+        {
+          "at": 2.0,
+          "value": 100.0,
+          "easing": "linear"
+        }
+      ],
+      "samples": [
+        [
+          -1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.5,
+          25.0
+        ],
+        [
+          1.0,
+          50.0
+        ],
+        [
+          2.0,
+          100.0
+        ],
+        [
+          3.0,
+          100.0
+        ]
+      ]
+    },
+    {
+      "name": "ease_in",
+      "why": "slow away from the key it leaves",
+      "keys": [
+        {
+          "at": 0.0,
+          "value": 0.0,
+          "easing": "in"
+        },
+        {
+          "at": 2.0,
+          "value": 100.0,
+          "easing": "linear"
+        }
+      ],
+      "samples": [
+        [
+          0.5,
+          6.25
+        ],
+        [
+          1.0,
+          25.0
+        ],
+        [
+          1.5,
+          56.25
+        ],
+        [
+          2.0,
+          100.0
+        ]
+      ]
+    },
+    {
+      "name": "ease_out",
+      "why": "fast away, slow into the key it arrives at",
+      "keys": [
+        {
+          "at": 0.0,
+          "value": 0.0,
+          "easing": "out"
+        },
+        {
+          "at": 2.0,
+          "value": 100.0,
+          "easing": "linear"
+        }
+      ],
+      "samples": [
+        [
+          0.5,
+          43.75
+        ],
+        [
+          1.0,
+          75.0
+        ],
+        [
+          1.5,
+          93.75
+        ],
+        [
+          2.0,
+          100.0
+        ]
+      ]
+    },
+    {
+      "name": "ease_in_out",
+      "why": "symmetric, and exactly half way at half way",
+      "keys": [
+        {
+          "at": 0.0,
+          "value": 0.0,
+          "easing": "in_out"
+        },
+        {
+          "at": 2.0,
+          "value": 100.0,
+          "easing": "linear"
+        }
+      ],
+      "samples": [
+        [
+          0.5,
+          12.5
+        ],
+        [
+          1.0,
+          50.0
+        ],
+        [
+          1.5,
+          87.5
+        ],
+        [
+          2.0,
+          100.0
+        ]
+      ]
+    },
+    {
+      "name": "step",
+      "why": "holds and jumps: no value in between was ever asked for",
+      "keys": [
+        {
+          "at": 0.0,
+          "value": 10.0,
+          "easing": "step"
+        },
+        {
+          "at": 2.0,
+          "value": 90.0,
+          "easing": "linear"
+        }
+      ],
+      "samples": [
+        [
+          0.0,
+          10.0
+        ],
+        [
+          1.0,
+          10.0
+        ],
+        [
+          1.999,
+          10.0
+        ],
+        [
+          2.0,
+          90.0
+        ],
+        [
+          3.0,
+          90.0
+        ]
+      ]
+    },
+    {
+      "name": "one_key_is_a_constant",
+      "why": "nothing to move between, so nothing moves",
+      "keys": [
+        {
+          "at": 1.0,
+          "value": 42.0,
+          "easing": "linear"
+        }
+      ],
+      "samples": [
+        [
+          0.0,
+          42.0
+        ],
+        [
+          1.0,
+          42.0
+        ],
+        [
+          9.0,
+          42.0
+        ]
+      ]
+    },
+    {
+      "name": "three_keys_each_with_its_own_shape",
+      "why": "easing belongs to the key it leaves, so only the middle stretch holds",
+      "keys": [
+        {
+          "at": 0.0,
+          "value": 0.0,
+          "easing": "linear"
+        },
+        {
+          "at": 1.0,
+          "value": 50.0,
+          "easing": "step"
+        },
+        {
+          "at": 2.0,
+          "value": 100.0,
+          "easing": "linear"
+        }
+      ],
+      "samples": [
+        [
+          0.5,
+          25.0
+        ],
+        [
+          1.0,
+          50.0
+        ],
+        [
+          1.5,
+          50.0
+        ],
+        [
+          2.0,
+          100.0
+        ]
+      ]
+    },
+    {
+      "name": "two_keys_on_one_second_are_a_jump",
+      "why": "an editor can produce it with anchors; the later key wins",
+      "keys": [
+        {
+          "at": 0.0,
+          "value": 0.0,
+          "easing": "linear"
+        },
+        {
+          "at": 1.0,
+          "value": 30.0,
+          "easing": "linear"
+        },
+        {
+          "at": 1.0,
+          "value": 70.0,
+          "easing": "linear"
+        },
+        {
+          "at": 2.0,
+          "value": 70.0,
+          "easing": "linear"
+        }
+      ],
+      "samples": [
+        [
+          0.5,
+          15.0
+        ],
+        [
+          1.0,
+          70.0
+        ],
+        [
+          1.5,
+          70.0
+        ]
+      ]
+    }
+  ]
+}

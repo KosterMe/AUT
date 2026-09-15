@@ -34,25 +34,26 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import logging
+import math
 import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from app.adapters.media import encoders
-from app.adapters.media import filters
-from app.adapters.media.ffmpeg import (
+from montage.render import encoders
+from montage.render import filters
+from montage.render.probe import (
     ffmpeg_exe,
     ffprobe_has_audio,
     media_root,
     probe_media,
     probe_render_output,
 )
-from app.core.config import get_settings
-from app.domain import composition as comp
-from app.domain import style as style_module
-from app.domain import subtitles
+from montage.config import get_settings
+from montage import composition as comp
+from montage import style as style_module
+from montage import subtitles
 
 log = logging.getLogger(__name__)
 
@@ -110,10 +111,10 @@ def render(
     # per clip spent confirming what putting them there already asserted.
     audio_by_source = {
         segment.source_path: ffprobe_has_audio(segment.source_path)
-        for segment in composition.segments
+        for segment in composition.spine
     }
     has_audio = (
-        any(audio_by_source.get(s.source_path, False) for s in composition.segments)
+        any(audio_by_source.get(s.source_path, False) for s in composition.spine)
         or composition.has_own_audio
     )
 
@@ -141,13 +142,13 @@ def render(
     )
     log.info(
         "rendered %s via %s: %d segment(s), %d insert(s), %d fragment(s) reused",
-        os.path.basename(output_path), chosen, len(composition.segments),
-        len(composition.inserts), reused,
+        os.path.basename(output_path), chosen, len(composition.spine),
+        len(composition.layers), reused,
     )
     return ClipRenderResult(
         output_path=output_path,
         output_duration=round(duration, 3),
-        segment_count=len(composition.segments),
+        segment_count=len(composition.spine),
         subtitles_path=subtitle_path,
         subtitle_count=subtitle_count,
         silence_removed_seconds=round(removed, 3),
@@ -218,45 +219,54 @@ def choose_strategy(composition: comp.Composition) -> str:
     if configured in (STRATEGY_ONE_PASS, STRATEGY_TWO_STAGE):
         return configured
 
-    if len(composition.segments) > settings.one_pass_max_segments:
+    if len(composition.spine) > settings.one_pass_max_segments:
         return STRATEGY_TWO_STAGE
-    if len(composition.inserts) > settings.one_pass_max_inserts:
+    if len(composition.layers) > settings.one_pass_max_layers:
         return STRATEGY_TWO_STAGE
-    if len(composition.layouts) > 1:
+    if len(composition.framings) > 1:
         return STRATEGY_TWO_STAGE
     if _cached_share(composition) >= 0.5:
         return STRATEGY_TWO_STAGE
     return STRATEGY_ONE_PASS
 
 
-def choose_layout(
+def frame_for_source(
     source_path: str,
     canvas: comp.Canvas,
     *,
     requested: str = LAYOUT_AUTO,
     tolerance: float = 0.15,
-) -> str:
-    """How this source should fill the canvas.
+) -> tuple[comp.Frame, bool]:
+    """How this source should fill the canvas: a rectangle and a backdrop.
 
-    Only `auto` is decided here; a profile that asked for a specific layout
+    Only `auto` is decided here; a style that asked for a particular framing
     gets it. The decision is about shape and nothing else: a source that is
     already about as tall and narrow as the canvas is cropped to fill it,
     because giving a vertical video a blurred backdrop made of itself is a
     frame of wasted screen. Anything wider keeps the backdrop.
+
+    The named layouts are still the vocabulary a style speaks — they leave when
+    profiles become scenarios (§9.2) — but nothing past this point knows them.
     """
     if requested and requested != LAYOUT_AUTO:
-        return requested
+        return comp.frame_for_layout(requested), requested == comp.LAYOUT_BLUR
 
     probe = probe_media(source_path)
     width, height = probe.get("width"), probe.get("height")
     if not width or not height:
-        return comp.LAYOUT_BLUR
+        # Cropping to a shape nobody measured is the worse guess.
+        return comp.CONTAINED, True
 
     source_aspect = float(width) / float(height)
     canvas_aspect = canvas.width / canvas.height
     if source_aspect <= canvas_aspect * (1.0 + tolerance):
-        return comp.LAYOUT_FILL
-    return comp.LAYOUT_BLUR
+        return comp.FULL_FRAME, False
+    return comp.CONTAINED, True
+
+
+def _unsplit(layout: str) -> str:
+    """A split screen that lost its bottom half falls back to deciding on shape."""
+    return LAYOUT_AUTO if layout == comp.LAYOUT_SPLIT else layout
 
 
 def plan_vertical_clip(
@@ -272,17 +282,30 @@ def plan_vertical_clip(
 ) -> comp.Composition:
     """Describe one slice of one file, without rendering anything.
 
-    Separate from `render_vertical_clip` because what goes *over* a clip is
-    decided from what is already in it: b-roll is placed against the subtitle
-    cues, and those only exist once silence removal has settled where the
-    segments are. So the caller plans, adds inserts, and only then renders.
+    **No production path calls this any more.** The live path is
+    `compile(scenario, facts)`, and this is what it replaced: one function that
+    probed the file and decided everything about the clip from a style. It
+    stays because the migration test's claim is about it — that the four
+    built-in scenarios produce the same EDL the pipeline produced before them —
+    and a claim whose other side has been deleted is a claim nobody can check
+    (§9.2).
+
+    That test *calls* it, with its two probes answered from the same
+    `ClipFacts` the scenario side uses. Until it did, this function was not run
+    by anything in the repository, and a reference implementation nobody runs
+    is documentation that rots quietly (trap 57).
+
+    What it shows, and the reason it was a dead end: the probes are wired in.
+    Silence removal happens here, the frame is chosen here, and a caller who
+    wanted a montage without paying for a `silencedetect` pass had nowhere to
+    say so. `required_facts` exists because of this function.
 
     The style arrives resolved. Every decision this function makes — where the
     cuts go, how the frame is filled, what the type looks like — reads from it
     and from nothing else, which is what makes the resulting composition a
     complete description of the clip rather than half of one.
     """
-    from app.adapters.media.ffmpeg import montage_keep_segments
+    from montage.render.probe import montage_keep_segments
 
     look = style or style_module.StyleSpec.from_settings()
     canvas = comp.canvas_for(look)
@@ -293,21 +316,32 @@ def plan_vertical_clip(
             input_path, start_sec=start_sec, end_sec=end_sec, pacing=look.pacing
         )
 
-    resolved_layout = choose_layout(
-        input_path, canvas,
-        requested=look.framing.layout, tolerance=look.framing.fill_tolerance,
-    )
-    if resolved_layout == comp.LAYOUT_SPLIT and not companion_path:
+    wants_split = look.framing.layout == comp.LAYOUT_SPLIT
+    if wants_split and not companion_path:
         # Asked for a split screen with nothing to put in the bottom half. The
         # clip is still worth making, so it falls back rather than failing.
         log.warning("no companion source for a split screen; falling back to a blurred backdrop")
-        resolved_layout = comp.LAYOUT_BLUR
+        wants_split = False
 
+    frame, backdrop = frame_for_source(
+        input_path, canvas,
+        requested=comp.LAYOUT_SPLIT if wants_split else _unsplit(look.framing.layout),
+        tolerance=look.framing.fill_tolerance,
+    )
     draft = comp.single_source(
         input_path, start_sec=start_sec, end_sec=end_sec, keep_segments=keep_segments,
-        canvas=canvas, style=look, layout=resolved_layout,
-        companion_path=companion_path if resolved_layout == comp.LAYOUT_SPLIT else None,
+        canvas=canvas, style=look, frame=frame, backdrop=backdrop,
     )
+    if wants_split and companion_path:
+        # One layer across the clip rather than a second source on every
+        # segment: the bottom half runs continuously and always did.
+        draft = dataclasses.replace(draft, layers=draft.layers + (comp.Layer(
+            source_path=companion_path,
+            at_sec=0.0,
+            duration_sec=draft.duration_sec,
+            frame=comp.BOTTOM_HALF,
+            z=-1,
+        ),))
     cues: list[subtitles.SubtitleCue] = []
     if look.subtitles.enabled:
         cues = subtitles.make_subtitle_cues(
@@ -316,32 +350,9 @@ def plan_vertical_clip(
             fallback_text=fallback_subtitle_text,
             style=look.subtitles,
         )
-    return comp.Composition(
-        segments=draft.segments,
-        canvas=canvas,
+    return dataclasses.replace(
+        draft,
         subtitles=comp.SubtitleSpec(cues=tuple(cues), title_text=title_text),
-        style=look,
-    )
-
-
-def render_vertical_clip(
-    input_path: str,
-    output_path: str,
-    *,
-    start_sec: float,
-    end_sec: float,
-    strategy: str | None = None,
-    **plan_options: Any,
-) -> ClipRenderResult:
-    """Plan and render one slice of one file, with no inserts over it."""
-    composition = plan_vertical_clip(
-        input_path, start_sec=start_sec, end_sec=end_sec, **plan_options
-    )
-    return render(
-        composition,
-        output_path,
-        strategy=strategy,
-        source_duration_sec=max(0.0, end_sec - start_sec),
     )
 
 
@@ -368,18 +379,12 @@ def one_pass_args(
     video_labels: list[str] = []
     audio_labels: list[str] = []
 
-    for index, segment in enumerate(composition.segments):
+    for index, segment in enumerate(composition.spine):
         video_input = _add_input(inputs, segment.source_path,
                                  start=segment.source_start_sec, duration=segment.duration_sec)
-        companion_input = None
-        if segment.layout == comp.LAYOUT_SPLIT and segment.companion_path:
-            companion_input = _add_input(inputs, segment.companion_path,
-                                         start=segment.companion_start_sec,
-                                         duration=segment.duration_sec, loop=True)
         chain, video_label = _segment_video_chain(
             index, composition.canvas, segment,
             video_in=f"[{video_input}:v]",
-            companion_in=None if companion_input is None else f"[{companion_input}:v]",
             framing=composition.style.framing,
         )
         parts.extend(chain)
@@ -393,8 +398,8 @@ def one_pass_args(
 
     video_label, audio_label = _concat(parts, video_labels, audio_labels if has_audio else [])
 
-    insert_chains, video_label = _insert_chains(composition, inputs, video_in=video_label)
-    parts.extend(insert_chains)
+    layer_chains, video_label = _layer_chains(composition, inputs, video_in=video_label)
+    parts.extend(layer_chains)
     parts.append(
         _look_chain(
             video_in=video_label, subtitle_path=subtitle_path, grade=composition.style.grade
@@ -422,8 +427,8 @@ def final_pass_args(
     """The second stage: inserts, look and audio over the joined segments."""
     inputs = ["-i", joined_path]
     parts: list[str] = []
-    insert_chains, video_label = _insert_chains(composition, inputs, video_in="0:v")
-    parts.extend(insert_chains)
+    layer_chains, video_label = _layer_chains(composition, inputs, video_in="0:v")
+    parts.extend(layer_chains)
     parts.append(
         _look_chain(
             video_in=video_label, subtitle_path=subtitle_path, grade=composition.style.grade
@@ -486,7 +491,7 @@ def _render_two_stage(
     settings = get_settings().render
     fragments: list[str] = []
     reused = 0
-    for index, segment in enumerate(composition.segments):
+    for index, segment in enumerate(composition.spine):
         path = fragment_path(composition.canvas, segment, framing=composition.style.framing)
         if settings.fragment_cache and os.path.exists(path) and os.path.getsize(path) > 2048:
             reused += 1
@@ -537,16 +542,10 @@ def fragment_args(
     inputs: list[str] = []
     video_input = _add_input(inputs, segment.source_path,
                              start=segment.source_start_sec, duration=segment.duration_sec)
-    companion_input = None
-    if segment.layout == comp.LAYOUT_SPLIT and segment.companion_path:
-        companion_input = _add_input(inputs, segment.companion_path,
-                                     start=segment.companion_start_sec,
-                                     duration=segment.duration_sec, loop=True)
 
     parts, video_label = _segment_video_chain(
         index, composition.canvas, segment,
         video_in=f"[{video_input}:v]",
-        companion_in=None if companion_input is None else f"[{companion_input}:v]",
         framing=composition.style.framing,
     )
     parts.append(f"[{video_label}]format=yuv420p,setsar=1[v]")
@@ -597,45 +596,56 @@ def _segment_video_chain(
     segment: comp.Segment,
     *,
     video_in: str,
-    companion_in: str | None,
     framing: style_module.FramingStyle | None = None,
 ) -> tuple[list[str], str]:
-    """Compose one segment into the canvas. Returns (chain parts, out label)."""
+    """Compose one segment into the canvas. Returns (chain parts, out label).
+
+    Three branches became one rectangle and one flag. What used to be `fill`
+    is a frame covering the canvas; `blur` is a frame contained inside it with
+    a blurred copy of itself behind; `split` is a frame filling half of it,
+    with the other half left for a layer. Combinations nobody could ask for
+    before — a source letterboxed on black, a source in the upper third —
+    follow from the same two fields rather than from a fourth branch.
+    """
     prefix = f"s{index}"
     out = f"v{index}"
-    frame = framing or style_module.FramingStyle.from_settings()
+    look = framing or style_module.FramingStyle.from_settings()
     normalise = f"fps={canvas.fps},setpts=PTS-STARTPTS"
+    left, top, width, height = segment.frame.box(canvas)
+    height = height or canvas.height
 
-    if segment.layout == comp.LAYOUT_FILL:
+    if segment.backdrop:
+        # The backdrop is made from this segment and nothing else, which is
+        # why it lives here rather than as a layer: there is no other source
+        # to take it from. Shrinking before the blur costs the divisor squared
+        # less for the same look, since a heavy blur discards the detail the
+        # downscale removed anyway.
+        parts = [
+            f"{video_in}{normalise},split=2[{prefix}bgsrc][{prefix}fgsrc]",
+            filters.background(canvas.width, canvas.height, src=f"[{prefix}bgsrc]",
+                               out=f"{prefix}bg", divisor=look.blur_divisor,
+                               radius=look.blur_radius),
+            filters.foreground(canvas.width, canvas.height, src=f"[{prefix}fgsrc]",
+                               out=f"{prefix}fg", zoom=look.zoom),
+            f"[{prefix}bg][{prefix}fg]overlay=(W-w)/2:(H-h)/2[{out}]",
+        ]
+        return parts, out
+
+    if (left, top, width, height) == (0, 0, canvas.width, canvas.height):
         return (
             [filters.fill(canvas.width, canvas.height, src=f"{video_in}{normalise},", out=out)],
             out,
         )
 
-    if segment.layout == comp.LAYOUT_SPLIT:
-        if not companion_in:
-            raise ValueError("a split-screen segment needs a companion input")
-        half = canvas.half_height
-        return (
-            [
-                filters.fill(canvas.width, half,
-                             src=f"{video_in}{normalise},", out=f"{prefix}top"),
-                filters.fill(canvas.width, half,
-                             src=f"{companion_in}{normalise},", out=f"{prefix}bottom"),
-                f"[{prefix}top][{prefix}bottom]vstack=inputs=2[{out}]",
-            ],
-            out,
-        )
-
+    # A frame smaller than the canvas: fill the box, then place it. What the
+    # box does not cover stays black, and a layer is free to sit there — which
+    # is exactly what the bottom half of a split screen now is.
     return (
         [
-            f"{video_in}{normalise},split=2[{prefix}bgsrc][{prefix}fgsrc]",
-            filters.background(canvas.width, canvas.height, src=f"[{prefix}bgsrc]",
-                               out=f"{prefix}bg", divisor=frame.blur_divisor,
-                               radius=frame.blur_radius),
-            filters.foreground(canvas.width, canvas.height, src=f"[{prefix}fgsrc]",
-                               out=f"{prefix}fg", zoom=frame.zoom),
-            f"[{prefix}bg][{prefix}fg]overlay=(W-w)/2:(H-h)/2[{out}]",
+            f"{video_in}{normalise},"
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},"
+            f"pad={canvas.width}:{canvas.height}:{left}:{top}:black[{out}]"
         ],
         out,
     )
@@ -683,48 +693,329 @@ def _concat(
     return "vcat", ("acat" if has_audio else "")
 
 
-def _insert_chains(
+def _layer_chains(
     composition: comp.Composition, inputs: list[str], *, video_in: str
 ) -> tuple[list[str], str]:
-    """Lay every insert over the assembled video, in timeline order.
+    """Lay every layer over the assembled spine, bottom of the stack first.
 
-    Each insert is padded at the front with `tpad` so overlay always has a
-    frame available at the moment it becomes visible; `enable` does the actual
-    switching. Insert audio is dropped — the clip's own soundtrack keeps
-    running underneath, which is what keeps subtitles aligned.
+    `overlay` has no z of its own — it composites one picture onto another, in
+    the order it is applied — so the stack order *is* the order of these
+    filters, and `Composition.stack` is the single place that order is decided.
+
+    Each layer is padded at the front with `tpad` so overlay always has a frame
+    available at the moment it becomes visible; `enable` does the actual
+    switching. Layer audio is dropped: the clip's own soundtrack keeps running
+    underneath, which is what keeps subtitles aligned.
+
+    Where the old code branched on `broll_full` versus `broll_pip`, this reads
+    the layer's frame. The two kinds were a rectangle covering the canvas and a
+    rectangle in the corner, and a rectangle is something you can write down.
     """
     parts: list[str] = []
     current = video_in
     canvas = composition.canvas
-    policy = composition.style.inserts
-    for order, insert in enumerate(sorted(composition.inserts, key=lambda i: i.at_sec)):
-        index = _add_input(inputs, insert.source_path, start=insert.source_start_sec,
-                           duration=insert.duration_sec, still=insert.still)
+    for order, layer in enumerate(composition.stack):
+        index = _add_input(inputs, layer.source_path, start=layer.source_start_sec,
+                           duration=layer.duration_sec, still=layer.still,
+                           paint=layer.paint, canvas=canvas,
+                           box=layer.frame.box(canvas)[2:])
         tag = f"ins{order}"
-        if insert.kind == comp.INSERT_FULL:
-            fit = (
-                f"scale={canvas.width}:{canvas.height}:force_original_aspect_ratio=increase,"
-                f"crop={canvas.width}:{canvas.height}"
-            )
-            position = "0:0"
-        else:
-            box_width = max(2, int(canvas.width * policy.pip_width_share) // 2 * 2)
-            fit = f"scale={box_width}:-2"
-            position = (
-                f"{canvas.width - box_width - policy.pip_margin_px}"
-                f":{int(canvas.height * policy.pip_top_share)}"
-            )
+        fit, position = _layer_geometry(layer.frame, canvas, since=layer.at_sec)
+        veil, head = _veil(layer, canvas, order=order, source=f"[{index}:v]")
+        parts.extend(veil)
         parts.append(
-            f"[{index}:v]fps={canvas.fps},{fit},setpts=PTS-STARTPTS,"
-            f"tpad=start_duration={filters.flt(insert.at_sec)}:start_mode=add:color=black[{tag}]"
+            f"{head}{fit},setpts=PTS-STARTPTS,"
+            f"tpad=start_duration={filters.flt(layer.at_sec)}:start_mode=add:color=black[{tag}]"
         )
         out = f"vins{order}"
         parts.append(
             f"[{current}][{tag}]overlay={position}:eof_action=pass:"
-            f"enable='between(t,{filters.flt(insert.at_sec)},{filters.flt(insert.end_sec)})'[{out}]"
+            f"enable='between(t,{filters.flt(layer.at_sec)},{filters.flt(layer.end_sec)})'[{out}]"
         )
         current = out
     return parts, current
+
+
+def _fitted(fit: str, width: int, height: int) -> str:
+    """How a source meets a box with both dimensions given.
+
+    Four words and four pictures (§4.2), and for a long time two of them were
+    the same picture: `contain` and `none` both compiled to `scale=w:h`, which
+    is the stretch that `fill` means. The editor offers `contain` as "the whole
+    of it, with margins" and got a squashed one instead (trap 63).
+
+    * `cover` scales past the box and crops — no bars, some of the picture lost.
+    * `contain` scales until it fits and pads the rest **transparently**, so
+      what is behind the layer shows through the margins. Opaque padding would
+      draw a black box around the picture, which is a different instruction.
+    * `fill` stretches to the box, which is the one that distorts on purpose.
+    * `none` leaves the source at its own size, centred, cropped if it is
+      bigger than the box and padded if it is smaller. `pad` first because
+      `crop` refuses a window larger than its input.
+    """
+    if fit == "cover":
+        # A box with both dimensions and something that has to fill it: scale
+        # past and crop, rather than stretch a wide source into a tall hole.
+        return (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height}"
+        )
+    if fit == "contain":
+        return (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"format=rgba,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=#00000000"
+        )
+    if fit == "none":
+        return (
+            f"format=rgba,"
+            f"pad=max(iw\\,{width}):max(ih\\,{height}):(ow-iw)/2:(oh-ih)/2"
+            f":color=#00000000,crop={width}:{height}"
+        )
+    return f"scale={width}:{height}"
+
+
+def _veil(
+    layer: comp.Layer, canvas: comp.Canvas, *, order: int, source: str
+) -> tuple[list[str], str]:
+    """Hold part of a layer back, and the start of its chain either way.
+
+    Two constructions, both measured on this build (§7.2) and both of which
+    *multiply* the layer's own alpha rather than replacing it — a sticker with
+    a hole in it has to keep the hole:
+
+    * a constant is `colorchannelmixer=aa=…`, one filter and no second input;
+    * a curve is drawn by `geq` on a mask sixteen pixels square, stretched
+      over the layer by `scale2ref`, multiplied into the alpha the layer
+      already has, and merged back.
+
+    The mask is small because `geq` is priced per pixel of its own input. Over
+    a whole canvas it costs ×23, which is what stage 6 recorded against the
+    property and why opacity did not animate then; over 16×16 and a stretch it
+    costs ×3 (trap 50).
+
+    The curve is shifted onto the layer's own clock for the same reason `fit`
+    is: everything up to `tpad` runs before the layer is moved into place, so
+    its second zero is the layer's first frame and not the clip's.
+    """
+    frame = layer.frame
+    fps = canvas.fps
+    if not frame.sheer:
+        return [], f"{source}fps={fps},"
+    if not frame.fades:
+        held = filters.flt(frame.opacity)
+        return [], f"{source}fps={fps},format=rgba,colorchannelmixer=aa={held},"
+
+    assert frame.motion is not None  # `frame.fades` is what got us here
+    curve = filters.polyline(
+        [
+            (round(at - layer.at_sec, 3), round(255.0 * max(0.0, min(1.0, value)), 3))
+            for at, value in frame.motion.opacity
+        ],
+        clock="T",
+    )
+    mask, own, merged = f"m{order}", f"own{order}", f"veil{order}"
+    return [
+        # No duration on the mask and `shortest` on the merge: the layer
+        # decides how long it is, and a mask cut to a length worked out here
+        # would either run out early or hold the graph open past the end.
+        f"color=c=black:s=16x16:r={fps},format=gray,geq=lum='{curve}'[{mask}]",
+        f"{source}fps={fps},format=rgba,split[{merged}a][{merged}b]",
+        f"[{merged}a]alphaextract[{own}]",
+        f"[{mask}][{own}]scale2ref[{mask}s][{own}s]",
+        f"[{own}s][{mask}s]blend=all_mode=multiply:shortest=1[{merged}]",
+    ], f"[{merged}b][{merged}]alphamerge,"
+
+
+def _layer_geometry(
+    frame: comp.Frame, canvas: comp.Canvas, *, since: float = 0.0
+) -> tuple[str, str]:
+    """How to scale a layer and where to put it, from its frame.
+
+    A frame covering the canvas is scaled up and cropped — there is nothing
+    beside it to position against. Anything smaller keeps its aspect ratio
+    (`-2` lets ffmpeg choose the height, as the picture-in-picture always did)
+    and is placed by its top-left corner, which is the one number `overlay`
+    takes.
+
+    A frame that moves takes a second road, and only then: a composition
+    without animation has to compile to the string it compiled to before
+    animation existed, or every scenario starts paying for a feature it does
+    not use (§4.3).
+    """
+    if frame.fills_canvas:
+        return (
+            f"scale={canvas.width}:{canvas.height}:force_original_aspect_ratio=increase,"
+            f"crop={canvas.width}:{canvas.height}",
+            "0:0",
+        )
+    left, top, width, height = frame.box(canvas)
+    if not height:
+        # No height asked for, so the aspect ratio decides it — `-2` keeps the
+        # dimension even, which yuv420p requires.
+        fit = f"scale={width}:-2"
+    else:
+        fit = _fitted(frame.fit, width, height)
+
+    if not frame.moves:
+        return fit, f"{left}:{top}"
+    return _moving_geometry(
+        frame, canvas, fit=fit, width=width, height=height, left=left, top=top,
+        since=since,
+    )
+
+
+def _moving_geometry(
+    frame: comp.Frame,
+    canvas: comp.Canvas,
+    *,
+    fit: str,
+    width: int,
+    height: int,
+    left: int,
+    top: int,
+    since: float = 0.0,
+) -> tuple[str, str]:
+    """The chain and the position for a frame that moves.
+
+    Two clocks, and the difference between them is `since`. `overlay` runs
+    after the layer has been padded into place, so its `t` is the clip's;
+    `scale` and `rotate` run before that, where the layer's own first frame is
+    zero. A curve is written against the clip (§4.3), so the chain gets it
+    shifted and `overlay` gets it as it stands. Before this was noticed, a
+    layer that started at 0:03 grew three seconds early (trap 51).
+
+    Three constructions, each one measured on this build rather than read out
+    of the documentation (§7.2):
+
+    * `scale=w='…t…':eval=frame` resizes on every frame. `eval` defaults to
+      `init`, which is the whole difference between a layer that grows and a
+      layer that is simply the wrong size.
+    * `rotate=a='…t…'` turns it — but `ow`/`oh` are evaluated once, at a point
+      where `t` does not exist yet, so the box is cut for the widest angle the
+      curve reaches and the picture turns inside it.
+    * `overlay=x='…':y='…'` places it, and where the box changes size it is
+      placed by `w`/`h` — the layer's *current* dimensions — rather than by
+      numbers worked out in advance, which would be the size it used to be.
+    """
+    motion = frame.motion
+    assert motion is not None  # `frame.moves` is what got us here
+
+    chain = [fit]
+    if motion.width or motion.height:
+        chain = [_moving_scale(motion, canvas, width=width, height=height, since=since)]
+    if motion.rotate:
+        chain.append(_moving_rotate(motion, since=since))
+
+    return ",".join(chain), _moving_position(
+        motion, canvas, width=width, height=height, left=left, top=top,
+        sized_at_runtime=motion.resizes,
+    )
+
+
+def _moving_scale(
+    motion: comp.Motion, canvas: comp.Canvas, *, width: int, height: int,
+    since: float = 0.0,
+) -> str:
+    """`scale` with an expression per side, for the sides that move."""
+    across = (
+        filters.polyline([
+            (round(at - since, 3), round(canvas.width * value / 100.0, 3))
+            for at, value in motion.width
+        ])
+        if motion.width else str(width)
+    )
+    down = (
+        filters.polyline([
+            (round(at - since, 3), round(canvas.height * value / 100.0, 3))
+            for at, value in motion.height
+        ])
+        if motion.height
+        # A layer that left its height to the aspect ratio keeps doing so
+        # while it grows: `-2` is not a size, it is "work it out and keep it
+        # even".
+        else (str(height) if height else "-2")
+    )
+    return f"scale=w='{across}':h='{down}':eval=frame"
+
+
+def _moving_rotate(motion: comp.Motion, *, since: float = 0.0) -> str:
+    """`rotate` with an angle that moves, in a box cut for the widest one.
+
+    Degrees on the way in, because that is what somebody types; radians on the
+    way out, because that is what ffmpeg reads.
+    """
+    radians = filters.polyline([
+        (round(at - since, 3), round(value * math.pi / 180.0, 6))
+        for at, value in motion.rotate
+    ])
+    widest = round(max(abs(value) for _, value in motion.rotate) * math.pi / 180.0, 6)
+    # `format=rgba` first: the corners the turn leaves empty have to be
+    # transparent, or the layer arrives as a black diamond.
+    return (
+        f"format=rgba,rotate=a='{radians}'"
+        f":ow=rotw({filters.flt(widest)}):oh=roth({filters.flt(widest)}):c=none"
+    )
+
+
+def _moving_position(
+    motion: comp.Motion,
+    canvas: comp.Canvas,
+    *,
+    width: int,
+    height: int,
+    left: int,
+    top: int,
+    sized_at_runtime: bool,
+) -> str:
+    """`overlay`'s x and y as expressions in `t`.
+
+    The curve is in per cent of the canvas, because that is what survives a
+    change of canvas; `overlay` wants pixels of the top-left corner. Where the
+    box keeps its size that conversion is arithmetic done here, once; where it
+    does not, it is written as an expression over `w`/`h` and ffmpeg does it
+    per frame.
+    """
+    def horizontal(value: float) -> float:
+        return round(canvas.width * value / 100.0 - width / 2.0, 3)
+
+    def vertical(value: float) -> float:
+        # The same asymmetry `box` has: a layer whose height follows from its
+        # width is positioned by the number itself, because there is no height
+        # to take half of yet.
+        return round(
+            canvas.height * value / 100.0 - (height / 2.0 if height else 0.0), 3
+        )
+
+    if not sized_at_runtime:
+        x = (
+            filters.polyline([(at, horizontal(value)) for at, value in motion.x])
+            if motion.x else str(left)
+        )
+        y = (
+            filters.polyline([(at, vertical(value)) for at, value in motion.y])
+            if motion.y else str(top)
+        )
+        return f"x='{x}':y='{y}'"
+
+    centre_x = (
+        filters.polyline([(at, value) for at, value in motion.x])
+        if motion.x else filters.flt(100.0 * (left + width / 2.0) / canvas.width)
+    )
+    # Whether `y` is the middle of the box or its top edge — the asymmetry
+    # `box` has, kept rather than quietly fixed while something else is being
+    # added. A height that moves is a height, so it centres.
+    centred = bool(height) or bool(motion.height)
+    centre_y = (
+        filters.polyline([(at, value) for at, value in motion.y])
+        if motion.y
+        else filters.flt(
+            100.0 * (top + (height / 2.0 if height and centred else 0.0)) / canvas.height
+        )
+    )
+    return (
+        f"x='({centre_x})*{canvas.width}/100-w/2'"
+        f":y='({centre_y})*{canvas.height}/100{'-h/2' if centred else ''}'"
+    )
 
 
 def _look_chain(
@@ -767,32 +1058,38 @@ def _audio_chains(
     voice = audio_in
     extra: list[str] = []
 
-    if composition.music is not None:
-        music = composition.music
-        # The voice is needed twice: once in the mix, once as the trigger that
-        # tells the compressor when to pull the music down.
-        parts.append(f"[{voice}]asplit=2[voicemix][voicekey]")
-        voice = "voicemix"
+    for order, bed in enumerate(composition.beds):
+        label = "bed" if order == 0 else f"bed{order}"
         index = _add_input(
-            inputs, music.source_path,
-            start=music.start_sec, duration=duration, loop=True,
+            inputs, bed.source_path,
+            start=bed.source_start_sec, duration=duration, loop=True,
         )
-        fade_out_start = max(0.0, duration - music.fade_out_sec)
+        fade_out_start = max(0.0, duration - bed.fade_out_sec)
         parts.append(
-            f"[{index}:a]{_conform()},volume={music.gain_db:.2f}dB,"
-            f"afade=t=in:st=0:d={filters.flt(music.fade_in_sec)},"
-            f"afade=t=out:st={filters.flt(fade_out_start)}:d={filters.flt(music.fade_out_sec)}"
-            "[bed]"
+            f"[{index}:a]{_conform()},volume={bed.gain_db:.2f}dB,"
+            f"afade=t=in:st=0:d={filters.flt(bed.fade_in_sec)},"
+            f"afade=t=out:st={filters.flt(fade_out_start)}:d={filters.flt(bed.fade_out_sec)}"
+            f"[{label}]"
         )
+        if not bed.ducks:
+            extra.append(label)
+            continue
+        # The voice is needed twice: once in the mix, once as the trigger that
+        # tells the compressor when to pull the bed down. Split once, however
+        # many beds ask to be ducked.
+        if voice == audio_in:
+            parts.append(f"[{voice}]asplit=2[voicemix][voicekey]")
+            voice = "voicemix"
+        ducked = "ducked" if order == 0 else f"ducked{order}"
         parts.append(
-            f"[bed][voicekey]sidechaincompress="
-            f"threshold={music.duck_threshold:.4f}:ratio={music.duck_ratio:.2f}:"
-            f"attack={music.duck_attack_ms:.2f}:release={music.duck_release_ms:.2f}:"
-            "makeup=1[ducked]"
+            f"[{label}][voicekey]sidechaincompress="
+            f"threshold={bed.duck_threshold:.4f}:ratio={bed.duck_ratio:.2f}:"
+            f"attack={bed.duck_attack_ms:.2f}:release={bed.duck_release_ms:.2f}:"
+            f"makeup=1[{ducked}]"
         )
-        extra.append("ducked")
+        extra.append(ducked)
 
-    for order, effect in enumerate(sorted(composition.effects, key=lambda e: e.at_sec)):
+    for order, effect in enumerate(sorted(composition.stingers, key=lambda e: e.at_sec)):
         index = _add_input(inputs, effect.source_path, start=0.0, duration=effect.duration_sec)
         label = f"sfx{order}"
         delay_ms = int(round(effect.at_sec * 1000))
@@ -856,11 +1153,9 @@ def fragment_path(
         for part in (
             comp.VERSION,
             canvas.width, canvas.height, canvas.fps,
-            segment.layout,
+            segment.frame, segment.backdrop,
             _source_identity(segment.source_path),
             f"{segment.source_start_sec:.3f}", f"{segment.source_end_sec:.3f}",
-            _source_identity(segment.companion_path) if segment.companion_path else "",
-            f"{segment.companion_start_sec:.3f}",
             frame.zoom, frame.blur_divisor, frame.blur_radius,
             settings.fragment_encoder, settings.fragment_crf,
         )
@@ -888,7 +1183,7 @@ def _cached_share(composition: comp.Composition) -> float:
         return 0.0
     cached = sum(
         segment.duration_sec
-        for segment in composition.segments
+        for segment in composition.spine
         if os.path.exists(
             fragment_path(composition.canvas, segment, framing=composition.style.framing)
         )
@@ -922,8 +1217,16 @@ def _add_input(
     duration: float,
     still: bool = False,
     loop: bool = False,
+    paint: comp.Paint | None = None,
+    canvas: comp.Canvas | None = None,
+    box: tuple[int, int] | None = None,
 ) -> int:
     """Append a seeked input and return its index.
+
+    A painted layer has no file to seek into: it is a `lavfi` source the
+    renderer synthesises — a flat colour, or words drawn on a transparent
+    ground. It still becomes an input like any other, so everything after this
+    point treats it as one (§7.3, trap 59).
 
     Seeking at the input rather than trimming in the graph is the whole reason
     a montage spread across a long source is affordable: the decoder only
@@ -938,6 +1241,12 @@ def _add_input(
     """
     index = sum(1 for item in inputs if item == "-i")
     length = filters.flt(max(0.01, duration))
+    if paint is not None:
+        inputs.extend([
+            "-f", "lavfi", "-t", length,
+            "-i", filters.painted(paint, canvas, box),
+        ])
+        return index
     if still:
         inputs.extend(["-loop", "1", "-t", length, "-i", path])
         return index

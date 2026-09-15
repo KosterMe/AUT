@@ -11,6 +11,7 @@ import pytest
 from sqlmodel import select
 
 from app.core.clock import aware_utc_now, utc_now
+from app.core.jsonutil import dumps
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.db.enums import ClipStatus, JobStatus, PublicationStatus, TaskStatus
 from app.db.models import Account, Clip, ClipJob, Publication, Task
@@ -730,7 +731,18 @@ class TestStyleResolution:
             db, source_ref="https://youtu.be/abc", start_immediately=False, **kwargs
         )
 
-    def test_starting_a_job_freezes_its_style_into_the_payload(self, db):
+    def test_starting_a_job_freezes_its_style_onto_the_job(self, db):
+        job = self._job(db)
+        clip_jobs.start(db, job.id)
+        db.commit()
+
+        style = clip_jobs.montage_options(job)["style"]
+        assert style["delivery"]["width"] == 1080
+        assert style["pacing"]["remove_silence"] is True  # the talking profile
+
+    def test_the_download_task_carries_no_montage_options_at_all(self, db):
+        """Cutting has no opinion about how the clips are dressed, so it is not
+        handed them — it used to carry them to every render as a courier."""
         job = self._job(db)
         clip_jobs.start(db, job.id)
         db.commit()
@@ -739,9 +751,8 @@ class TestStyleResolution:
             db.exec(select(Task).where(Task.kind == "download")).one()
         )
 
-        style = payload["render"]["style"]
-        assert style["delivery"]["width"] == 1080
-        assert style["pacing"]["remove_silence"] is True  # the talking profile
+        assert "render" not in payload
+        assert payload["cutter"] == "speech"
 
     def test_a_preset_beats_the_profile_in_the_frozen_style(self, db):
         preset = styles.create(
@@ -751,11 +762,9 @@ class TestStyleResolution:
         clip_jobs.start(db, job.id)
         db.commit()
 
-        payload = queue.payload_of(
-            db.exec(select(Task).where(Task.kind == "download")).one()
+        assert (
+            clip_jobs.montage_options(job)["style"]["pacing"]["remove_silence"] is False
         )
-
-        assert payload["render"]["style"]["pacing"]["remove_silence"] is False
 
     def test_editing_a_preset_does_not_reach_a_job_already_running(self, db):
         preset = styles.create(db, name="House", data={"subtitles": {"font_size": 100}})
@@ -766,10 +775,8 @@ class TestStyleResolution:
         styles.update(db, preset.id, data={"subtitles": {"font_size": 40}})
         db.commit()
 
-        payload = queue.payload_of(
-            db.exec(select(Task).where(Task.kind == "download")).one()
-        )
-        assert payload["render"]["style"]["subtitles"]["font_size"] == 100
+        frozen = clip_jobs.montage_options(job)["style"]
+        assert frozen["subtitles"]["font_size"] == 100
 
 
 class TestClipRerender:
@@ -778,10 +785,7 @@ class TestClipRerender:
         job.original_path = "/media/source.mp4"
         db.add(job)
         db.flush()
-        created = clips.plan(
-            db, job.id, [SliceSpec(1, 0.0, 60.0, "headline", "words", 3)],
-            render_options={"source_path": "/media/source.mp4", "source_title": "Source"},
-        )
+        created = clips.plan(db, job.id, [SliceSpec(1, 0.0, 60.0, "headline", "words", 3)])
         clip = created[0]
         clips.mark_ready(
             db, clip.id, video_path="/media/clip.mp4", cover_path=None,
@@ -801,9 +805,11 @@ class TestClipRerender:
             select(Task).where(Task.kind == "render").order_by(Task.id.desc())
         ).first()
         payload = queue.payload_of(task)
-        assert payload["render"]["source_path"] == "/media/source.mp4"
         assert payload["render"]["style"] == {"subtitles": {"font_size": 96}}
         assert clip.start_sec == 0.0 and clip.end_sec == 60.0
+        # The source is not among the options any more: it is the job's, and a
+        # re-render reads it there rather than being handed a copy.
+        assert db.get(ClipJob, clip.job_id).original_path == "/media/source.mp4"
 
     def test_a_rerender_is_not_deduplicated_against_the_render_it_repeats(self, db):
         """The plan-time dedupe key would swallow it and nothing would happen."""
@@ -828,3 +834,40 @@ class TestClipRerender:
         clip = self._rendered_clip(db)
 
         assert clips.composition_of(db, clip.id) == {"segments": [], "style": {}}
+
+    def test_the_job_is_where_a_rerender_reads_the_look_from(self, db):
+        clip = self._rendered_clip(db)
+        job = db.get(ClipJob, clip.job_id)
+        job.render_options_json = dumps({"inserts": False})
+        db.add(job)
+        db.commit()
+
+        assert clips.render_options_of(db, clip) == {"inserts": False}
+
+    def test_options_left_on_an_older_render_task_are_still_found(self, db):
+        """A clip planned before the job kept its own has them in its task and
+        nowhere else. A re-render that found nothing there would queue a render
+        with no idea what the clip is supposed to look like."""
+        clip = self._rendered_clip(db)
+        task = db.get(Task, clip.task_id)
+        task.payload_json = dumps({
+            "clip_id": clip.id, "job_id": clip.job_id,
+            "render": {"source_path": "/media/source.mp4", "inserts": False},
+        })
+        db.add(task)
+        db.commit()
+
+        assert clips.render_options_of(db, clip) == {
+            "source_path": "/media/source.mp4", "inserts": False,
+        }
+
+    def test_the_job_wins_over_an_older_task_once_it_has_its_own(self, db):
+        clip = self._rendered_clip(db)
+        job = db.get(ClipJob, clip.job_id)
+        job.render_options_json = dumps({"inserts": True})
+        task = db.get(Task, clip.task_id)
+        task.payload_json = dumps({"render": {"inserts": False}})
+        db.add_all([job, task])
+        db.commit()
+
+        assert clips.render_options_of(db, clip) == {"inserts": True}

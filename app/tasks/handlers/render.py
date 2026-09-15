@@ -14,15 +14,15 @@ from __future__ import annotations
 import logging
 import os
 
-from app.adapters.media import compiler
 from app.adapters.media import ffmpeg as media
+from montage import client as montage
 from app.core.errors import PermanentError
 from app.db.enums import TaskKind
 from app.domain import captions as caption_builder
-from app.domain import composition as comp
+from montage import composition as comp
 from app.domain import profiles
-from app.domain import style as style_module
-from app.services import assets, clip_jobs, clips, rendering
+from montage import style as style_module
+from app.services import assets, clip_jobs, clips, rendering, scenarios
 from app.tasks.context import TaskContext
 from app.tasks.registry import register_handler
 
@@ -47,11 +47,13 @@ def _on_failure(ctx: TaskContext, message: str, final: bool) -> None:
 @register_handler(TaskKind.RENDER, on_failure=_on_failure)
 def handle_render(ctx: TaskContext) -> dict:
     clip_id = ctx.require_int("clip_id")
-    options = dict(ctx.get("render") or {})
 
     with ctx.db() as session:
         clip = clips.get(session, clip_id)
         job = clip_jobs.get(session, clip.job_id)
+        # From the job, not from this task: cutting no longer forwards them,
+        # and a re-render queued days later reads the same thing this one does.
+        options = _montage_options(ctx, job)
         # Resolved inside the session because a preset lives in the database,
         # and resolved once because everything below reads from it.
         style = style_for(job, options)
@@ -65,6 +67,10 @@ def handle_render(ctx: TaskContext) -> dict:
             source_path=options.get("source_path") or job.original_path or "",
             source_title=options.get("source_title") or job.display_title,
             thumbnail_path=options.get("thumbnail_path") or job.thumbnail_path,
+            # Read here rather than downstream because a stored scenario is a
+            # row: resolving it needs the session, and the session is gone by
+            # the time the clip is composed.
+            scenario=scenarios.for_job(session, job, style),
         )
         library = rendering.library_for(session, style=style, seed=clip_id)
         clips.mark_rendering(session, clip_id)
@@ -90,12 +96,13 @@ def handle_render(ctx: TaskContext) -> dict:
 
     plan = rendering.compose_clip(
         clip=spec, job=spec, options=options, style=style,
+        scenario=spec.scenario,
         library=library, seed=clip_id, on_progress=ctx.progress,
     )
     composition = plan.composition
 
     ctx.progress("rendering_video", 0.25)
-    result = compiler.render(
+    result = montage.render(
         composition,
         output_path,
         strategy=options.get("strategy"),
@@ -103,9 +110,9 @@ def handle_render(ctx: TaskContext) -> dict:
     )
 
     ctx.progress("rendering_cover", 0.85)
-    cover_path = media.render_clip_cover(
+    cover_path = montage.cover(
         source_path=spec.source_path,
-        output_path=media.cover_path_for(result.output_path),
+        output_path=montage.cover_path_for(result.output_path),
         start_sec=spec.start_sec,
         title_text=caption_builder.display_title(spec.source_title, spec.title),
         part_text=f"часть {spec.index}",
@@ -132,10 +139,9 @@ def handle_render(ctx: TaskContext) -> dict:
         "cover_path": cover_path,
         "output_duration": result.output_duration,
         "strategy": result.strategy,
-        "insert_count": len(composition.inserts),
-        "effect_count": len(composition.effects),
-        "music": composition.music.source_path if composition.music else None,
-        "layout": sorted(composition.layouts),
+        "layer_count": len(composition.layers),
+        "effect_count": len(composition.stingers),
+        "music": composition.beds[0].source_path if composition.beds else None,
         "segment_count": result.segment_count,
         "fragments_reused": result.fragments_reused,
         "subtitle_count": result.subtitle_count,
@@ -143,6 +149,26 @@ def handle_render(ctx: TaskContext) -> dict:
         "silence_removed_seconds": result.silence_removed_seconds,
         "qa": result.qa,
     }
+
+
+def _montage_options(ctx: TaskContext, job) -> dict:
+    """How this clip is dressed: the job's options, with this task's on top.
+
+    Three kinds of task arrive here and the same merge serves all of them. One
+    queued by planning carries no options at all and takes the job's. A
+    re-render carries the one thing the caller changed, and it wins over the
+    job without discarding the rest of it. A task queued by a worker from
+    before the job kept its own options carries the lot, and the job has
+    nothing to contribute — so the payload is what is left standing.
+
+    The transcript settings go underneath as a default: they are a fact about
+    the source rather than an option, and they arrived through the payload
+    before only because the cutting stage was the one putting them there.
+    """
+    options = dict(clip_jobs.montage_options(job))
+    options.update(ctx.get("render") or {})
+    options.setdefault("transcript_settings", clip_jobs.transcript_settings(job))
+    return options
 
 
 def style_for(job, options: dict) -> style_module.StyleSpec:
@@ -196,7 +222,7 @@ class _RenderSpec:
 
     __slots__ = (
         "clip_id", "index", "start_sec", "end_sec", "title", "text",
-        "source_path", "source_title", "thumbnail_path",
+        "source_path", "source_title", "thumbnail_path", "scenario",
     )
 
     def __init__(self, **fields):

@@ -16,6 +16,7 @@ import pytest
 from sqlmodel import Session
 
 from app.core.config import get_settings
+from montage.config import get_settings as get_montage_settings
 from app.db import session as db_session
 
 # Every prefix the application reads configuration from. Anything matching is
@@ -47,13 +48,19 @@ def isolated_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Ite
     # Cleared, not populated: a test that sets its own env vars before touching
     # settings must see them. Building the Settings object here would cache it
     # first and silently ignore whatever the test configured.
+    #
+    # Both of them: AUT and the montage service read the same environment into
+    # two caches of their own, and clearing one leaves the other answering with
+    # whatever the previous test configured.
     get_settings.cache_clear()
+    get_montage_settings.cache_clear()
     db_session.set_engine(None)
 
     yield
 
     db_session.set_engine(None)
     get_settings.cache_clear()
+    get_montage_settings.cache_clear()
 
 
 @pytest.fixture()
@@ -74,12 +81,15 @@ def configure(monkeypatch: pytest.MonkeyPatch):
     """Set configuration env vars and rebuild the cached Settings.
 
     Settings are cached per process, so changing the environment without this
-    has no effect once anything has read them.
+    has no effect once anything has read them. Both caches: AUT and the montage
+    service read the same `AUTOCLIPS_*` variables into separate Settings of
+    their own, and rebuilding one leaves the other answering from before.
     """
 
     def apply(**env: object) -> None:
         for key, value in env.items():
             monkeypatch.setenv(key, str(value))
         get_settings.cache_clear()
+        get_montage_settings.cache_clear()
 
     return apply

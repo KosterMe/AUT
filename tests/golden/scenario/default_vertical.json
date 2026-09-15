@@ -1,0 +1,183 @@
+{
+  "audio": [],
+  "canvas": {
+    "fps": 30,
+    "height": 1920,
+    "width": 1080
+  },
+  "layers": [],
+  "spine": [
+    {
+      "backdrop": false,
+      "frame": {
+        "fit": "cover",
+        "height": 100.0,
+        "motion": null,
+        "opacity": 1.0,
+        "rotate": 0.0,
+        "width": 100.0,
+        "x": 50.0,
+        "y": 50.0
+      },
+      "source_end_sec": 40.0,
+      "source_path": "/media/source.mp4",
+      "source_start_sec": 10.0
+    },
+    {
+      "backdrop": false,
+      "frame": {
+        "fit": "cover",
+        "height": 100.0,
+        "motion": null,
+        "opacity": 1.0,
+        "rotate": 0.0,
+        "width": 100.0,
+        "x": 50.0,
+        "y": 50.0
+      },
+      "source_end_sec": 70.0,
+      "source_path": "/media/source.mp4",
+      "source_start_sec": 42.0
+    },
+    {
+      "backdrop": false,
+      "frame": {
+        "fit": "cover",
+        "height": 100.0,
+        "motion": null,
+        "opacity": 1.0,
+        "rotate": 0.0,
+        "width": 100.0,
+        "x": 50.0,
+        "y": 50.0
+      },
+      "source_end_sec": 100.0,
+      "source_path": "/media/source.mp4",
+      "source_start_sec": 72.0
+    }
+  ],
+  "style": {
+    "audio": {
+      "duck_attack_ms": 20.0,
+      "duck_ratio": 8.0,
+      "duck_release_ms": 300.0,
+      "duck_threshold": 0.03,
+      "effect_gain_db": -8.0,
+      "effect_lead_seconds": 0.12,
+      "effect_min_gap_seconds": 4.0,
+      "effect_seconds": 1.0,
+      "effects_on_cuts": true,
+      "effects_on_inserts": true,
+      "enabled": true,
+      "max_effects": 6,
+      "music": false,
+      "music_fade_in_sec": 0.6,
+      "music_fade_out_sec": 1.2,
+      "music_gain_db": -20.0,
+      "sfx": false
+    },
+    "delivery": {
+      "crf": 23,
+      "fps": 30,
+      "height": 1920,
+      "strategy": "",
+      "width": 1080
+    },
+    "framing": {
+      "blur_divisor": 4,
+      "blur_radius": 24.0,
+      "companion_tag": "background",
+      "fill_tolerance": 0.15,
+      "layout": "auto",
+      "zoom": 1.2
+    },
+    "grade": {
+      "contrast": 1.04,
+      "saturation": 1.08,
+      "sharpen": true,
+      "sharpen_chroma": 0.25,
+      "sharpen_luma": 0.55
+    },
+    "inserts": {
+      "cadence_seconds": 12.0,
+      "cadence_when_no_match": false,
+      "enabled": true,
+      "hook_guard_seconds": 2.5,
+      "kind": "broll_full",
+      "max_inserts": 4,
+      "max_seconds": 3.5,
+      "max_share": 0.35,
+      "min_gap_seconds": 6.0,
+      "min_seconds": 1.5,
+      "pip_margin_px": 48,
+      "pip_top_share": 0.094,
+      "pip_width_share": 0.46,
+      "tail_guard_seconds": 1.5
+    },
+    "pacing": {
+      "max_segments": 24,
+      "min_kept_share": 0.55,
+      "min_removed_seconds": 0.8,
+      "min_segment_seconds": 1.2,
+      "min_silence_seconds": 0.55,
+      "noise_db": -35.0,
+      "padding_seconds": 0.12,
+      "remove_silence": true
+    },
+    "subtitles": {
+      "animate": true,
+      "colour": "#FFFFFF",
+      "enabled": true,
+      "end_hold_seconds": 0.35,
+      "font": "Oswald",
+      "font_size": 82,
+      "hold_seconds": 0.15,
+      "max_line_chars": 24,
+      "outline_colour": "#000000",
+      "outline_ratio": 0.12,
+      "position_percent": 76,
+      "shadow_opacity": 0.52,
+      "shadow_ratio": 0.015,
+      "strip_punctuation": true,
+      "time_offset_seconds": 0.0,
+      "uppercase": false
+    },
+    "version": 1
+  },
+  "subtitles": {
+    "cues": [
+      {
+        "end_sec": 3.0,
+        "start_sec": 2.0,
+        "text": "смотрите"
+      },
+      {
+        "end_sec": 3.5,
+        "start_sec": 3.0,
+        "text": "на"
+      },
+      {
+        "end_sec": 5.15,
+        "start_sec": 3.5,
+        "text": "машину"
+      },
+      {
+        "end_sec": 38.5,
+        "start_sec": 38.0,
+        "text": "и"
+      },
+      {
+        "end_sec": 39.0,
+        "start_sec": 38.5,
+        "text": "на"
+      },
+      {
+        "end_sec": 41.35,
+        "start_sec": 39.0,
+        "text": "дорогу"
+      }
+    ],
+    "title_text": "Заголовок клипа"
+  },
+  "version": 3
+}

@@ -1,14 +1,16 @@
-"""Deciding what one clip contains, for whoever is about to render it.
+"""AUT's half of composing a clip: the words, the headline, the library.
 
 Two callers need exactly the same answer: the render handler, which turns it
 into a file, and the preview endpoint, which turns four seconds of it into
-something to look at. Before this they would have had to agree by copying, and
-a preview that composes a clip even slightly differently from the render is
-worse than no preview — it is a preview of something else.
+something to look at. A preview that composes a clip even slightly differently
+from the render is worse than no preview — it is a preview of something else —
+so the sequence lives here once.
 
-So the sequence lives here once: pick the transcript for the subtitles, plan
-the montage, then lay b-roll, music and effects over it. It ends where ffmpeg
-begins.
+What is left here after the montage service moved out is the part that is
+AUT's by rights: picking the transcript (ASR belongs to the cutter that needs
+it), composing the headline (it has to agree with the caption the clip is
+published under), and reading the library. Those three become facts, and
+`montage.client` takes them from there.
 
 The database is read in one short call at the front (`library_for`) and never
 touched again. Composing a clip can mean transcribing it, which is minutes on
@@ -19,32 +21,32 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from typing import Any, Callable
 
 from sqlmodel import Session
 
+from app.adapters.media import ffmpeg as media_paths
 from app.adapters.asr import cache as transcript_cache
 from app.adapters.asr import selection
-from app.adapters.media import compiler
-from app.domain import audio as audio_planner
 from app.domain import captions as caption_builder
-from app.domain import composition as comp
-from app.domain import inserts as insert_planner
-from app.domain import style as style_module
-from app.services import assets
+from app.domain import profiles
+from app.core.errors import ValidationError
+from app.services import assets, clips as clip_store
+from montage import client as montage
+from montage import composition as comp
+from montage import scenario as sc
+from montage import style as style_module
+from montage.rules import inserts as insert_planner
 
 log = logging.getLogger(__name__)
 
 Progress = Callable[[str, float], None]
 
 
-@dataclasses.dataclass(frozen=True)
-class Library:
-    """What the b-roll library offers this clip, read in one go."""
-
-    options: list[insert_planner.AssetOption] = dataclasses.field(default_factory=list)
-    # Only for a split screen: the video that fills the bottom half.
-    companion_path: str | None = None
+# The shape the montage service takes its library in. Aliased rather than
+# restated, so there is one definition of what a clip is offered.
+Library = montage.Library
 
 
 @dataclasses.dataclass(frozen=True)
@@ -83,6 +85,8 @@ def compose_clip(
     job,
     options: dict[str, Any],
     style: style_module.StyleSpec,
+    scenario: sc.Scenario | None = None,
+    scenario_name: str = profiles.DEFAULT,
     library: Library | None = None,
     seed: int | None = None,
     allow_transcription: bool = True,
@@ -99,16 +103,30 @@ def compose_clip(
     shelf = library or Library()
     clip_seed = seed if seed is not None else int(clip.id or 0)
 
-    _report(on_progress, "preparing_subtitles", 0.1)
-    subtitle_segments, subtitle_meta = selection.select_subtitle_transcript(
-        source_path,
-        fallback_segments=cached_segments(source_path, options.get("transcript_settings")),
-        start_sec=clip.start_sec,
-        end_sec=clip.end_sec,
-        enabled=style.subtitles.enabled,
-        job_transcript_model=options.get("transcript_settings"),
-        allow_transcription=allow_transcription,
-    )
+    # Resolved by the caller when the job names one of its own, because that
+    # takes a database session and this function outlives it — composing a
+    # clip can mean transcribing it.
+    if scenario is None:
+        scenario = montage.scenario_for(scenario_name, style)
+
+    # Asked before the words are fetched, not after. A montage with no
+    # subtitles and no keyword b-roll has no use for a transcript, and finding
+    # that out first is what stops a `film` job sending every one of its clips
+    # through Whisper — the slowest thing in the pipeline, for an answer
+    # nothing reads.
+    subtitle_segments: list = []
+    subtitle_meta: dict[str, Any] = {"source": "not_needed"}
+    if montage.wants_transcript(scenario):
+        _report(on_progress, "preparing_subtitles", 0.1)
+        subtitle_segments, subtitle_meta = selection.select_subtitle_transcript(
+            source_path,
+            fallback_segments=cached_segments(source_path, options.get("transcript_settings")),
+            start_sec=clip.start_sec,
+            end_sec=clip.end_sec,
+            enabled=style.subtitles.enabled,
+            job_transcript_model=options.get("transcript_settings"),
+            allow_transcription=allow_transcription,
+        )
 
     # The burned-in headline mirrors the caption's first line, so what a viewer
     # reads on the video and in the description agree.
@@ -119,92 +137,32 @@ def compose_clip(
     )
 
     _report(on_progress, "planning_montage", 0.2)
-    composition = compiler.plan_vertical_clip(
-        source_path,
+    plan = montage.compose(montage.ClipRequest(
+        scenario=scenario,
+        source_path=source_path,
         start_sec=clip.start_sec,
         end_sec=clip.end_sec,
         style=style,
-        companion_path=shelf.companion_path,
-        transcript_segments=subtitle_segments,
-        fallback_subtitle_text=clip.text or "",
+        speech=tuple(subtitle_segments),
+        fallback_text=clip.text or "",
         title_text=headline,
-    )
-    composition = dress(
-        composition,
-        shelf.options,
+        library=shelf,
         seed=clip_seed,
-        broll=style.inserts.enabled,
-        music=style.audio.music and style.audio.enabled,
-        sfx=style.audio.sfx and style.audio.enabled,
-    )
+        index=clip.index,
+    ))
 
     return ClipPlan(
-        composition=composition,
+        composition=plan.composition,
         headline=headline,
         subtitle_source=str(subtitle_meta.get("source") or ""),
         companion_path=shelf.companion_path,
     )
 
 
-def dress(
-    composition: comp.Composition,
-    library: list[insert_planner.AssetOption],
-    *,
-    seed: int,
-    broll: bool,
-    music: bool,
-    sfx: bool,
-) -> comp.Composition:
-    """Lay b-roll, a music bed and transition sounds over a planned clip.
-
-    All three read the same library and are seeded by the clip rather than by
-    chance, so re-rendering produces the same edit — otherwise the fragment
-    cache would be inspecting a composition it had never seen before every
-    single time.
-    """
-    if not library or not (broll or music or sfx):
-        return composition
-
-    changes: dict = {}
-    if broll:
-        chosen = insert_planner.choose_inserts(
-            composition, assets=library, policy=composition.style.inserts, seed=seed
-        )
-        if chosen:
-            changes["inserts"] = chosen
-
-    if music or sfx:
-        policy = composition.style.audio
-        # B-roll first, deliberately: an insert appearing is one of the moments
-        # a transition sound belongs on, and it does not exist until now.
-        staged = dataclasses.replace(composition, **changes) if changes else composition
-        if music:
-            bed = audio_planner.choose_music(staged, assets=library, policy=policy, seed=seed)
-            if bed is not None:
-                changes["music"] = bed
-        if sfx:
-            effects = audio_planner.choose_effects(
-                staged, assets=library, policy=policy, seed=seed
-            )
-            if effects:
-                changes["effects"] = effects
-
-    if not changes:
-        return composition
-    log.info(
-        "clip %s takes %d insert(s), %d effect(s) and %s music from a library of %d",
-        seed, len(changes.get("inserts", ())), len(changes.get("effects", ())),
-        "a" if changes.get("music") else "no", len(library),
-    )
-    return dataclasses.replace(composition, **changes)
-
-
 def library_paths(composition: comp.Composition, companion_path: str | None) -> list[str]:
     """Every library file this clip actually used, for the rotation counter."""
-    paths = [insert.source_path for insert in composition.inserts]
-    paths.extend(effect.source_path for effect in composition.effects)
-    if composition.music is not None:
-        paths.append(composition.music.source_path)
+    paths = [layer.source_path for layer in composition.layers]
+    paths.extend(track.source_path for track in composition.audio)
     if companion_path:
         paths.append(companion_path)
     return paths
@@ -222,3 +180,62 @@ def cached_segments(source_path: str, transcript_settings: Any) -> list[dict]:
 def _report(on_progress: Progress | None, stage: str, fraction: float) -> None:
     if on_progress is not None:
         on_progress(stage, fraction)
+
+
+def preview(
+    session: Session,
+    clip,
+    job,
+    *,
+    style: style_module.StyleSpec,
+    scenario: sc.Scenario | None = None,
+    at_sec: float = 0.0,
+    duration_sec: float = 4.0,
+    scale: float = 0.5,
+) -> str:
+    """A few seconds of this clip, rendered small, as a file on disk.
+
+    Composed by exactly the same code the real render uses, so what comes back
+    is the clip rather than an approximation of it — only shorter and smaller.
+    The one difference is that it will not start a transcription: a preview
+    waits on nothing, and a window whose words are not on disk yet gets the
+    job's transcript instead.
+
+    Two callers want this: previewing a clip in a style, and previewing a
+    scenario on a clip. They differ by one argument, and writing it twice is
+    how the second one quietly stops being the thing the first one renders.
+    """
+    options = clip_store.render_options_of(session, clip)
+    source_path = options.get("source_path") or job.original_path or ""
+    if not source_path or not os.path.isfile(source_path):
+        raise ValidationError(
+            "the source video is not on disk, so there is nothing to preview. "
+            "Re-run the job to download it again."
+        )
+
+    seed = int(clip.id or 0)
+    plan = compose_clip(
+        clip=clip, job=job, options=options, style=style, scenario=scenario,
+        library=library_for(session, style=style, seed=seed),
+        seed=seed, allow_transcription=False,
+    )
+
+    # Clamped rather than refused: the montage is shorter than the clip
+    # whenever silence was removed, so a slider positioned against the source
+    # can legitimately point past the end of what was rendered.
+    length = plan.composition.duration_sec
+    start = max(0.0, min(at_sec, max(0.0, length - duration_sec)))
+
+    output_path = media_paths.preview_output_path(seed)
+    try:
+        montage.preview(
+            plan.composition,
+            output_path,
+            spec=montage.PreviewSpec(
+                at_sec=start, duration_sec=min(duration_sec, length), scale=scale,
+            ),
+        )
+    except ValueError as error:
+        raise ValidationError(f"that window cannot be previewed: {error}") from error
+    log.info("previewed clip %s at %.1fs", seed, start)
+    return output_path

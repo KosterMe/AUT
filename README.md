@@ -5,7 +5,7 @@ Turns long videos into vertical TikTok clips and publishes them on a schedule.
 ```
 YouTube URL / local file
         ↓  download
-        ↓  transcribe            (YouTube captions, or Whisper / NVIDIA Riva)
+        ↓  transcribe            (if the cutter needs words: captions, Whisper or Riva)
         ↓  cut                   → clips    speech · scene changes · the clock
         ↓  place b-roll from the library on the words that name it
         ↓  score it            music ducked under the speech, sounds on the cuts

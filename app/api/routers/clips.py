@@ -10,18 +10,14 @@ render does.
 from __future__ import annotations
 
 import logging
-import os
 
 from fastapi import APIRouter, Depends, status
 from fastapi.responses import FileResponse
 from sqlmodel import Session
 
-from app.adapters.media import compiler
-from app.adapters.media import ffmpeg as media
 from app.api.deps import db_session
 from app.api.schemas.clips import ClipPreviewRequest, ClipRead, ClipRenderRequest
-from app.core.errors import ValidationError
-from app.services import clip_jobs, clips, rendering, styles
+from app.services import clip_jobs, clips, rendering, scenarios, styles
 
 log = logging.getLogger(__name__)
 
@@ -92,40 +88,14 @@ def preview_clip(
         style_id=payload.style_id if payload.style_id is not None else job.style_id,
         overrides=payload.style,
     )
-    options = clips.render_options_of(session, clip)
-    source_path = options.get("source_path") or job.original_path or ""
-    if not source_path or not os.path.isfile(source_path):
-        raise ValidationError(
-            "the source video is not on disk, so there is nothing to preview. "
-            "Re-run the job to download it again."
-        )
-
-    library = rendering.library_for(session, style=style, seed=clip_id)
-    plan = rendering.compose_clip(
-        clip=clip, job=job, options=options, style=style,
-        library=library, seed=clip_id, allow_transcription=False,
+    output_path = rendering.preview(
+        session, clip, job,
+        style=style,
+        scenario=scenarios.for_job(session, job, style),
+        at_sec=payload.at_sec,
+        duration_sec=payload.duration_sec,
+        scale=payload.scale,
     )
-
-    # Clamped rather than refused: the montage is shorter than the clip
-    # whenever silence was removed, so a slider positioned against the source
-    # can legitimately point past the end of what was rendered.
-    length = plan.composition.duration_sec
-    at_sec = max(0.0, min(payload.at_sec, max(0.0, length - payload.duration_sec)))
-
-    output_path = media.preview_output_path(clip_id)
-    try:
-        compiler.render_preview(
-            plan.composition,
-            output_path,
-            spec=compiler.PreviewSpec(
-                at_sec=at_sec,
-                duration_sec=min(payload.duration_sec, length),
-                scale=payload.scale,
-            ),
-        )
-    except ValueError as error:
-        raise ValidationError(f"that window cannot be previewed: {error}") from error
-    log.info("previewed clip %s at %.1fs", clip_id, at_sec)
     return FileResponse(
         output_path,
         media_type="video/mp4",

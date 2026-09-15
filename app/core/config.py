@@ -407,8 +407,8 @@ class RenderSettings(BaseSettings):
     one_pass_max_segments: int = Field(
         default=8, ge=1, validation_alias="AUTOCLIPS_RENDER_ONE_PASS_MAX_SEGMENTS"
     )
-    one_pass_max_inserts: int = Field(
-        default=4, ge=0, validation_alias="AUTOCLIPS_RENDER_ONE_PASS_MAX_INSERTS"
+    one_pass_max_layers: int = Field(
+        default=8, ge=0, validation_alias="AUTOCLIPS_RENDER_ONE_PASS_MAX_INSERTS"
     )
 
     # Reuse of rendered segments between two-stage renders. Disable to measure

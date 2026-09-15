@@ -1,7 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { QueryKey } from "@tanstack/react-query";
-import { Accounts, Assets, Jobs, Publications, Styles, System } from "./client";
-import { TERMINAL_JOB_STATUSES, type ClipJob, type ClipJobDetail } from "./types";
+import { Accounts, Assets, Jobs, Publications, Scenarios, Styles, System } from "./client";
+import {
+  TERMINAL_JOB_STATUSES,
+  type ClipJob,
+  type ClipJobDetail,
+  type ScenarioData,
+} from "./types";
 
 // A job in flight changes every few seconds; a finished one never does.
 // Polling only while something is actually running keeps an idle tab quiet.
@@ -13,6 +18,7 @@ function jobIsLive(job?: Pick<ClipJob, "status">) {
 
 export const keys = {
   health: ["health"] as const,
+  capabilities: ["capabilities"] as const,
   accounts: ["accounts"] as const,
   assets: ["assets"] as const,
   jobs: ["jobs"] as const,
@@ -21,7 +27,43 @@ export const keys = {
   tasks: ["tasks"] as const,
   styles: ["styles"] as const,
   styleDefaults: (profile?: string) => ["styles", "defaults", profile ?? "talking"] as const,
+  scenarios: ["scenarios"] as const,
+  scenarioInspect: (fingerprint: string, duration: number, at: number) =>
+    ["scenarios", "inspect", duration, at, fingerprint] as const,
 };
+
+export function useScenarios() {
+  return useQuery({ queryKey: keys.scenarios, queryFn: Scenarios.list });
+}
+
+/**
+ * The draft, laid out on a clip of that length by the compiler.
+ *
+ * Keyed by the draft itself, so every edit asks again and the answer for a
+ * draft already seen comes back from the cache — dragging a block back to
+ * where it was costs nothing. The editor draws this and nothing else: a
+ * second implementation of the layout rules in the browser would diverge from
+ * the renderer in exactly the small ways nobody notices until a clip is
+ * wrong.
+ */
+export function useScenarioInspect(
+  data: ScenarioData | null,
+  duration: number,
+  at = 0,
+) {
+  const fingerprint = data ? JSON.stringify(data) : "";
+  return useQuery({
+    queryKey: keys.scenarioInspect(fingerprint, duration, at),
+    queryFn: () => Scenarios.inspect(data as ScenarioData, duration, at),
+    enabled: !!data,
+    // A compile of the same draft at the same length is the same answer.
+    staleTime: Infinity,
+    // Keep the last layout on screen while the next one is computed, so the
+    // timeline does not blink on every keystroke.
+    placeholderData: (previous) => previous,
+    retry: false,
+  });
+}
 
 export function useStyles() {
   return useQuery({ queryKey: keys.styles, queryFn: Styles.list });
@@ -34,6 +76,16 @@ export function useStyleDefaults(profile?: string) {
     // The defaults only move when the server's configuration does, which does
     // not happen while a tab is open.
     staleTime: 5 * 60 * 1000,
+  });
+}
+
+export function useCapabilities() {
+  // The answer is a property of the installed ffmpeg, so it changes when the
+  // container does and not before: asked once and kept for the session.
+  return useQuery({
+    queryKey: keys.capabilities,
+    queryFn: System.capabilities,
+    staleTime: Infinity,
   });
 }
 

@@ -48,6 +48,9 @@ RUN cd app/adapters/tiktok/signature \
     && rm -rf /var/lib/apt/lists/*
 
 COPY app ./app
+# The montage service ships in the same image while it is called in
+# process (§13.3 — package first, network second). Stage 1в gives it its own.
+COPY montage ./montage
 COPY assets ./assets
 COPY alembic.ini ./
 

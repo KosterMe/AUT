@@ -156,7 +156,6 @@ node_modules/
 # IDE / local agent config
 .idea/
 .vscode/
-.claude/
 
 # Misc
 app/adapters/tiktok/signature/command.txt

@@ -1,8 +1,12 @@
-"""Handler: fetch a source video, transcribe it, and plan its clips.
+"""Handler: fetch a source video, cut it into clips, and queue their renders.
 
 The expensive, sequential part of the pipeline. It ends by queueing one render
 task per clip, which is where parallelism comes from — renders are independent
 and several worker processes can chew through them at once.
+
+It transcribes only when the cutter it is about to run cannot work without
+words, and it hands the next stage nothing but boundaries: how those clips are
+dressed is recorded on the job, and montage reads it there.
 """
 from __future__ import annotations
 
@@ -49,6 +53,10 @@ def handle_download(ctx: TaskContext) -> dict:
     with ctx.db() as session:
         job = clip_jobs.get(session, job_id)
         source_ref, platform = job.source_ref, job.source_platform
+        # Which signal to cut on is the job's own field now, read here while
+        # the session is open. Empty only for a task queued before the column
+        # existed, and that is the one case the payload is still asked.
+        cutter = job.cutter or ""
         existing_path = job.original_path or clip_jobs.source_downloaded_elsewhere(
             session, job_id, source_ref
         )
@@ -82,10 +90,10 @@ def handle_download(ctx: TaskContext) -> dict:
         clip_jobs.set_progress(session, job_id, JobStatus.TRANSCRIBING, "transcribing", 0.15)
 
     profile = profiles.get(ctx.get("profile"))
-    cutter = str(ctx.get("cutter") or profile.cutter)
+    cutter = cutter or str(ctx.get("cutter") or profile.cutter)
 
     transcript = None
-    if profile.requires_transcript or cutter == cutting.CUTTER_SPEECH:
+    if cutting.needs_transcript(cutter):
         ctx.progress("transcribing", 0.2)
         transcript = transcripts.load_or_build(
             media_path,
@@ -103,12 +111,12 @@ def handle_download(ctx: TaskContext) -> dict:
                 "the ASR backend is misconfigured. Videos without dialogue should use "
                 "the 'film' profile, which cuts on scene changes instead."
             )
+        with ctx.db() as session:
+            clip_jobs.record_transcript_settings(session, job_id, transcript.settings)
 
     ctx.progress("planning_clips", 0.85)
     with ctx.db() as session:
         clip_jobs.set_progress(session, job_id, JobStatus.PLANNING, "planning clips", 0.85)
-        job = clip_jobs.get(session, job_id)
-        source_title = job.display_title
 
     specs = _cut(
         ctx,
@@ -120,15 +128,8 @@ def handle_download(ctx: TaskContext) -> dict:
     if not specs:
         raise PermanentError(f"the {cutter} cutter produced no usable clips")
 
-    render_options = dict(ctx.get("render") or {})
-    render_options.setdefault("source_path", media_path)
-    render_options.setdefault("source_title", source_title)
-    render_options.setdefault("thumbnail_path", thumbnail)
-    if transcript is not None:
-        render_options.setdefault("transcript_settings", transcript.settings)
-
     with ctx.db() as session:
-        created = clips.plan(session, job_id, specs, render_options=render_options)
+        created = clips.plan(session, job_id, specs)
         clip_jobs.set_progress(session, job_id, JobStatus.RENDERING, "rendering", 0.0)
         clip_ids = [clip.id for clip in created]
 

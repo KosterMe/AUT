@@ -21,6 +21,7 @@ from app.core.config import get_settings
 from app.db.enums import TaskStatus
 from app.db.models import Clip, Task
 from app.tasks import queue
+from montage import client as montage
 
 router = APIRouter(prefix="/api", tags=["system"])
 
@@ -49,6 +50,23 @@ def health(session: Session = Depends(db_session)):
         # UI can stop offering a button that only ever returns 503 here.
         "browser_login": browser_login_available(),
     }
+
+
+@router.get("/capabilities")
+def capabilities():
+    """What this build of ffmpeg can actually do (§7.2, Р-40).
+
+    The editor asks once at startup and stops offering what this build cannot
+    deliver — a keyframe track for a property that will not animate is worse
+    than no track at all, because the render succeeds without the animation.
+
+    It is `montage.client` that answers, so the numbers come from wherever the
+    montage runs: pointed at a service, this reports *that* container's ffmpeg
+    rather than the API's, which is the only version of the answer worth
+    having. The probe is cached per process — three dozen ffmpeg runs do not
+    repeat on every request — so this is a cheap call after the first.
+    """
+    return montage.capabilities()
 
 
 def browser_login_available() -> bool:

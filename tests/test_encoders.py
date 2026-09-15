@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.adapters.media import encoders
+from montage.render import encoders
 
 
 @pytest.fixture(autouse=True)

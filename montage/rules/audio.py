@@ -17,9 +17,9 @@ Pure logic, as with every other planner: values in, values out.
 """
 from __future__ import annotations
 
-from app.domain.composition import Composition, MusicBed, SoundEffect
-from app.domain.inserts import AssetOption
-from app.domain.style import MUSIC_TAG, SFX_TAG, AudioPolicy, tag_aliases
+from montage.composition import AudioTrack, Composition
+from montage.rules.inserts import AssetOption
+from montage.style import MUSIC_TAG, SFX_TAG, AudioPolicy, tag_aliases
 
 
 def choose_music(
@@ -28,7 +28,7 @@ def choose_music(
     assets: list[AssetOption],
     policy: AudioPolicy | None = None,
     seed: int = 0,
-) -> MusicBed | None:
+) -> AudioTrack | None:
     """Pick a bed for this clip, or nothing if the library has no music."""
     rules = policy or AudioPolicy()
     tracks = _tagged(assets, MUSIC_TAG)
@@ -36,10 +36,11 @@ def choose_music(
         return None
 
     track = tracks[seed % len(tracks)]
-    return MusicBed(
+    return AudioTrack(
         source_path=track.path,
         gain_db=rules.music_gain_db,
-        start_sec=_offset_into(track, composition.duration_sec, seed),
+        loop=True,
+        source_start_sec=_offset_into(track, composition.duration_sec, seed),
         fade_in_sec=rules.music_fade_in_sec,
         fade_out_sec=rules.music_fade_out_sec,
         duck_threshold=rules.duck_threshold,
@@ -55,14 +56,14 @@ def choose_effects(
     assets: list[AssetOption],
     policy: AudioPolicy | None = None,
     seed: int = 0,
-) -> tuple[SoundEffect, ...]:
+) -> tuple[AudioTrack, ...]:
     """Put a sound on each visible change, up to the policy's limit."""
     rules = policy or AudioPolicy()
     sounds = _tagged(assets, SFX_TAG)
     if not sounds:
         return ()
 
-    effects: list[SoundEffect] = []
+    effects: list[AudioTrack] = []
     previous = -rules.effect_min_gap_seconds
     for order, moment in enumerate(_moments(composition, rules)):
         if len(effects) >= rules.max_effects:
@@ -74,7 +75,7 @@ def choose_effects(
             break
         sound = sounds[(seed + order) % len(sounds)]
         effects.append(
-            SoundEffect(
+            AudioTrack(
                 source_path=sound.path,
                 at_sec=round(at, 3),
                 duration_sec=_effect_length(sound, rules),
@@ -98,7 +99,7 @@ def _moments(composition: Composition, policy: AudioPolicy) -> list[float]:
             for segment in composition.timeline()[1:]
         )
     if policy.effects_on_inserts:
-        moments.extend(insert.at_sec for insert in composition.inserts)
+        moments.extend(layer.at_sec for layer in composition.layers)
     return sorted({round(at, 3) for at in moments if at > 0})
 
 
